@@ -1,0 +1,60 @@
+import type { DetectionPattern } from "../../types.js"
+
+export const credentialPatterns: DetectionPattern[] = [
+  {
+    id: "password-in-url",
+    name: "Password in URL",
+    category: "credentials",
+    pattern: /:\/\/[^:\/\s]+:([^@\/\s]{3,})@/g,
+    redact: () => "[REDACTED]",
+    confidence: "high",
+  },
+  {
+    id: "password-assignment",
+    name: "Password Assignment",
+    category: "credentials",
+    pattern: /(?<=(?:password|passwd|pwd|pass|secret|token|api_key|apikey|api-key|auth_token|access_token)\s*[=:]\s*['"]?)[^\s'"]{8,}/gi,
+    redact: () => "[REDACTED]",
+    confidence: "medium",
+  },
+  {
+    id: "mongodb-connection-string",
+    name: "MongoDB Connection String",
+    category: "credentials",
+    pattern: /mongodb(?:\+srv)?:\/\/[^\s'"]+/g,
+    redact: () => "[REDACTED]",
+    confidence: "high",
+  },
+  {
+    id: "postgres-connection-string",
+    name: "PostgreSQL Connection String",
+    category: "credentials",
+    pattern: /postgres(?:ql)?:\/\/[^\s'"]+/g,
+    redact: () => "[REDACTED]",
+    confidence: "high",
+  },
+  {
+    id: "mysql-connection-string",
+    name: "MySQL Connection String",
+    category: "credentials",
+    pattern: /mysql:\/\/[^\s'"]+/g,
+    redact: () => "[REDACTED]",
+    confidence: "high",
+  },
+  {
+    id: "redis-connection-string",
+    name: "Redis Connection String",
+    category: "credentials",
+    pattern: /redis(?:s)?:\/\/[^\s'"]+/g,
+    redact: () => "[REDACTED]",
+    confidence: "high",
+  },
+  {
+    id: "generic-connection-string",
+    name: "Generic Connection String",
+    category: "credentials",
+    pattern: /(?:Server|Data Source|Host)=[^;]+;.*(?:Password|Pwd)=[^;]+/gi,
+    redact: () => "[REDACTED]",
+    confidence: "medium",
+  },
+]

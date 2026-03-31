@@ -1,0 +1,158 @@
+{
+  "categories": {
+    "api-keys": true,
+    "credentials": true,
+    "private-keys": true,
+    "docker": true,
+    "kubernetes": true,
+    "cloud": true,
+    "pii-email": true,
+    "pii-phone": true,
+    "pii-ssn": true,
+    "pii-credit-card": true,
+    "pii-ip-address": false
+  },
+
+  "disabledPatterns": [],
+
+  "customPatterns": [],
+
+  "whitelistedPaths": [],
+
+  "blockedFilePaths": [
+    "**/.env",
+    "**/.env.*",
+    "**/.env.local",
+    "**/.env.production",
+    "**/*.pem",
+    "**/*.key",
+    "**/*.p12",
+    "**/*.pfx",
+    "**/*.jks",
+    "**/id_rsa",
+    "**/id_ed25519",
+    "**/id_ecdsa",
+    "**/.aws/credentials",
+    "**/.aws/config",
+    "**/.docker/config.json",
+    "**/.kube/config",
+    "**/kubeconfig*",
+    "**/values.secret.yaml",
+    "**/values.secrets.yaml",
+    "**/*.tfstate",
+    "**/*.tfvars",
+    "**/.vault-token",
+    "**/.netrc",
+    "**/.pgpass",
+    "**/.my.cnf"
+  ],
+
+  "excludedTools": ["glob", "list"],
+
+  "notifications": true,
+
+  "audit": {
+    "enabled": true,
+    "filePath": ".opencode/security-guard/audit.log",
+    "maxFileSize": 10485760,
+    "maxFiles": 5,
+    "verbosity": "normal"
+  },
+
+  "env": {
+    "enabled": true,
+    "stripPatterns": [
+      "*_SECRET",
+      "*_SECRET_*",
+      "*_TOKEN",
+      "*_TOKEN_*",
+      "*_PASSWORD",
+      "*_PASSWORD_*",
+      "*_KEY",
+      "*_API_KEY",
+      "*_API_KEY_*",
+      "*_PRIVATE_KEY",
+      "DOCKER_AUTH_*",
+      "AWS_SECRET_ACCESS_KEY",
+      "AWS_SESSION_TOKEN",
+      "GITHUB_TOKEN",
+      "VAULT_TOKEN",
+      "PULUMI_CONFIG_PASSPHRASE",
+      "HEROKU_API_KEY",
+      "VERCEL_TOKEN",
+      "CF_API_TOKEN",
+      "CF_API_KEY",
+      "SUPABASE_SERVICE_ROLE_KEY",
+      "DATABASE_URL",
+      "REDIS_URL",
+      "MONGODB_URI"
+    ]
+  },
+
+  "llm": {
+    "enabled": true,
+    "debug": true,
+    "baseUrl": "http://172.16.0.10:9292/v1",
+    "model": "08-Nemotron-3-Nano-30B-A3B",
+    "apiKey": "",
+    "timeout": 300000,
+    "contextAccumulation": false,
+    "contextDetectionsOnly": true,
+    "maxContextPairs": 5,
+    "maxContextChars": 16000,
+    "temperature": 0.1,
+    "headers": {},
+    "healthCheckPath": "/models",
+    "completionsPath": "/chat/completions",
+
+    "outputSanitizer": {
+      "enabled": true,
+      "tools": ["read", "bash", "grep"],
+      "skipWhenRegexClean": false,
+      "maxTokens": 2048,
+      "systemPrompt": "",
+      "promptTemplate": "",
+      "actionMode": "redact"
+    },
+
+    "safetyEvaluator": {
+      "enabled": true,
+      "tools": ["bash", "write", "edit", "webfetch"],
+      "blockThreshold": "high",
+      "warnThreshold": "medium",
+      "bypassedCommands": [
+        "git status",
+        "git log",
+        "git diff",
+        "git branch",
+        "git show",
+        "ls",
+        "pwd",
+        "echo",
+        "cat",
+        "head",
+        "tail",
+        "wc",
+        "date",
+        "whoami"
+      ],
+      "allowedOperations": [
+        "nginx -t",
+        "certbot certificates"
+      ],
+      "operationalProfiles": {
+        "log-review": true,
+        "security-monitoring": {
+          "enabled": true,
+          "additionalPatterns": ["custom-security-tool status *"]
+        },
+        "service-status": true,
+        "system-health": true
+      },
+      "maxTokens": 1024,
+      "systemPrompt": "",
+      "promptTemplate": "",
+      "actionMode": "block"
+    }
+  }
+}

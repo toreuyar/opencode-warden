@@ -1,0 +1,60 @@
+import type { DetectionPattern } from "../../types.js"
+
+export const privateKeyPatterns: DetectionPattern[] = [
+  {
+    id: "rsa-private-key",
+    name: "RSA Private Key",
+    category: "private-keys",
+    pattern: /-----BEGIN RSA PRIVATE KEY-----[\s\S]*?-----END RSA PRIVATE KEY-----/g,
+    redact: () => "[REDACTED]",
+    confidence: "high",
+  },
+  {
+    id: "openssh-private-key",
+    name: "OpenSSH Private Key",
+    category: "private-keys",
+    pattern: /-----BEGIN OPENSSH PRIVATE KEY-----[\s\S]*?-----END OPENSSH PRIVATE KEY-----/g,
+    redact: () => "[REDACTED]",
+    confidence: "high",
+  },
+  {
+    id: "dsa-private-key",
+    name: "DSA Private Key",
+    category: "private-keys",
+    pattern: /-----BEGIN DSA PRIVATE KEY-----[\s\S]*?-----END DSA PRIVATE KEY-----/g,
+    redact: () => "[REDACTED]",
+    confidence: "high",
+  },
+  {
+    id: "ec-private-key",
+    name: "EC Private Key",
+    category: "private-keys",
+    pattern: /-----BEGIN EC PRIVATE KEY-----[\s\S]*?-----END EC PRIVATE KEY-----/g,
+    redact: () => "[REDACTED]",
+    confidence: "high",
+  },
+  {
+    id: "generic-private-key",
+    name: "Generic Private Key",
+    category: "private-keys",
+    pattern: /-----BEGIN PRIVATE KEY-----[\s\S]*?-----END PRIVATE KEY-----/g,
+    redact: () => "[REDACTED]",
+    confidence: "high",
+  },
+  {
+    id: "encrypted-private-key",
+    name: "Encrypted Private Key",
+    category: "private-keys",
+    pattern: /-----BEGIN ENCRYPTED PRIVATE KEY-----[\s\S]*?-----END ENCRYPTED PRIVATE KEY-----/g,
+    redact: () => "[REDACTED]",
+    confidence: "high",
+  },
+  {
+    id: "pgp-private-key",
+    name: "PGP Private Key",
+    category: "private-keys",
+    pattern: /-----BEGIN PGP PRIVATE KEY BLOCK-----[\s\S]*?-----END PGP PRIVATE KEY BLOCK-----/g,
+    redact: () => "[REDACTED]",
+    confidence: "high",
+  },
+]

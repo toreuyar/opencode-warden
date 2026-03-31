@@ -1,0 +1,56 @@
+{
+  "name": "opencode-warden",
+  "version": "1.0.0",
+  "description": "Security plugin for OpenCode — intercepts tool calls to detect secrets, redact sensitive data, evaluate safety risks, block access to sensitive files, and maintain an audit trail",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "src/index.ts",
+  "files": [
+    "dist",
+    "src",
+    "opencode-warden.example.json",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "typecheck": "bun run tsc --noEmit",
+    "test": "bun test",
+    "build": "bun build src/index.ts --outdir dist --target bun",
+    "prepublishOnly": "bun run build"
+  },
+  "author": {
+    "name": "Töre Çağrı Uyar",
+    "url": "https://github.com/toreuyar"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/toreuyar/opencode-warden.git"
+  },
+  "homepage": "https://github.com/toreuyar/opencode-warden",
+  "bugs": {
+    "url": "https://github.com/toreuyar/opencode-warden/issues"
+  },
+  "dependencies": {
+    "zod": "^3.23.0"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "^1.2.0"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.2.5",
+    "@types/bun": "^1.1.0",
+    "typescript": "^5.5.0"
+  },
+  "keywords": [
+    "opencode",
+    "plugin",
+    "security",
+    "warden",
+    "redaction",
+    "secrets",
+    "audit",
+    "safety",
+    "llm"
+  ],
+  "license": "MIT"
+}
