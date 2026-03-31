@@ -142,7 +142,7 @@ export function createOutputRedactor(deps: OutputRedactorDeps) {
     const debugLog = config.llm.debug
       ? (msg: string) => {
           client.app.log({
-            body: { service: "security-guard", level: "info", message: msg },
+            body: { service: "warden", level: "info", message: msg },
           }).catch(() => {})
         }
       : undefined

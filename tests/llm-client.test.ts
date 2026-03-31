@@ -20,10 +20,10 @@ describe("buildLlmHeaders", () => {
   test("custom headers are merged", () => {
     const headers = buildLlmHeaders("", {
       "X-Custom": "value",
-      "X-Client-ID": "security-guard",
+      "X-Client-ID": "warden",
     })
     expect(headers["X-Custom"]).toBe("value")
-    expect(headers["X-Client-ID"]).toBe("security-guard")
+    expect(headers["X-Client-ID"]).toBe("warden")
     expect(headers["Content-Type"]).toBe("application/json")
   })
 

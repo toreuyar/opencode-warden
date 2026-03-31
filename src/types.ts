@@ -34,6 +34,7 @@ export type PatternCategory =
 // ─── Detection Types ───
 
 export type ConfidenceLevel = "low" | "medium" | "high"
+export type PatternSource = "builtin" | "user" | "ai"
 
 export interface DetectionPattern {
   id: string
@@ -42,6 +43,7 @@ export interface DetectionPattern {
   pattern: RegExp
   redact: (match: string) => string
   confidence: ConfidenceLevel
+  source?: PatternSource
 }
 
 export interface DetectionMatch {

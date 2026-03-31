@@ -459,13 +459,12 @@ describe("Compaction Context Hook", () => {
 
     expect(output.context.length).toBe(1)
     const context = output.context[0]
-    expect(context).toContain("Security Guard Policy")
-    expect(context).toContain("Blocked File Paths")
+    expect(context).toContain("Warden Security Policy")
+    expect(context).toContain("Blocked Files")
     expect(context).toContain(".env")
-    expect(context).toContain("Monitored Content Categories")
-    expect(context).toContain("api-keys")
     expect(context).toContain("[REDACTED]")
-    expect(context).toContain("Tool Call Monitoring")
+    expect(context).toContain("Blocked Commands")
+    expect(context).toContain("security_help")
   })
 })
 

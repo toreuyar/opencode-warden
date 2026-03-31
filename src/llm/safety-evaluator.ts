@@ -200,6 +200,71 @@ export class SafetyEvaluator {
   }
 
   /**
+   * Dry-run a tool call through safety evaluation WITHOUT modifying conversation context.
+   * Used by the security_evaluate tool to let the AI pre-check commands.
+   */
+  async dryRun(
+    tool: string,
+    args: Record<string, unknown>,
+  ): Promise<SafetyEvaluation> {
+    const log = this.debugLog
+
+    // Fast-path: bypassed commands don't need LLM
+    if (this.isBypassed(tool, args)) {
+      return {
+        safe: true,
+        riskLevel: "none",
+        riskDimensions: [],
+        explanation: "Pre-approved (bypassed command)",
+        suggestedAlternative: "",
+        recommendation: "allow",
+      }
+    }
+
+    log?.(`Safety dry-run: tool=${tool} args=${JSON.stringify(args).substring(0, 120)}`)
+
+    const systemPrompt = this.config.systemPrompt || DEFAULT_SAFETY_SYSTEM_PROMPT
+    const customTemplate = this.config.promptTemplate || ""
+    const prompt = buildSafetyPrompt(
+      tool,
+      args,
+      customTemplate || undefined,
+      this.config.operationalProfiles,
+    )
+
+    // One-shot messages — does NOT touch this.context
+    const messages = [
+      { role: "system" as const, content: systemPrompt },
+      { role: "user" as const, content: prompt },
+    ]
+
+    try {
+      const response = await this.providerChain.call(
+        messages,
+        { componentName: "safety-evaluator-dryrun" },
+      )
+      const evaluation = this.parseResponse(response)
+      const result = this.applyThresholds(evaluation)
+
+      log?.(
+        `Safety dry-run result: riskLevel=${result.riskLevel} recommendation=${result.recommendation}`,
+      )
+
+      return result
+    } catch (err) {
+      log?.(`Safety dry-run failed: ${err instanceof Error ? err.message : err}`)
+      return {
+        safe: false,
+        riskLevel: "critical",
+        riskDimensions: [],
+        explanation: "LLM unreachable — dry-run cannot evaluate",
+        suggestedAlternative: "",
+        recommendation: "block",
+      }
+    }
+  }
+
+  /**
    * Evaluate file content before execution (Layer 2: Indirect Execution Prevention).
    *
    * Stateless — does NOT use conversation context. File content provides all context.

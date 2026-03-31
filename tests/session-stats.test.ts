@@ -84,7 +84,7 @@ describe("SessionStats", () => {
     stats.recordBlock("read", ".env", "blocked")
 
     const report = stats.getReport("summary")
-    expect(report).toContain("Security Guard Report")
+    expect(report).toContain("Warden Report")
     expect(report).toContain("Total Tool Calls: 1")
     expect(report).toContain("Total Detections: 2")
     expect(report).toContain("Blocked Attempts: 1")

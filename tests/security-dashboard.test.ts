@@ -24,8 +24,8 @@ describe("security-dashboard tool", () => {
       config: DEFAULT_CONFIG,
       llmSanitizer: null,
     })
-    const output = await tool.execute()
-    expect(output).toContain("=== Security Guard Dashboard ===")
+    const output = await tool.execute({})
+    expect(output).toContain("=== Warden Dashboard ===")
     expect(output).toContain("=== End Dashboard ===")
   })
 
@@ -36,7 +36,7 @@ describe("security-dashboard tool", () => {
       config: DEFAULT_CONFIG,
       llmSanitizer: null,
     })
-    const output = await tool.execute()
+    const output = await tool.execute({})
     expect(output).toContain("Active Categories:")
     expect(output).toContain("api-keys")
   })
@@ -50,7 +50,7 @@ describe("security-dashboard tool", () => {
       config: DEFAULT_CONFIG,
       llmSanitizer: null,
     })
-    const output = await tool.execute()
+    const output = await tool.execute({})
     expect(output).toContain("Total Tool Calls: 2")
   })
 
@@ -64,7 +64,7 @@ describe("security-dashboard tool", () => {
       config: DEFAULT_CONFIG,
       llmSanitizer: sanitizer,
     })
-    const output = await tool.execute()
+    const output = await tool.execute({})
     expect(output).toContain("LLM Sanitizer: Available")
     expect(output).toContain("test-provider")
     expect(output).toContain("ready")
@@ -77,7 +77,7 @@ describe("security-dashboard tool", () => {
       config: DEFAULT_CONFIG,
       llmSanitizer: null,
     })
-    const output = await tool.execute()
+    const output = await tool.execute({})
     expect(output).toContain("LLM Sanitizer: Disabled")
   })
 
@@ -90,7 +90,7 @@ describe("security-dashboard tool", () => {
       config: DEFAULT_CONFIG,
       llmSanitizer: null,
     })
-    const output = await tool.execute()
+    const output = await tool.execute({})
     expect(output).toContain("Detections by Category")
     expect(output).toContain("api-keys: 2")
     expect(output).toContain("credentials: 1")
@@ -104,7 +104,7 @@ describe("security-dashboard tool", () => {
       config: DEFAULT_CONFIG,
       llmSanitizer: null,
     })
-    const output = await tool.execute()
+    const output = await tool.execute({})
     expect(output).toContain("Blocked File Access")
     expect(output).toContain("/project/.env")
   })
@@ -119,9 +119,48 @@ describe("security-dashboard tool", () => {
       config: DEFAULT_CONFIG,
       llmSanitizer: null,
     })
-    const output = await tool.execute()
+    const output = await tool.execute({})
     expect(output).toContain("Recent Events")
     expect(output).toContain("DETECT")
     expect(output).toContain("BLOCK")
+  })
+
+  test("brief mode returns single-line status", async () => {
+    const stats = new SessionStats("test-session")
+    const tool = createSecurityDashboardTool({
+      sessionStats: stats,
+      config: DEFAULT_CONFIG,
+      llmSanitizer: null,
+    })
+    const output = await tool.execute({ mode: "brief" })
+    expect(output.split("\n").length).toBe(1)
+    expect(output).toContain("Warden:")
+    expect(output).toContain("calls")
+    expect(output).toContain("detections")
+    expect(output).toContain("blocks")
+    expect(output).toContain("LLM:")
+  })
+
+  test("brief mode shows OK when no issues", async () => {
+    const stats = new SessionStats("test-session")
+    const tool = createSecurityDashboardTool({
+      sessionStats: stats,
+      config: DEFAULT_CONFIG,
+      llmSanitizer: null,
+    })
+    const output = await tool.execute({ mode: "brief" })
+    expect(output).toContain("Warden: OK")
+  })
+
+  test("brief mode shows ALERT when blocks exist", async () => {
+    const stats = new SessionStats("test-session")
+    stats.recordBlock("bash", "/etc/passwd", "blocked")
+    const tool = createSecurityDashboardTool({
+      sessionStats: stats,
+      config: DEFAULT_CONFIG,
+      llmSanitizer: null,
+    })
+    const output = await tool.execute({ mode: "brief" })
+    expect(output).toContain("Warden: ALERT")
   })
 })

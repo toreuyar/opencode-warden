@@ -395,7 +395,7 @@ describe("Configuration", () => {
 
   test("default diagnosticLog.filePath is correct", () => {
     expect(DEFAULT_CONFIG.diagnosticLog.filePath).toBe(
-      ".opencode/security-guard/diagnostic.log",
+      ".opencode/warden/diagnostic.log",
     )
   })
 

@@ -8,102 +8,82 @@ function makeConfig(): SecurityGuardConfig {
 }
 
 describe("buildSecurityPolicyContext", () => {
-  test("contains security guard header", () => {
+  test("contains warden header", () => {
     const result = buildSecurityPolicyContext(DEFAULT_CONFIG)
-    expect(result).toContain("## Security Guard Policy")
+    expect(result).toContain("## Warden Security Policy")
   })
 
-  test("contains content redaction section", () => {
+  test("contains redaction section", () => {
     const result = buildSecurityPolicyContext(DEFAULT_CONFIG)
-    expect(result).toContain("### Content Redaction")
+    expect(result).toContain("### Redaction")
     expect(result).toContain("[REDACTED]")
-    expect(result).toContain("Do not")
+    expect(result).toContain("Do not reconstruct")
   })
 
-  test("contains blocked file paths when present", () => {
+  test("contains blocked files when present", () => {
     const result = buildSecurityPolicyContext(DEFAULT_CONFIG)
-    expect(result).toContain("### Blocked File Paths")
+    expect(result).toContain("### Blocked Files")
     expect(result).toContain("**/.env")
     expect(result).toContain("**/*.pem")
   })
 
-  test("omits blocked file paths section when empty", () => {
+  test("omits blocked files section when empty", () => {
     const config = makeConfig()
     config.blockedFilePaths = []
     const result = buildSecurityPolicyContext(config)
-    expect(result).not.toContain("### Blocked File Paths")
+    expect(result).not.toContain("### Blocked Files")
   })
 
-  test("lists active detection categories", () => {
+  test("contains blocked commands warning", () => {
     const result = buildSecurityPolicyContext(DEFAULT_CONFIG)
-    expect(result).toContain("### Monitored Content Categories")
-    expect(result).toContain("api-keys")
-    expect(result).toContain("credentials")
-    expect(result).toContain("private-keys")
+    expect(result).toContain("### Blocked Commands")
+    expect(result).toContain("Do NOT retry")
   })
 
-  test("does not list disabled categories", () => {
-    const config = makeConfig()
-    // pii-ip-address is disabled by default
-    const result = buildSecurityPolicyContext(config)
-    expect(result).not.toContain("- pii-ip-address")
-  })
-
-  test("contains tool call monitoring section", () => {
-    const result = buildSecurityPolicyContext(DEFAULT_CONFIG)
-    expect(result).toContain("### Tool Call Monitoring")
-    expect(result).toContain("blocked")
-  })
-
-  test("contains security tools section", () => {
-    const result = buildSecurityPolicyContext(DEFAULT_CONFIG)
-    expect(result).toContain("### Security Tools")
-    expect(result).toContain("security_dashboard")
-    expect(result).toContain("security_report")
-    expect(result).toContain("security_rules")
-  })
-
-  test("shows output size limit when configured", () => {
+  test("shows output limits when configured", () => {
     const config = makeConfig()
     config.llm.outputSanitizer.maxOutputSize = 65536
     const result = buildSecurityPolicyContext(config)
-    expect(result).toContain("### Output Size Limit")
+    expect(result).toContain("### Output Limits")
     expect(result).toContain("65536 characters")
     expect(result).toContain("~64KB")
   })
 
-  test("omits output size limit when zero", () => {
+  test("omits output limits when zero", () => {
     const config = makeConfig()
     config.llm.outputSanitizer.maxOutputSize = 0
     const result = buildSecurityPolicyContext(config)
-    expect(result).not.toContain("### Output Size Limit")
+    expect(result).not.toContain("### Output Limits")
   })
 
-  test("shows allowed operations when profiles are active", () => {
-    const config = makeConfig()
-    config.llm.safetyEvaluator.operationalProfiles = {
-      "log-review": true,
-      "service-status": true,
-    }
-    const result = buildSecurityPolicyContext(config)
-    expect(result).toContain("### Allowed Operations")
-    expect(result).toContain("Active Profiles")
-    expect(result).toContain("log-review")
-    expect(result).toContain("service-status")
-  })
-
-  test("shows custom allowed operations", () => {
-    const config = makeConfig()
-    config.llm.safetyEvaluator.allowedOperations = ["nginx -t", "certbot certificates"]
-    const result = buildSecurityPolicyContext(config)
-    expect(result).toContain("### Allowed Operations")
-    expect(result).toContain("Custom Patterns")
-    expect(result).toContain("nginx -t")
-    expect(result).toContain("certbot certificates")
-  })
-
-  test("omits allowed operations when none configured", () => {
+  test("contains security_help pointer", () => {
     const result = buildSecurityPolicyContext(DEFAULT_CONFIG)
-    expect(result).not.toContain("### Allowed Operations")
+    expect(result).toContain("security_help")
+  })
+
+  test("does NOT contain individual tool descriptions", () => {
+    const result = buildSecurityPolicyContext(DEFAULT_CONFIG)
+    expect(result).not.toContain("security_dashboard")
+    expect(result).not.toContain("security_report")
+    expect(result).not.toContain("security_rules")
+  })
+
+  test("does NOT contain categories listing", () => {
+    const result = buildSecurityPolicyContext(DEFAULT_CONFIG)
+    expect(result).not.toContain("Monitored Content Categories")
+    expect(result).not.toContain("- api-keys")
+  })
+
+  test("does NOT contain allowed operations", () => {
+    const config = makeConfig()
+    config.llm.safetyEvaluator.operationalProfiles = { "log-review": true }
+    const result = buildSecurityPolicyContext(config)
+    expect(result).not.toContain("Allowed Operations")
+  })
+
+  test("policy is concise (under 40 lines)", () => {
+    const result = buildSecurityPolicyContext(DEFAULT_CONFIG)
+    const lineCount = result.split("\n").length
+    expect(lineCount).toBeLessThanOrEqual(50)
   })
 })

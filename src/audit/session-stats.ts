@@ -128,7 +128,7 @@ export class SessionStats {
     const s = this.data
     const lines: string[] = []
 
-    lines.push("=== Security Guard Report ===")
+    lines.push("=== Warden Report ===")
     lines.push(`Session: ${s.sessionId || "N/A"}`)
     lines.push(`Started: ${s.startedAt}`)
     lines.push(`Total Tool Calls: ${s.totalToolCalls}`)

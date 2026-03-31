@@ -14,9 +14,13 @@ import { buildSecurityPolicyContext } from "./hooks/security-policy.js"
 import { createSecurityDashboardTool } from "./tools/security-dashboard.js"
 import { createSecurityReportTool } from "./tools/security-report.js"
 import { createRulesManageTool } from "./tools/rules-manage.js"
+import { createSecurityHelpTool } from "./tools/security-help.js"
+import { createSecurityAuditTool } from "./tools/security-audit.js"
+import { createSecurityEvaluateTool } from "./tools/security-evaluate.js"
+import { createSecurityConfigTool } from "./tools/security-config.js"
 import type { ToastState, PatternCategory, PluginClient, WrittenFileMetadata } from "./types.js"
 
-export const SecurityGuard: Plugin = async ({ client: sdkClient, directory }) => {
+export const Warden: Plugin = async ({ client: sdkClient, directory }) => {
   // Cast SDK client to our PluginClient interface
   const client = sdkClient as unknown as PluginClient
 
@@ -72,7 +76,7 @@ export const SecurityGuard: Plugin = async ({ client: sdkClient, directory }) =>
     const panelDebugLog = config.llm.debug
       ? (msg: string) => {
           client.app.log({
-            body: { service: "security-guard", level: "info", message: msg },
+            body: { service: "warden", level: "info", message: msg },
           }).catch(() => {})
         }
       : undefined
@@ -110,7 +114,7 @@ export const SecurityGuard: Plugin = async ({ client: sdkClient, directory }) =>
       if (!healthy) {
         client.app.log({
           body: {
-            service: "security-guard",
+            service: "warden",
             level: "error",
             message:
               "LLM unreachable — all LLM-evaluated operations will be BLOCKED until LLM is available",
@@ -120,7 +124,7 @@ export const SecurityGuard: Plugin = async ({ client: sdkClient, directory }) =>
         if (config.notifications) {
           client.tui.showToast({
             body: {
-              message: "🛡 Security Guard: LLM unreachable — LLM-evaluated operations will be BLOCKED",
+              message: "🛡 Warden: LLM unreachable — LLM-evaluated operations will be BLOCKED",
               variant: "error",
             },
           }).catch(() => {})
@@ -212,6 +216,19 @@ export const SecurityGuard: Plugin = async ({ client: sdkClient, directory }) =>
     projectDir: directory,
   })
 
+  const helpToolDef = createSecurityHelpTool()
+
+  const auditToolDef = createSecurityAuditTool({
+    auditLogPath: join(directory, config.audit.filePath),
+    maxFiles: config.audit.maxFiles,
+  })
+
+  const evaluateToolDef = createSecurityEvaluateTool({
+    safetyEvaluator,
+  })
+
+  const configToolDef = createSecurityConfigTool({ config })
+
   // ─── Log Startup ───
   const activeCategories = (
     Object.entries(config.categories) as [PatternCategory, boolean][]
@@ -223,14 +240,14 @@ export const SecurityGuard: Plugin = async ({ client: sdkClient, directory }) =>
 
   client.app.log({
     body: {
-      service: "security-guard",
+      service: "warden",
       level: "info",
-      message: `Security Guard active: ${patternCount} patterns, ${activeCategories.length} categories [${activeCategories.join(", ")}], LLM: ${config.llm.enabled ? "enabled" : "disabled"}`,
+      message: `Warden active: ${patternCount} patterns, ${activeCategories.length} categories [${activeCategories.join(", ")}], LLM: ${config.llm.enabled ? "enabled" : "disabled"}`,
     },
   }).catch(() => {})
 
   diagnosticLogger?.startup(
-    `Security Guard active: ${patternCount} patterns, ${activeCategories.length} categories, LLM: ${config.llm.enabled ? "enabled" : "disabled"}`,
+    `Warden active: ${patternCount} patterns, ${activeCategories.length} categories, LLM: ${config.llm.enabled ? "enabled" : "disabled"}`,
     {
       categories: activeCategories,
       patternCount,
@@ -242,7 +259,7 @@ export const SecurityGuard: Plugin = async ({ client: sdkClient, directory }) =>
   // ─── Show Startup Warnings ───
   for (const warning of startupWarnings) {
     client.app.log({
-      body: { service: "security-guard", level: "warn", message: warning },
+      body: { service: "warden", level: "warn", message: warning },
     }).catch(() => {})
     if (config.notifications) {
       client.tui.showToast({
@@ -293,11 +310,29 @@ export const SecurityGuard: Plugin = async ({ client: sdkClient, directory }) =>
     },
 
     tool: {
+      security_help: tool({
+        description: helpToolDef.description,
+        args: {
+          topic: tool.schema
+            .string()
+            .optional()
+            .describe("Tool name to get detailed help for"),
+        },
+        async execute(args) {
+          return helpToolDef.execute(args)
+        },
+      }),
+
       security_dashboard: tool({
         description: dashboardToolDef.description,
-        args: {},
-        async execute() {
-          return dashboardToolDef.execute()
+        args: {
+          mode: tool.schema
+            .enum(["full", "brief"])
+            .optional()
+            .describe('Display mode: "full" (default) or "brief" (one-line status)'),
+        },
+        async execute(args) {
+          return dashboardToolDef.execute(args)
         },
       }),
 
@@ -316,16 +351,69 @@ export const SecurityGuard: Plugin = async ({ client: sdkClient, directory }) =>
         },
       }),
 
+      security_audit: tool({
+        description: auditToolDef.description,
+        args: {
+          tool: tool.schema
+            .string()
+            .optional()
+            .describe("Filter by tool name"),
+          eventType: tool.schema
+            .enum(["block", "detection", "pass", "safety-block", "safety-warn"])
+            .optional()
+            .describe("Filter by event type"),
+          category: tool.schema
+            .string()
+            .optional()
+            .describe("Filter by detection category"),
+          limit: tool.schema
+            .number()
+            .optional()
+            .describe("Max entries to return (default 20)"),
+        },
+        async execute(args) {
+          return auditToolDef.execute(args)
+        },
+      }),
+
+      security_evaluate: tool({
+        description: evaluateToolDef.description,
+        args: {
+          tool: tool.schema
+            .string()
+            .describe('Tool name to evaluate (e.g., "bash", "write", "edit")'),
+          command: tool.schema
+            .string()
+            .optional()
+            .describe("Command string (for bash tool)"),
+          args: tool.schema
+            .string()
+            .optional()
+            .describe("JSON string of tool arguments (for non-bash tools)"),
+        },
+        async execute(args) {
+          return evaluateToolDef.execute(args)
+        },
+      }),
+
+      security_config: tool({
+        description: configToolDef.description,
+        args: {},
+        async execute() {
+          return configToolDef.execute()
+        },
+      }),
+
       security_rules: tool({
         description: rulesToolDef.description,
         args: {
           action: tool.schema
-            .enum(["list", "test", "add", "remove"])
-            .describe('Action: "list", "test", "add", or "remove"'),
+            .enum(["list", "test", "add", "edit", "remove"])
+            .describe('Action: "list", "test", "add", "edit", or "remove"'),
           pattern: tool.schema
             .string()
             .optional()
-            .describe("Regex pattern (for test/add)"),
+            .describe("Regex pattern (for test/add/edit)"),
           testString: tool.schema
             .string()
             .optional()
@@ -333,15 +421,15 @@ export const SecurityGuard: Plugin = async ({ client: sdkClient, directory }) =>
           name: tool.schema
             .string()
             .optional()
-            .describe("Rule name (for add)"),
+            .describe("Rule name (for add/edit)"),
           category: tool.schema
             .string()
             .optional()
-            .describe("Category (for add)"),
+            .describe("Category (for add/edit)"),
           id: tool.schema
             .string()
             .optional()
-            .describe("Rule ID (for remove)"),
+            .describe("Rule ID (for edit/remove)"),
           redactTemplate: tool.schema
             .string()
             .optional()
@@ -355,4 +443,4 @@ export const SecurityGuard: Plugin = async ({ client: sdkClient, directory }) =>
   }
 }
 
-export default SecurityGuard
+export default Warden

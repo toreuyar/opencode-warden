@@ -52,14 +52,14 @@ export const DEFAULT_CONFIG: SecurityGuardConfig = {
   notifications: true,
   audit: {
     enabled: true,
-    filePath: ".opencode/security-guard/audit.log",
+    filePath: ".opencode/warden/audit.log",
     maxFileSize: 10 * 1024 * 1024, // 10MB
     maxFiles: 5,
     verbosity: "normal",
   },
   diagnosticLog: {
     enabled: false,
-    filePath: ".opencode/security-guard/diagnostic.log",
+    filePath: ".opencode/warden/diagnostic.log",
     maxFileSize: 10 * 1024 * 1024, // 10MB
     maxFiles: 3,
   },

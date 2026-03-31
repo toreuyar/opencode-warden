@@ -54,7 +54,7 @@ export class AuditLogger {
       try {
         await this.client.app.log({
           body: {
-            service: "security-guard",
+            service: "warden",
             level,
             message: this.formatLogMessage(entry),
           },

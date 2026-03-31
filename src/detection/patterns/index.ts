@@ -22,15 +22,16 @@ export function getPatterns(
   disabledPatterns: string[],
   customPatterns: CustomPatternConfig[],
   warnings?: string[],
+  aiPatterns?: DetectionPattern[],
 ): DetectionPattern[] {
   const disabledSet = new Set(disabledPatterns)
 
-  // Filter built-in patterns by category and disabled list
-  const patterns = ALL_BUILTIN_PATTERNS.filter(
-    (p) => enabledCategories[p.category] && !disabledSet.has(p.id),
-  )
+  // Layer 1: Built-in patterns (immutable, cannot be altered at runtime)
+  const patterns: DetectionPattern[] = ALL_BUILTIN_PATTERNS
+    .filter((p) => enabledCategories[p.category] && !disabledSet.has(p.id))
+    .map((p) => ({ ...p, source: "builtin" as const }))
 
-  // Add custom patterns
+  // Layer 2: User-defined patterns from config files (immutable at runtime)
   for (const custom of customPatterns) {
     if (!enabledCategories[custom.category]) continue
     if (disabledSet.has(custom.id)) continue
@@ -44,6 +45,7 @@ export function getPatterns(
         pattern: regex,
         redact: () => custom.redactTemplate,
         confidence: custom.confidence,
+        source: "user",
       })
     } catch {
       warnings?.push(
@@ -52,11 +54,19 @@ export function getPatterns(
     }
   }
 
+  // Layer 3: AI-managed patterns (added/removed at runtime, session-only)
+  if (aiPatterns) {
+    for (const p of aiPatterns) {
+      if (!enabledCategories[p.category]) continue
+      patterns.push(p)
+    }
+  }
+
   return patterns
 }
 
 export function getAllBuiltinPatterns(): DetectionPattern[] {
-  return [...ALL_BUILTIN_PATTERNS]
+  return ALL_BUILTIN_PATTERNS.map((p) => ({ ...p, source: "builtin" as const }))
 }
 
 export {

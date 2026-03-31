@@ -69,7 +69,7 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
     const debugLog = config.llm.debug
       ? (msg: string) => {
           client.app.log({
-            body: { service: "security-guard", level: "info", message: msg },
+            body: { service: "warden", level: "info", message: msg },
           }).catch(() => {})
         }
       : undefined
@@ -100,7 +100,7 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
       }
 
       throw new Error(
-        `Security Guard: Tool "${input.tool}" is blocked by security policy. ` +
+        `Warden: Tool "${input.tool}" is blocked by security policy. ` +
         `This tool has been disabled by the administrator.`,
       )
     }
@@ -169,7 +169,7 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
         }
 
         throw new Error(
-          `Security Guard: Access to "${filePath}" is blocked by security policy. ` +
+          `Warden: Access to "${filePath}" is blocked by security policy. ` +
           `This file may contain sensitive data (credentials, keys, secrets). ` +
           `If you need access, ask the user to temporarily allowlist it.`,
         )
@@ -215,7 +215,7 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
         }
 
         throw new Error(
-          `Security Guard: Remote access to "${remotePath}" is blocked by security policy. ` +
+          `Warden: Remote access to "${remotePath}" is blocked by security policy. ` +
           `This file may contain sensitive data (credentials, keys, secrets). ` +
           `If you need access, ask the user to temporarily allowlist it.`,
         )
@@ -305,7 +305,7 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
           }
 
           throw new Error(
-            `Security Guard: Execution of binary file at non-system path blocked.\n` +
+            `Warden: Execution of binary file at non-system path blocked.\n` +
             `File: ${execPath}\n` +
             `Binary files at non-system paths cannot be verified for safety. ` +
             `Use a system-installed binary or ask the user to review and approve.`,
@@ -374,7 +374,7 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
             : ""
 
           throw new Error(
-            `Security Guard: Execution blocked — file content flagged as dangerous.\n` +
+            `Warden: Execution blocked — file content flagged as dangerous.\n` +
             `File: ${execPath}\n` +
             `Risk: ${fileEvalResult.riskLevel} | Dimensions: ${fileEvalResult.riskDimensions.join(", ")}\n` +
             `Reason: ${fileEvalResult.explanation}` +
@@ -525,7 +525,7 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
             : ""
 
           throw new Error(
-            `Security Guard: Tool call blocked by safety evaluation.\n` +
+            `Warden: Tool call blocked by safety evaluation.\n` +
             `Risk: ${safetyResult.riskLevel} | Dimensions: ${safetyResult.riskDimensions.join(", ")}\n` +
             `Reason: ${safetyResult.explanation}` +
             suggestion +

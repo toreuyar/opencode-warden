@@ -13,10 +13,25 @@ export function createSecurityDashboardTool(deps: DashboardDeps) {
 
   return {
     description:
-      "View security guard status and detection statistics for the current session",
-    args: {},
-    async execute(): Promise<string> {
+      "View Warden status and detection statistics for the current session",
+    args: {
+      mode: {
+        type: "string" as const,
+        optional: true,
+        description: 'Display mode: "full" (default) or "brief" (one-line status)',
+      },
+    },
+    async execute(args: { mode?: string }): Promise<string> {
       const summary = sessionStats.getSummary()
+
+      if (args.mode === "brief") {
+        const hasIssues = summary.blockedAttempts > 0 || summary.safetyBlocks > 0
+        const status = hasIssues ? "ALERT" : "OK"
+        const llmStatus = llmSanitizer
+          ? (llmSanitizer.isAvailable() ? "available" : "cooldown")
+          : (config.llm.enabled ? "no providers" : "disabled")
+        return `Warden: ${status} | ${summary.totalToolCalls} calls | ${summary.totalDetections} detections | ${summary.blockedAttempts} blocks | LLM: ${llmStatus}`
+      }
 
       const activeCategories = (
         Object.entries(config.categories) as [PatternCategory, boolean][]
@@ -25,7 +40,7 @@ export function createSecurityDashboardTool(deps: DashboardDeps) {
         .map(([cat]) => cat)
 
       const lines: string[] = []
-      lines.push("=== Security Guard Dashboard ===")
+      lines.push("=== Warden Dashboard ===")
       lines.push("")
 
       // Status
