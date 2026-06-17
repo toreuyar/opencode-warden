@@ -142,6 +142,12 @@ export const Warden: Plugin = async ({ client: sdkClient, directory }) => {
   }
 
   // ─── Shared State ───
+  type SessionPromptState = {
+    agent?: string
+    model?: { providerID: string; modelID: string }
+    variant?: string
+  }
+  const sessionPromptState = new Map<string, SessionPromptState>()
   const toastState: ToastState = {
     lastToastTime: 0,
     minInterval: 2000, // Max 1 toast per 2 seconds
@@ -149,7 +155,7 @@ export const Warden: Plugin = async ({ client: sdkClient, directory }) => {
   const sessionAllowlist = new Set<string>()
   const evaluatedCalls = new Set<string>()
   const writtenFileRegistry = new Map<string, WrittenFileMetadata>()
-  let policyInjected = false
+  const policyInjected = new Set<string>()
   const securityPolicyText = buildSecurityPolicyContext(config)
 
   // ─── Create Hooks ───
@@ -275,15 +281,26 @@ export const Warden: Plugin = async ({ client: sdkClient, directory }) => {
       output: { args: Record<string, unknown> },
     ) => {
       // Inject security policy into session on first tool call
-      if (!policyInjected && input.sessionID) {
-        policyInjected = true
+      if (!policyInjected.has(input.sessionID) && input.sessionID) {
+        policyInjected.add(input.sessionID)
         try {
+          const state = sessionPromptState.get(input.sessionID)
+          const body: {
+            noReply: true
+            parts: { type: "text"; text: string }[]
+            agent?: string
+            model?: { providerID: string; modelID: string }
+            variant?: string
+          } = {
+            noReply: true,
+            parts: [{ type: "text", text: securityPolicyText }],
+          }
+          if (state?.agent) body.agent = state.agent
+          if (state?.model) body.model = state.model
+          if (state?.variant) body.variant = state.variant
           await client.session.prompt({
             path: { id: input.sessionID },
-            body: {
-              noReply: true,
-              parts: [{ type: "text", text: securityPolicyText }],
-            },
+            body,
           })
         } catch {
           // Non-critical — compaction context is the fallback
@@ -295,17 +312,39 @@ export const Warden: Plugin = async ({ client: sdkClient, directory }) => {
     "permission.ask": permissionHandler,
     "shell.env": envSanitizer,
     "experimental.session.compacting": compactionContext,
+    "chat.message": async ({ sessionID, agent, model, variant }) => {
+      try {
+        if (!sessionID) return
+        const existing = sessionPromptState.get(sessionID) ?? {}
+        sessionPromptState.set(sessionID, {
+          ...existing,
+          ...(agent !== undefined ? { agent } : {}),
+          ...(model ? { model } : {}),
+          ...(variant !== undefined ? { variant } : {}),
+        })
+      } catch {
+        // Non-critical
+      }
+    },
 
     event: async ({ event }) => {
-      if (event.type === "session.created") {
-        diagnosticLogger?.info("Session reset: clearing all state")
-        sessionStats.reset("")
-        sessionAllowlist.clear()
-        evaluatedCalls.clear()
-        writtenFileRegistry.clear()
-        policyInjected = false
-        llmSanitizer?.reset()
-        safetyEvaluator?.reset()
+      try {
+        if (event.type === "session.created") {
+          const sessionID = event.properties?.info?.id
+          if (sessionID) {
+            sessionPromptState.delete(sessionID)
+            policyInjected.delete(sessionID)
+            diagnosticLogger?.info("Session reset: clearing state", { sessionID })
+          }
+          sessionStats.reset("")
+          sessionAllowlist.clear()
+          evaluatedCalls.clear()
+          writtenFileRegistry.clear()
+          llmSanitizer?.reset()
+          safetyEvaluator?.reset()
+        }
+      } catch {
+        // Non-critical
       }
     },
 
