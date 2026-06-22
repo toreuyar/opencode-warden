@@ -463,4 +463,24 @@ describe("Configuration", () => {
     })
     expect(result.success).toBe(true)
   })
+
+  // ─── Policy Config ───
+
+  test("default config has policy.filePath", () => {
+    expect(DEFAULT_CONFIG.policy.filePath).toBe(".opencode/warden/policy.log.json")
+  })
+
+  test("Zod schema validates policy config with custom filePath", () => {
+    const result = securityGuardConfigSchema.safeParse({
+      policy: { filePath: "/custom/path/policy.log.json" },
+    })
+    expect(result.success).toBe(true)
+  })
+
+  test("Zod schema accepts empty policy config", () => {
+    const result = securityGuardConfigSchema.safeParse({
+      policy: {},
+    })
+    expect(result.success).toBe(true)
+  })
 })

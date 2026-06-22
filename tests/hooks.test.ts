@@ -7,7 +7,7 @@ import { createInputSanitizer } from "../src/hooks/input-sanitizer.js"
 import { createOutputRedactor } from "../src/hooks/output-redactor.js"
 import { createEnvSanitizer } from "../src/hooks/env-sanitizer.js"
 import { createCompactionContext } from "../src/hooks/compaction-context.js"
-import type { PluginClient, ToastState, WrittenFileMetadata } from "../src/types.js"
+import type { PluginClient, ToastState, WrittenFileMetadata, SecurityGuardConfig } from "../src/types.js"
 
 const mockClient: PluginClient = {
   app: {
