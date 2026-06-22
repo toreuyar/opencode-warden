@@ -45,6 +45,10 @@ const diagnosticLogSchema = z.object({
   maxFiles: z.number().int().positive().optional(),
 })
 
+const policyConfigSchema = z.object({
+  filePath: z.string().optional(),
+})
+
 const envSanitizerSchema = z.object({
   enabled: z.boolean().optional(),
   stripPatterns: z.array(z.string()).optional(),
@@ -165,6 +169,7 @@ export const securityGuardConfigSchema = z.object({
   env: envSanitizerSchema.optional(),
   indirectExecution: indirectExecutionSchema.optional(),
   llm: llmConfigSchema.optional(),
+  policy: policyConfigSchema.optional(),
 })
 
 export type SecurityGuardUserConfig = z.infer<typeof securityGuardConfigSchema>

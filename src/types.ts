@@ -143,6 +143,10 @@ export interface DiagnosticLogConfig {
   maxFiles: number
 }
 
+export interface PolicyConfig {
+  filePath: string
+}
+
 export interface CustomPatternConfig {
   id: string
   name: string
@@ -164,6 +168,7 @@ export interface SecurityGuardConfig {
   notifications: boolean
   audit: AuditConfig
   diagnosticLog: DiagnosticLogConfig
+  policy: PolicyConfig
   env: EnvSanitizerConfig
   indirectExecution: IndirectExecutionConfig
   llm: {

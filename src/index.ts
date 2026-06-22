@@ -1,6 +1,7 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
-import { join } from "path"
+import { join, dirname } from "path"
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs"
 import { loadConfig } from "./config/index.js"
 import { createDetectionEngine } from "./detection/index.js"
 import { AuditLogger, SessionStats, DiagnosticLogger, LlmChatLogger } from "./audit/index.js"
@@ -18,7 +19,7 @@ import { createSecurityHelpTool } from "./tools/security-help.js"
 import { createSecurityAuditTool } from "./tools/security-audit.js"
 import { createSecurityEvaluateTool } from "./tools/security-evaluate.js"
 import { createSecurityConfigTool } from "./tools/security-config.js"
-import type { ToastState, PatternCategory, PluginClient, WrittenFileMetadata } from "./types.js"
+import type { ToastState, PatternCategory, PluginClient, WrittenFileMetadata, SecurityGuardConfig } from "./types.js"
 
 export const Warden: Plugin = async ({ client: sdkClient, directory }) => {
   // Cast SDK client to our PluginClient interface
@@ -141,6 +142,28 @@ export const Warden: Plugin = async ({ client: sdkClient, directory }) => {
     }
   }
 
+  // ─── Policy Log Persistence ───
+  function getPolicyLogPath(config: SecurityGuardConfig, projectDir: string): string {
+    const fp = config.policy?.filePath || ".opencode/warden/policy.log.json"
+    return fp.startsWith("/") ? fp : join(projectDir, fp)
+  }
+
+  function loadPolicyLog(config: SecurityGuardConfig, projectDir: string): Set<string> {
+    const path = getPolicyLogPath(config, projectDir)
+    if (!existsSync(path)) return new Set()
+    try {
+      const data = JSON.parse(readFileSync(path, "utf-8"))
+      return new Set(data.sessionIds || [])
+    } catch { return new Set() }
+  }
+
+  function savePolicyLog(config: SecurityGuardConfig, projectDir: string, set: Set<string>): void {
+    const path = getPolicyLogPath(config, projectDir)
+    const dir = dirname(path)
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+    writeFileSync(path, JSON.stringify({ sessionIds: [...set] }, null, 2))
+  }
+
   // ─── Shared State ───
   type SessionPromptState = {
     agent?: string
@@ -155,7 +178,7 @@ export const Warden: Plugin = async ({ client: sdkClient, directory }) => {
   const sessionAllowlist = new Set<string>()
   const evaluatedCalls = new Set<string>()
   const writtenFileRegistry = new Map<string, WrittenFileMetadata>()
-  const policyInjected = new Set<string>()
+  const policyInjected = loadPolicyLog(config, directory)
   const securityPolicyText = buildSecurityPolicyContext(config)
 
   // ─── Create Hooks ───
@@ -283,6 +306,7 @@ export const Warden: Plugin = async ({ client: sdkClient, directory }) => {
       // Inject security policy into session on first tool call
       if (!policyInjected.has(input.sessionID) && input.sessionID) {
         policyInjected.add(input.sessionID)
+        savePolicyLog(config, directory, policyInjected)
         try {
           const state = sessionPromptState.get(input.sessionID)
           const body: {
@@ -334,6 +358,7 @@ export const Warden: Plugin = async ({ client: sdkClient, directory }) => {
           if (sessionID) {
             sessionPromptState.delete(sessionID)
             policyInjected.delete(sessionID)
+            savePolicyLog(config, directory, policyInjected)
             diagnosticLogger?.info("Session reset: clearing state", { sessionID })
           }
           sessionStats.reset("")

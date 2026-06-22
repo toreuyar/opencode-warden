@@ -92,6 +92,9 @@ export const DEFAULT_CONFIG: SecurityGuardConfig = {
       "MONGODB_URI",
     ],
   },
+  policy: {
+    filePath: ".opencode/warden/policy.log.json",
+  },
   indirectExecution: {
     enabled: true,
     scriptExtensions: [
