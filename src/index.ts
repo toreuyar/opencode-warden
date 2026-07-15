@@ -197,6 +197,7 @@ export const Warden: Plugin = async ({ client: sdkClient, directory }) => {
     client,
     safetyEvaluator,
     evaluatedCalls,
+    sessionAllowlist,
     auditLogger,
     diagnosticLogger,
   })

@@ -58,6 +58,7 @@ describe("permission-handler", () => {
         client: makeClient() as any,
         safetyEvaluator: null,
         evaluatedCalls: new Set(),
+        sessionAllowlist: new Set(),
         auditLogger: makeAuditLogger() as any,
         diagnosticLogger: null,
       })
@@ -76,6 +77,7 @@ describe("permission-handler", () => {
         client: makeClient() as any,
         safetyEvaluator: null,
         evaluatedCalls: new Set(),
+        sessionAllowlist: new Set(),
         auditLogger: makeAuditLogger() as any,
         diagnosticLogger: null,
       })
@@ -99,6 +101,7 @@ describe("permission-handler", () => {
         client: makeClient() as any,
         safetyEvaluator: null,
         evaluatedCalls: new Set(),
+        sessionAllowlist: new Set(),
         auditLogger: auditLogger as any,
         diagnosticLogger: null,
       })
@@ -120,6 +123,7 @@ describe("permission-handler", () => {
         client: makeClient() as any,
         safetyEvaluator: null,
         evaluatedCalls: new Set(),
+        sessionAllowlist: new Set(),
         auditLogger: makeAuditLogger() as any,
         diagnosticLogger: null,
       })
@@ -149,6 +153,7 @@ describe("permission-handler", () => {
         client: makeClient() as any,
         safetyEvaluator: evaluator as any,
         evaluatedCalls: new Set(),
+        sessionAllowlist: new Set(),
         auditLogger: auditLogger as any,
         diagnosticLogger: null,
       })
@@ -177,6 +182,7 @@ describe("permission-handler", () => {
         client: makeClient() as any,
         safetyEvaluator: evaluator as any,
         evaluatedCalls,
+        sessionAllowlist: new Set(),
         auditLogger: makeAuditLogger() as any,
         diagnosticLogger: null,
       })
@@ -212,6 +218,7 @@ describe("permission-handler", () => {
         client: client as any,
         safetyEvaluator: evaluator as any,
         evaluatedCalls: new Set(),
+        sessionAllowlist: new Set(),
         auditLogger: makeAuditLogger() as any,
         diagnosticLogger: null,
       })
@@ -245,6 +252,7 @@ describe("permission-handler", () => {
         client: makeClient() as any,
         safetyEvaluator: evaluator as any,
         evaluatedCalls: new Set(),
+        sessionAllowlist: new Set(),
         auditLogger: makeAuditLogger() as any,
         diagnosticLogger: null,
       })
@@ -278,6 +286,7 @@ describe("permission-handler", () => {
         client: makeClient() as any,
         safetyEvaluator: evaluator as any,
         evaluatedCalls: new Set(),
+        sessionAllowlist: new Set(),
         auditLogger: makeAuditLogger() as any,
         diagnosticLogger: null,
       })
@@ -308,6 +317,7 @@ describe("permission-handler", () => {
         client: makeClient() as any,
         safetyEvaluator: evaluator as any,
         evaluatedCalls: new Set(),
+        sessionAllowlist: new Set(),
         auditLogger: makeAuditLogger() as any,
         diagnosticLogger: null,
       })
@@ -318,6 +328,161 @@ describe("permission-handler", () => {
         metadata: {},
       }) as any, output)
       expect(capturedArgs.command).toBe("git status")
+    })
+  })
+
+  describe("deterministic checks (before LLM evaluation)", () => {
+    test("denies blockedTools without contacting LLM", async () => {
+      const config = makeConfig({
+        llm: {
+          enabled: true,
+          safetyEvaluator: { actionMode: "permission", enabled: true },
+        },
+      })
+      config.blockedTools = ["task"]
+      const evaluator = {
+        shouldEvaluate: mock(() => true),
+        isBypassed: mock(() => false),
+        evaluate: mock(async () => {
+          throw new Error("should not be called")
+        }),
+      }
+      const auditLogger = makeAuditLogger()
+      const handler = createPermissionHandler({
+        config,
+        client: makeClient() as any,
+        safetyEvaluator: evaluator as any,
+        evaluatedCalls: new Set(),
+        sessionAllowlist: new Set(),
+        auditLogger: auditLogger as any,
+        diagnosticLogger: null,
+      })
+      const output = { status: "ask" as "ask" | "deny" | "allow" }
+      await handler(makeInput({ type: "task" }) as any, output)
+      expect(output.status).toBe("deny")
+      expect(evaluator.evaluate).not.toHaveBeenCalled()
+      expect(auditLogger.log).toHaveBeenCalledWith(
+        expect.objectContaining({
+          blockReason: expect.stringContaining("blocked by security policy"),
+        }),
+      )
+    })
+
+    test("denies blocked file paths without contacting LLM", async () => {
+      const config = makeConfig({
+        llm: {
+          enabled: true,
+          safetyEvaluator: { actionMode: "permission", enabled: true },
+        },
+      })
+      const evaluator = {
+        shouldEvaluate: mock(() => true),
+        isBypassed: mock(() => false),
+        evaluate: mock(async () => {
+          throw new Error("should not be called")
+        }),
+      }
+      const auditLogger = makeAuditLogger()
+      const handler = createPermissionHandler({
+        config,
+        client: makeClient() as any,
+        safetyEvaluator: evaluator as any,
+        evaluatedCalls: new Set(),
+        sessionAllowlist: new Set(),
+        auditLogger: auditLogger as any,
+        diagnosticLogger: null,
+      })
+      const output = { status: "ask" as "ask" | "deny" | "allow" }
+      await handler(makeInput({
+        type: "read",
+        title: "read .env",
+        metadata: { filePath: "/project/.env" },
+      }) as any, output)
+      expect(output.status).toBe("deny")
+      expect(evaluator.evaluate).not.toHaveBeenCalled()
+      expect(auditLogger.log).toHaveBeenCalledWith(
+        expect.objectContaining({
+          blockReason: expect.stringContaining(".env"),
+        }),
+      )
+    })
+
+    test("allowlisted file paths bypass the block and reach LLM", async () => {
+      const config = makeConfig({
+        llm: {
+          enabled: true,
+          safetyEvaluator: { actionMode: "permission", enabled: true },
+        },
+      })
+      const evaluator = {
+        shouldEvaluate: mock(() => true),
+        isBypassed: mock(() => false),
+        evaluate: mock(async () => ({
+          safe: true,
+          riskLevel: "low",
+          riskDimensions: [],
+          explanation: "safe",
+          suggestedAlternative: "",
+          recommendation: "allow",
+        })),
+      }
+      const sessionAllowlist = new Set<string>()
+      sessionAllowlist.add("/project/.env")
+      const handler = createPermissionHandler({
+        config,
+        client: makeClient() as any,
+        safetyEvaluator: evaluator as any,
+        evaluatedCalls: new Set(),
+        sessionAllowlist,
+        auditLogger: makeAuditLogger() as any,
+        diagnosticLogger: null,
+      })
+      const output = { status: "ask" as "ask" | "deny" | "allow" }
+      await handler(makeInput({
+        type: "read",
+        title: "read .env",
+        metadata: { filePath: "/project/.env" },
+      }) as any, output)
+      expect(output.status).toBe("allow")
+      expect(evaluator.evaluate).toHaveBeenCalled()
+    })
+
+    test("non-blocked file paths proceed to LLM evaluation", async () => {
+      const config = makeConfig({
+        llm: {
+          enabled: true,
+          safetyEvaluator: { actionMode: "permission", enabled: true },
+        },
+      })
+      const evaluator = {
+        shouldEvaluate: mock(() => true),
+        isBypassed: mock(() => false),
+        evaluate: mock(async () => ({
+          safe: true,
+          riskLevel: "low",
+          riskDimensions: [],
+          explanation: "safe",
+          suggestedAlternative: "",
+          recommendation: "allow",
+        })),
+      }
+      const handler = createPermissionHandler({
+        config,
+        client: makeClient() as any,
+        safetyEvaluator: evaluator as any,
+        evaluatedCalls: new Set(),
+        sessionAllowlist: new Set(),
+        auditLogger: makeAuditLogger() as any,
+        diagnosticLogger: null,
+      })
+      const output = { status: "ask" as "ask" | "deny" | "allow" }
+      await handler(makeInput({
+        type: "read",
+        title: "read main.ts",
+        metadata: { filePath: "/project/src/main.ts" },
+      }) as any, output)
+      expect(output.status).toBe("allow")
+      expect(evaluator.evaluate).toHaveBeenCalled()
     })
   })
 })

@@ -6,6 +6,12 @@ import type {
   PluginClient,
 } from "../types.js"
 import { isRemoteCommand } from "../utils/ssh.js"
+import {
+  isBlockedPath,
+  isAllowlisted,
+  extractFilePath,
+  extractRemoteFilePathsFromArgs,
+} from "../utils/paths.js"
 
 interface PermissionInput {
   id: string
@@ -24,6 +30,7 @@ interface PermissionHandlerDeps {
   client: PluginClient
   safetyEvaluator: SafetyEvaluator | null
   evaluatedCalls: Set<string>
+  sessionAllowlist: Set<string>
   auditLogger: AuditLogger
   diagnosticLogger: DiagnosticLogger | null
 }
@@ -34,6 +41,7 @@ export function createPermissionHandler(deps: PermissionHandlerDeps) {
     client,
     safetyEvaluator,
     evaluatedCalls,
+    sessionAllowlist,
     auditLogger,
     diagnosticLogger,
   } = deps
@@ -156,6 +164,165 @@ export function createPermissionHandler(deps: PermissionHandlerDeps) {
     if (toolName === "bash" && !args.command && input.title) {
       args.command = input.title
     }
+
+    // ─── Deterministic checks (before LLM evaluation) ───
+    // These must run before LLM safety evaluation so that deterministic
+    // blocks produce accurate messages. Without this, a call that would be
+    // blocked by file path rules instead shows "LLM unreachable" when the
+    // LLM is down — because the LLM evaluation pre-empts the deterministic
+    // checks that live in the input sanitizer.
+
+    // Check blockedTools
+    if (config.blockedTools.includes(toolName)) {
+      debugLog?.(`Permission hook: tool=${toolName} → DENIED (blockedTools)`)
+      diagnosticLogger?.decision("permission-handler", toolName, `DENIED by blockedTools policy`)
+      output.status = "deny"
+
+      await auditLogger.log({
+        timestamp: new Date().toISOString(),
+        tool: toolName,
+        hook: "permission",
+        sessionId: input.sessionID,
+        callId: callID ?? input.id,
+        detections: [],
+        blocked: true,
+        blockReason: `Tool "${toolName}" is blocked by security policy`,
+        redactedCount: 0,
+      })
+
+      if (config.notifications) {
+        try {
+          await client.tui.showToast({
+            body: {
+              message: `🛡 Denied: tool "${toolName}" is not allowed`,
+              variant: "error" as const,
+            },
+          })
+        } catch { /* toast failure is non-critical */ }
+      }
+
+      try {
+        await client.session.prompt({
+          path: { id: input.sessionID },
+          body: {
+            noReply: true,
+            parts: [{
+              type: "text",
+              text: `Warden: Tool "${toolName}" is blocked by security policy. This tool has been disabled by the administrator.`,
+            }],
+          },
+        })
+      } catch { /* session prompt injection is non-critical */ }
+
+      diagnosticLogger?.hookEnd("permission-handler", toolName, input.callID ?? input.id, Date.now() - hookStart, { outcome: "deny", reason: "blockedTools" })
+      return
+    }
+
+    // Check blocked file paths
+    const deterministicFilePath = extractFilePath(toolName, args)
+    if (deterministicFilePath) {
+      if (
+        !isAllowlisted(deterministicFilePath, sessionAllowlist) &&
+        isBlockedPath(deterministicFilePath, config.blockedFilePaths, config.whitelistedPaths)
+      ) {
+        debugLog?.(`Permission hook: tool=${toolName} → DENIED (blocked file path: ${deterministicFilePath})`)
+        diagnosticLogger?.decision("permission-handler", toolName, `DENIED file path: ${deterministicFilePath}`)
+        output.status = "deny"
+
+        await auditLogger.log({
+          timestamp: new Date().toISOString(),
+          tool: toolName,
+          hook: "permission",
+          sessionId: input.sessionID,
+          callId: callID ?? input.id,
+          detections: [],
+          blocked: true,
+          blockReason: `Blocked file path: ${deterministicFilePath}`,
+          redactedCount: 0,
+        })
+
+        if (config.notifications) {
+          try {
+            await client.tui.showToast({
+              body: {
+                message: `🛡 Denied: ${deterministicFilePath} access denied`,
+                variant: "error" as const,
+              },
+            })
+          } catch { /* toast failure is non-critical */ }
+        }
+
+        try {
+          await client.session.prompt({
+            path: { id: input.sessionID },
+            body: {
+              noReply: true,
+              parts: [{
+                type: "text",
+                text: `Warden: Access to "${deterministicFilePath}" is blocked by security policy. This file may contain sensitive data. If you need access, ask the user to temporarily allowlist it.`,
+              }],
+            },
+          })
+        } catch { /* session prompt injection is non-critical */ }
+
+        diagnosticLogger?.hookEnd("permission-handler", toolName, input.callID ?? input.id, Date.now() - hookStart, { outcome: "deny", reason: "blocked file path" })
+        return
+      }
+    }
+
+    // Check remote file paths (SSH/SCP)
+    const remotePaths = extractRemoteFilePathsFromArgs(toolName, args)
+    for (const remotePath of remotePaths) {
+      if (
+        !isAllowlisted(remotePath, sessionAllowlist) &&
+        isBlockedPath(remotePath, config.blockedFilePaths, config.whitelistedPaths)
+      ) {
+        debugLog?.(`Permission hook: tool=${toolName} → DENIED (blocked remote file path: ${remotePath})`)
+        diagnosticLogger?.decision("permission-handler", toolName, `DENIED remote file path: ${remotePath}`)
+        output.status = "deny"
+
+        await auditLogger.log({
+          timestamp: new Date().toISOString(),
+          tool: toolName,
+          hook: "permission",
+          sessionId: input.sessionID,
+          callId: callID ?? input.id,
+          detections: [],
+          blocked: true,
+          blockReason: `Blocked remote file path: ${remotePath}`,
+          redactedCount: 0,
+        })
+
+        if (config.notifications) {
+          try {
+            await client.tui.showToast({
+              body: {
+                message: `🛡 Denied: remote access to ${remotePath} denied`,
+                variant: "error" as const,
+              },
+            })
+          } catch { /* toast failure is non-critical */ }
+        }
+
+        try {
+          await client.session.prompt({
+            path: { id: input.sessionID },
+            body: {
+              noReply: true,
+              parts: [{
+                type: "text",
+                text: `Warden: Remote access to "${remotePath}" is blocked by security policy. This file may contain sensitive data. If you need access, ask the user to temporarily allowlist it.`,
+              }],
+            },
+          })
+        } catch { /* session prompt injection is non-critical */ }
+
+        diagnosticLogger?.hookEnd("permission-handler", toolName, input.callID ?? input.id, Date.now() - hookStart, { outcome: "deny", reason: "blocked remote file path" })
+        return
+      }
+    }
+
+    // ─── End deterministic checks ───
 
     // Check bypass list
     if (safetyEvaluator.isBypassed(toolName, args)) {

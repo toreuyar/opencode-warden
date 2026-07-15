@@ -10,7 +10,7 @@ import type {
   PatternCategory,
   WrittenFileMetadata,
 } from "../types.js"
-import { isBlockedPath, extractFilePath, extractRemoteFilePathsFromArgs } from "../utils/paths.js"
+import { isBlockedPath, isAllowlisted, extractFilePath, extractRemoteFilePathsFromArgs } from "../utils/paths.js"
 import { deepScan } from "../utils/deep-scan.js"
 import {
   extractExecutedFilePaths,
@@ -131,18 +131,10 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
     // Step 1: Check file path blocking
     const filePath = extractFilePath(input.tool, output.args)
     if (filePath) {
-      // Check session allowlist first
-      const isAllowlisted = sessionAllowlist.has(filePath) ||
-        [...sessionAllowlist].some((pattern) => {
-          try {
-            return new RegExp(pattern.replace(/\*/g, ".*")).test(filePath)
-          } catch {
-            return false
-          }
-        })
+      const isAllowlistedPath = isAllowlisted(filePath, sessionAllowlist)
 
       if (
-        !isAllowlisted &&
+        !isAllowlistedPath &&
         isBlockedPath(filePath, config.blockedFilePaths, config.whitelistedPaths)
       ) {
         diagnosticLogger?.decision("input-sanitizer", input.tool, `BLOCKED file path: ${filePath}`)
@@ -179,17 +171,10 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
     // Step 1b: Check remote file paths in SSH/SCP commands
     const remotePaths = extractRemoteFilePathsFromArgs(input.tool, output.args)
     for (const remotePath of remotePaths) {
-      const isRemoteAllowlisted = sessionAllowlist.has(remotePath) ||
-        [...sessionAllowlist].some((pattern) => {
-          try {
-            return new RegExp(pattern.replace(/\*/g, ".*")).test(remotePath)
-          } catch {
-            return false
-          }
-        })
+      const isRemoteAllowlistedPath = isAllowlisted(remotePath, sessionAllowlist)
 
       if (
-        !isRemoteAllowlisted &&
+        !isRemoteAllowlistedPath &&
         isBlockedPath(remotePath, config.blockedFilePaths, config.whitelistedPaths)
       ) {
         sessionStats.recordBlock(input.tool, remotePath, "Blocked remote file path")

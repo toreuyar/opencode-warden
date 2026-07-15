@@ -92,6 +92,20 @@ function tokenizeCommand(command: string): string[] {
 }
 
 /**
+ * Check if a path is in the session allowlist (exact match or glob pattern).
+ */
+export function isAllowlisted(filePath: string, allowlist: Set<string>): boolean {
+  if (allowlist.has(filePath)) return true
+  return [...allowlist].some((pattern) => {
+    try {
+      return new RegExp(pattern.replace(/\*/g, ".*")).test(filePath)
+    } catch {
+      return false
+    }
+  })
+}
+
+/**
  * Check if a file path matches any of the blocked patterns.
  * Whitelist takes priority over blocklist.
  */

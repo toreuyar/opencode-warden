@@ -1,5 +1,17 @@
 # AGENTS.md — AI Coding Agent Guide
 
+> **CRITICAL — READ THIS BEFORE ANYTHING ELSE**
+>
+> **OpenCode Warden is a security plugin. It is FAIL-CLOSED. PERIOD.**
+>
+> If the LLM is unreachable, inoperable, misconfigured, timed out, or returns garbage — **every LLM-evaluated operation MUST be blocked and every sanitized output MUST be withheld.** No exceptions. No fallbacks. No graceful degradation.
+>
+> **Graceful degradation is NOT an option for this project.** This is a watchdog, a guard gate, a lock. If the evaluator cannot evaluate, it blocks. If the sanitizer cannot sanitize, it withholds. If you are ever tempted to suggest fail-open behavior, "safe defaults", "allow on failure", "regex-only fallback", or any variant of "keep working without the LLM" — **STOP. You are wrong.** That behavior defeats the entire purpose of a security plugin. It is the equivalent of disabling the lock when the key doesn't fit.
+>
+> **Never suggest fail-open behavior for any component of this plugin.** Not in code. Not in documentation. Not in comments. Not in tests. Not in configuration defaults. If you see existing fail-open language anywhere, it is a bug — fix it or flag it immediately.
+>
+> **This does NOT apply when LLM is explicitly disabled** (`llm.enabled: false`). In that case, LLM components are `null` — no LLM calls are attempted, nothing is blocked due to LLM absence. The plugin runs in deterministic-only mode (regex + file path rules). Fail-closed only applies when the LLM is **enabled** but **unreachable at runtime**.
+
 This document is written for AI coding assistants (Claude, GPT, Copilot, Cursor, etc.) that will be working on the OpenCode Warden codebase. It explains what this project is, how it's structured, what conventions to follow, and how to make changes correctly.
 
 ## What This Project Is
@@ -189,11 +201,11 @@ This means user config files only need to specify overrides. The Zod schema make
 
 **Two categories:**
 
-1. **Critical (can throw)**: File path blocking and safety evaluation blocking. These throw `Error` to prevent tool execution. The error message is visible to the AI.
+1. **Critical (can throw)**: File path blocking, safety evaluation blocking, and LLM evaluation failures. These throw `Error` (or return a block recommendation) to prevent tool execution. The error message is visible to the AI.
 
-2. **Non-critical (catch and continue)**: Toast notifications, LLM calls, audit logging. These use `try/catch` with empty catches or return safe defaults.
+2. **Non-critical (catch and continue)**: Toast notifications and audit logging. These use `try/catch` with empty catches.
 
-**LLM components are fail-open**: If the LLM is unavailable, safety evaluator returns `{ safe: true, recommendation: "allow" }` and output sanitizer returns the original text unchanged. This prevents the plugin from becoming a single point of failure.
+**LLM components are fail-closed**: If the LLM is unavailable, the safety evaluator returns `{ safe: false, recommendation: "block" }` and the output sanitizer withholds output entirely. A security plugin must never degrade to permissive behavior when its evaluator is down — that would be like disabling the lock when the key doesn't fit. The plugin blocking all LLM-evaluated operations during an outage is the correct, intended behavior.
 
 Pattern you will see frequently:
 ```typescript
@@ -507,9 +519,9 @@ The `evaluatedCalls: Set<string>` prevents double LLM evaluation. When `permissi
 - Avoiding wasted LLM calls
 - Preventing inconsistent results between the two hooks
 
-### Fail-Open LLM
+### Fail-Closed LLM
 
-Both `SafetyEvaluator.evaluate()` and `LlmSanitizer.sanitize()` catch all errors and return safe defaults. Do not change this behavior — the plugin must never become a blocker when the LLM is unavailable.
+Both `SafetyEvaluator.evaluate()` and `LlmSanitizer.sanitize()` catch all errors and return blocking defaults. Do not change this behavior — the plugin must block when the LLM is unavailable. This is a security watchdog: if it cannot evaluate, it must not let anything through. Fail-open on a security layer defeats its entire purpose.
 
 ### Toast Rate Limiting
 
@@ -566,7 +578,7 @@ Before considering any change complete:
 4. New features have tests
 5. Config changes appear in defaults, schema, and types
 6. Mutable state resets on `session.created`
-7. LLM-dependent code is fail-open
+7. LLM-dependent code is fail-closed
 8. Blocking errors start with `"Security Guard:"`
 9. Non-critical operations use `try/catch` with empty catches
 10. All imports use `.js` extension

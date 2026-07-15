@@ -265,7 +265,7 @@ return {
 ### Design Decisions
 
 - **Security policy injection**: Done on the first tool call (not session creation) because we need a `sessionID` to call `session.prompt`. This ensures the AI knows about security constraints from the start.
-- **Non-blocking health check**: The LLM health check runs in the background to avoid delaying plugin startup. If it fails, we show a toast and fall back to regex-only mode.
+- **Non-blocking health check**: The LLM health check runs in the background to avoid delaying plugin startup. If it fails, we show a toast warning that all LLM-evaluated operations will be blocked until the LLM is available.
 - **Shared mutable state**: `evaluatedCalls`, `sessionAllowlist`, and `toastState` are shared by reference across hook closures. This is safe because all hooks run sequentially within the OpenCode event loop (no concurrent access).
 
 ---
@@ -780,9 +780,9 @@ else                         → recommendation = "allow"
 
 This overrides whatever recommendation the LLM gave. The LLM might say "allow" for a medium-risk operation, but if `warnThreshold` is `"medium"`, we override to "warn".
 
-**Response parsing** (`parseResponse()`): Extracts JSON from the LLM response using a regex `/\{[\s\S]*\}/`. This handles cases where the LLM wraps JSON in markdown code blocks. Falls back to `{ safe: true, riskLevel: "none", recommendation: "allow" }` if parsing fails.
+**Response parsing** (`parseResponse()`): Extracts JSON from the LLM response using a regex `/\{[\s\S]*\}/`. This handles cases where the LLM wraps JSON in markdown code blocks. Falls back to `{ safe: false, riskLevel: "critical", recommendation: "block" }` if parsing fails.
 
-**Fail-open design**: If the LLM call fails (timeout, network error, parse error), the evaluator returns a safe "allow" result. This prevents the LLM being unavailable from blocking all tool calls.
+**Fail-closed design**: If the LLM call fails (timeout, network error, parse error), the evaluator returns a blocking `{ safe: false, recommendation: "block" }` result. This is a security plugin — if it cannot evaluate, it must not let anything through.
 
 ### `llm/index.ts` — LlmSanitizer Class
 
@@ -798,7 +798,7 @@ The `LlmSanitizer` handles the second-pass output sanitization.
 3. Parse JSON response: `{ sanitized, detections[] }`
 4. Return sanitized output with detection list
 
-**Fail-open**: Returns the original output unchanged if the LLM call fails.
+**Fail-closed**: Throws on LLM call failure — the caller (output redactor) withholds the output entirely if sanitization cannot be completed.
 
 ---
 
@@ -1195,41 +1195,41 @@ This reduces false positives — random 16-digit numbers that don't pass Luhn ar
 
 ## Error Handling Philosophy
 
-The plugin follows a **fail-open, log-and-continue** philosophy for non-critical operations:
+The plugin follows a **fail-closed** philosophy for LLM-dependent security operations, and a **log-and-continue** philosophy for non-critical operations:
 
 ### Critical Operations (can throw)
 
 - **File path blocking**: Throws `Error` to prevent tool execution. The AI sees the error message.
 - **Safety evaluation blocking**: Throws `Error` with risk details. The AI sees why the command was blocked.
+- **LLM evaluation failures**: When the LLM is unreachable, the safety evaluator returns `{ recommendation: "block" }` and the output sanitizer withholds output entirely. This is fail-closed by design — a security plugin must block when it cannot evaluate.
 
 ### Non-Critical Operations (catch and continue)
 
 - **Toast notifications**: Wrapped in `try/catch` — toast failures never break tool execution
-- **LLM calls**: Caught and defaulted to safe "allow" responses — LLM unavailability doesn't block all tools
 - **Audit logging**: Caught silently — logging failures don't affect tool execution
-- **Health checks**: Non-blocking, caught and logged — unhealthy LLM falls back to regex-only
+- **Health checks**: Non-blocking, caught and logged
 
 ### Pattern: `catch { /* toast failure is non-critical */ }`
 
 This pattern appears frequently throughout the codebase. The empty catch is intentional — toast failures are truly non-critical and logging them would create noise.
 
-### Pattern: Fail-Open LLM
+### Pattern: Fail-Closed LLM
 
-Both the `SafetyEvaluator` and `LlmSanitizer` return safe/unchanged defaults when the LLM fails:
+Both the `SafetyEvaluator` and `LlmSanitizer` return blocking defaults when the LLM fails:
 
 ```typescript
 // SafetyEvaluator.evaluate()
 catch (err) {
-  return { safe: true, riskLevel: "none", ..., recommendation: "allow" }
+  return { safe: false, riskLevel: "critical", ..., recommendation: "block" }
 }
 
 // LlmSanitizer.sanitize()
 catch (err) {
-  return { sanitized: rawOutput, detections: [] }  // Return unchanged output
+  throw new Error(`LLM sanitization failed: ${errMsg}`)  // Output withheld by caller
 }
 ```
 
-This ensures the plugin never becomes a point of failure — if the LLM is down, regex-only mode continues working.
+A security plugin must never degrade to permissive behavior when its evaluator is down. If the LLM is unreachable, all LLM-evaluated operations are blocked and all sanitized output is withheld. This is the correct, intended behavior — fail-open on a security layer is like disabling the lock when the key doesn't fit.
 
 ---
 
@@ -1373,11 +1373,11 @@ try {
   await client.tui.showToast({ ... })
 } catch { /* toast failure is non-critical */ }
 
-// LLM failure — fail open
+// LLM failure — fail closed (block)
 try {
   const result = await safetyEvaluator.evaluate(tool, args)
 } catch {
-  return { safe: true, riskLevel: "none", recommendation: "allow" }
+  return { safe: false, riskLevel: "critical", recommendation: "block" }
 }
 ```
 

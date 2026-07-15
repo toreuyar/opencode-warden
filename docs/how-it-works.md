@@ -67,7 +67,7 @@ The detection engine uses a two-pass approach:
 - Optional second pass using a local or remote LLM
 - Receives tool name, arguments, and title as context
 - Catches secrets that regex misses (e.g., base64-encoded credentials, custom token formats)
-- Fails gracefully — if the LLM is unavailable, regex results still apply
+- Fails closed — if the LLM is unavailable, output is withheld entirely (fail-closed by design)
 
 ## LLM Integration
 
