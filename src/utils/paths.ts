@@ -475,9 +475,9 @@ export function isDynamicPathTarget(p: string): boolean {
  * READ targets (checked against blockedFilePaths only):
  *  - Input redirect:          < file
  *
-   * Skips: fd-duplication (2>&1, <&3), fd-close (>&-), heredocs (<<), /dev/null,
-   * and pure-numeric tokens. Quoting and glued redirection operators are handled
-   * by the tokenizer.
+ * Skips: fd-duplication (2>&1, <&3), fd-close (>&-), heredocs (<<), /dev/null,
+ * and pure-numeric tokens. Quoting and glued redirection operators are handled
+ * by the tokenizer.
  */
 export function extractBashFileTargets(command: string): {
   reads: string[]
@@ -543,8 +543,11 @@ export function extractBashFileTargets(command: string): {
       continue
     }
 
-    // truncate [opts] <file>... — every non-flag argument is a write target
+    // truncate [opts] <file>... — every non-flag argument is a write target.
+    // -s/--size and -r/--reference each consume the next token (SIZE or RFILE);
+    // RFILE is a read-reference (truncate reads its size), not a write target.
     if (tok === "truncate") {
+      const argFlags = new Set(["-s", "-r", "--size", "--reference"])
       let j = i + 1
       let optsEnded = false
       while (j < tokens.length) {
@@ -553,6 +556,10 @@ export function extractBashFileTargets(command: string): {
         if (!optsEnded && t === "--") {
           optsEnded = true
           j++
+          continue
+        }
+        if (!optsEnded && argFlags.has(t)) {
+          j += 2 // skip flag + its argument
           continue
         }
         if (!optsEnded && t.startsWith("-")) {

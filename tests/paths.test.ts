@@ -246,6 +246,33 @@ describe("extractBashFileTargets", () => {
     ).toEqual(["/var/log/syslog"])
   })
 
+  test("truncate -s with non-numeric size does not leak the size as a target", () => {
+    // -s 1M: 1M is the SIZE arg, not a file. Must be skipped, not extracted.
+    expect(
+      extractBashFileTargets("truncate -s 1M /var/log/syslog").writes,
+    ).toEqual(["/var/log/syslog"])
+    expect(
+      extractBashFileTargets("truncate -s 100K /var/log/auth.log").writes,
+    ).toEqual(["/var/log/auth.log"])
+  })
+
+  test("truncate -r reference file is not treated as a write target", () => {
+    // -r /etc/hosts references its size (a read); only the real target is written.
+    expect(
+      extractBashFileTargets("truncate -r /etc/hosts /var/log/syslog").writes,
+    ).toEqual(["/var/log/syslog"])
+  })
+
+  test("truncate --size/--reference long forms also skip their argument", () => {
+    expect(
+      extractBashFileTargets("truncate --size 2G /var/log/syslog").writes,
+    ).toEqual(["/var/log/syslog"])
+    expect(
+      extractBashFileTargets("truncate --reference /etc/hosts /var/log/syslog")
+        .writes,
+    ).toEqual(["/var/log/syslog"])
+  })
+
   test("extracts input redirect as a READ target (< file)", () => {
     const r = extractBashFileTargets("mail root < /etc/shadow")
     expect(r.reads).toEqual(["/etc/shadow"])

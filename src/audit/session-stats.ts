@@ -154,7 +154,7 @@ export class SessionStats {
 
     if (s.blockedFilePaths.length > 0) {
       lines.push("")
-      lines.push("--- Blocked File Paths ---")
+      lines.push("--- Blocked File Access ---")
       for (const p of s.blockedFilePaths) {
         lines.push(`  ${p}`)
       }
