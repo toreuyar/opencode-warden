@@ -217,10 +217,10 @@ describe("extractInnerCommand", () => {
 })
 
 describe("extractRemoteFilePaths", () => {
-  test("extracts cat target from SSH inner command", () => {
+  test("extracts cat target from SSH inner command (read)", () => {
     const parsed = parseSshCommand('ssh user@host.com "cat /etc/passwd"')!
     const paths = extractRemoteFilePaths(parsed)
-    expect(paths).toEqual(["/etc/passwd"])
+    expect(paths).toEqual([{ path: "/etc/passwd", mode: "read" }])
   })
 
   test("extracts multiple read targets", () => {
@@ -228,30 +228,30 @@ describe("extractRemoteFilePaths", () => {
       'ssh user@host.com "cat /etc/passwd && head /var/log/syslog"',
     )!
     const paths = extractRemoteFilePaths(parsed)
-    expect(paths).toContain("/etc/passwd")
-    expect(paths).toContain("/var/log/syslog")
+    expect(paths).toContainEqual({ path: "/etc/passwd", mode: "read" })
+    expect(paths).toContainEqual({ path: "/var/log/syslog", mode: "read" })
   })
 
-  test("extracts less target", () => {
+  test("extracts less target (read)", () => {
     const parsed = parseSshCommand('ssh user@host.com "less /home/user/.env"')!
     const paths = extractRemoteFilePaths(parsed)
-    expect(paths).toEqual(["/home/user/.env"])
+    expect(paths).toEqual([{ path: "/home/user/.env", mode: "read" }])
   })
 
-  test("extracts remote path from SCP source", () => {
+  test("extracts remote path from SCP download source (read)", () => {
     const parsed = parseSshCommand(
       "scp user@server.com:/etc/shadow ./local/",
     )!
     const paths = extractRemoteFilePaths(parsed)
-    expect(paths).toEqual(["/etc/shadow"])
+    expect(paths).toEqual([{ path: "/etc/shadow", mode: "read" }])
   })
 
-  test("extracts remote path from SCP destination", () => {
+  test("extracts remote path from SCP upload destination (write)", () => {
     const parsed = parseSshCommand(
       "scp ./local.txt user@server.com:/home/user/.env",
     )!
     const paths = extractRemoteFilePaths(parsed)
-    expect(paths).toEqual(["/home/user/.env"])
+    expect(paths).toEqual([{ path: "/home/user/.env", mode: "write" }])
   })
 
   test("returns empty for SSH without file-reading inner command", () => {

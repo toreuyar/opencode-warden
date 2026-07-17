@@ -158,6 +158,7 @@ export interface SecurityGuardConfig {
   customPatterns: CustomPatternConfig[]
   whitelistedPaths: string[]
   blockedFilePaths: string[]
+  writeProtectedPaths: string[]
   excludedTools: string[]
   blockedTools: string[]
   sshOnlyMode: boolean
@@ -262,6 +263,7 @@ export type RiskDimension =
   | "resource-abuse"
   | "network-manipulation"
   | "supply-chain"
+  | "remote-execution"
   | "indirect-execution"
 
 export interface SafetyEvaluation {

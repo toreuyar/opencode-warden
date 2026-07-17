@@ -22,7 +22,7 @@ describe("buildSecurityPolicyContext", () => {
 
   test("contains blocked files when present", () => {
     const result = buildSecurityPolicyContext(DEFAULT_CONFIG)
-    expect(result).toContain("### Blocked Files")
+    expect(result).toContain("### Blocked Files (no read, no write)")
     expect(result).toContain("**/.env")
     expect(result).toContain("**/*.pem")
   })
@@ -32,6 +32,19 @@ describe("buildSecurityPolicyContext", () => {
     config.blockedFilePaths = []
     const result = buildSecurityPolicyContext(config)
     expect(result).not.toContain("### Blocked Files")
+  })
+
+  test("contains write-protected files section when present", () => {
+    const result = buildSecurityPolicyContext(DEFAULT_CONFIG)
+    expect(result).toContain("### Write-Protected Files (read OK, no write)")
+    expect(result).toContain("**/var/log/**")
+  })
+
+  test("omits write-protected section when empty", () => {
+    const config = makeConfig()
+    config.writeProtectedPaths = []
+    const result = buildSecurityPolicyContext(config)
+    expect(result).not.toContain("### Write-Protected Files")
   })
 
   test("contains blocked commands warning", () => {

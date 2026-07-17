@@ -206,7 +206,7 @@ describe("permission-handler", () => {
         evaluate: mock(async () => ({
           safe: false,
           riskLevel: "critical",
-          riskDimensions: ["destructive-operations"],
+          riskDimensions: ["destruction"],
           explanation: "recursive delete on root",
           suggestedAlternative: "Use targeted deletion",
           recommendation: "block",

@@ -39,6 +39,17 @@ describe("Configuration", () => {
     expect(DEFAULT_CONFIG.blockedFilePaths).toContain("**/*.tfstate")
   })
 
+  test("default config has write-protected file paths", () => {
+    expect(DEFAULT_CONFIG.writeProtectedPaths.length).toBeGreaterThan(0)
+    expect(DEFAULT_CONFIG.writeProtectedPaths).toContain("**/var/log/**")
+  })
+
+  test("blockedFilePaths and writeProtectedPaths are separate lists", () => {
+    // A path can be in writeProtected but NOT in blocked (readable, not writable)
+    expect(DEFAULT_CONFIG.writeProtectedPaths).toContain("**/var/log/**")
+    expect(DEFAULT_CONFIG.blockedFilePaths).not.toContain("**/var/log/**")
+  })
+
   test("default config has env strip patterns", () => {
     expect(DEFAULT_CONFIG.env.stripPatterns.length).toBeGreaterThan(0)
     expect(DEFAULT_CONFIG.env.stripPatterns).toContain("*_SECRET")

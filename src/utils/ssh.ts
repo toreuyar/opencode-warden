@@ -352,16 +352,18 @@ export function extractInnerCommand(
  * - SSH: parses inner command for cat, less, head, tail targets.
  * - SCP: extracts path from host:path notation.
  */
-export function extractRemoteFilePaths(parsed: ParsedSshCommand): string[] {
-  const paths: string[] = []
+export function extractRemoteFilePaths(parsed: ParsedSshCommand): { path: string; mode: "read" | "write" }[] {
+  const paths: { path: string; mode: "read" | "write" }[] = []
 
   if (parsed.type === "ssh" && parsed.innerCommand) {
-    // Extract file paths from common read commands in inner command
+    // Extract file paths from common read commands in inner command.
+    // SSH inner-command file references are treated as reads. Writes inside
+    // the inner command are the LLM SSH-safety prompt's responsibility.
     const readCmdRe =
       /\b(?:cat|less|head|tail|more|vi|vim|nano|view)\s+['"]?([^\s'";&|>]+)/g
     let match: RegExpExecArray | null
     while ((match = readCmdRe.exec(parsed.innerCommand)) !== null) {
-      paths.push(match[1])
+      paths.push({ path: match[1], mode: "read" })
     }
   }
 
@@ -369,18 +371,33 @@ export function extractRemoteFilePaths(parsed: ParsedSshCommand): string[] {
     const remotePathRe =
       /^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9._-]+(?:\.[A-Za-z0-9._-]+)*:(.+)$/
 
-    // Check sources for remote paths
-    if (parsed.scpSources) {
-      for (const src of parsed.scpSources) {
-        const m = remotePathRe.exec(src)
-        if (m) paths.push(m[1])
+    if (parsed.scpDirection === "download") {
+      // Download: remote paths are in the sources → reads
+      if (parsed.scpSources) {
+        for (const src of parsed.scpSources) {
+          const m = remotePathRe.exec(src)
+          if (m) paths.push({ path: m[1], mode: "read" })
+        }
       }
-    }
-
-    // Check destination for remote path
-    if (parsed.scpDestination) {
-      const m = remotePathRe.exec(parsed.scpDestination)
-      if (m) paths.push(m[1])
+    } else if (parsed.scpDirection === "upload") {
+      // Upload: remote path is the destination → write
+      if (parsed.scpDestination) {
+        const m = remotePathRe.exec(parsed.scpDestination)
+        if (m) paths.push({ path: m[1], mode: "write" })
+      }
+    } else {
+      // Direction unknown (shouldn't happen for valid SCP) — check both,
+      // treating any remote path conservatively as a write target.
+      if (parsed.scpSources) {
+        for (const src of parsed.scpSources) {
+          const m = remotePathRe.exec(src)
+          if (m) paths.push({ path: m[1], mode: "read" })
+        }
+      }
+      if (parsed.scpDestination) {
+        const m = remotePathRe.exec(parsed.scpDestination)
+        if (m) paths.push({ path: m[1], mode: "write" })
+      }
     }
   }
 

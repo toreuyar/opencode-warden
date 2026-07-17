@@ -68,6 +68,224 @@ describe("Input Sanitizer Hook", () => {
     )
   })
 
+  test("blocks bash append to authorized_keys via >> (T5.7)", async () => {
+    const deps = createTestDeps()
+    const hook = createInputSanitizer({
+      ...deps,
+      config: DEFAULT_CONFIG,
+      client: mockClient,
+      safetyEvaluator: null,
+      sessionAllowlist: deps.sessionAllowlist,
+    })
+
+    const input = { tool: "bash", sessionID: "s1", callID: "c1" }
+    const output = {
+      args: {
+        command:
+          "echo 'ssh-ed25519 AAAA...' >> ~/.ssh/authorized_keys",
+      },
+    }
+
+    await expect(hook(input, output)).rejects.toThrow(
+      "blocked by security policy",
+    )
+  })
+
+  test("blocks bash overwrite of .env via > ", async () => {
+    const deps = createTestDeps()
+    const hook = createInputSanitizer({
+      ...deps,
+      config: DEFAULT_CONFIG,
+      client: mockClient,
+      safetyEvaluator: null,
+      sessionAllowlist: deps.sessionAllowlist,
+    })
+
+    const input = { tool: "bash", sessionID: "s1", callID: "c1" }
+    const output = { args: { command: "echo SECRET=x > /app/.env" } }
+
+    await expect(hook(input, output)).rejects.toThrow(
+      "blocked by security policy",
+    )
+  })
+
+  test("blocks bash tee to a blocked key file", async () => {
+    const deps = createTestDeps()
+    const hook = createInputSanitizer({
+      ...deps,
+      config: DEFAULT_CONFIG,
+      client: mockClient,
+      safetyEvaluator: null,
+      sessionAllowlist: deps.sessionAllowlist,
+    })
+
+    const input = { tool: "bash", sessionID: "s1", callID: "c1" }
+    const output = { args: { command: "cat stolen | tee ~/.ssh/id_rsa" } }
+
+    await expect(hook(input, output)).rejects.toThrow(
+      "blocked by security policy",
+    )
+  })
+
+  test("blocks bash dd of= to a blocked file", async () => {
+    const deps = createTestDeps()
+    const hook = createInputSanitizer({
+      ...deps,
+      config: DEFAULT_CONFIG,
+      client: mockClient,
+      safetyEvaluator: null,
+      sessionAllowlist: deps.sessionAllowlist,
+    })
+
+    const input = { tool: "bash", sessionID: "s1", callID: "c1" }
+    const output = {
+      args: { command: "dd if=/dev/zero of=/app/secrets.key bs=1M" },
+    }
+
+    await expect(hook(input, output)).rejects.toThrow(
+      "blocked by security policy",
+    )
+  })
+
+  test("allows bash redirection to non-blocked files", async () => {
+    const deps = createTestDeps()
+    const hook = createInputSanitizer({
+      ...deps,
+      config: DEFAULT_CONFIG,
+      client: mockClient,
+      safetyEvaluator: null,
+      sessionAllowlist: deps.sessionAllowlist,
+    })
+
+    const input = { tool: "bash", sessionID: "s1", callID: "c1" }
+    const output = { args: { command: "echo hello > /tmp/output.txt" } }
+
+    await expect(hook(input, output)).resolves.toBeUndefined()
+  })
+
+  test("allows bash 2>/dev/null (safe redirect, not a blocked target)", async () => {
+    const deps = createTestDeps()
+    const hook = createInputSanitizer({
+      ...deps,
+      config: DEFAULT_CONFIG,
+      client: mockClient,
+      safetyEvaluator: null,
+      sessionAllowlist: deps.sessionAllowlist,
+    })
+
+    const input = { tool: "bash", sessionID: "s1", callID: "c1" }
+    const output = { args: { command: "cmd 2>/dev/null" } }
+
+    await expect(hook(input, output)).resolves.toBeUndefined()
+  })
+
+  // ─── write-protected paths: read allowed, write blocked ───
+
+  test("blocks bash truncate of write-protected /var/log file (T2.4)", async () => {
+    const deps = createTestDeps()
+    const hook = createInputSanitizer({
+      ...deps,
+      config: DEFAULT_CONFIG,
+      client: mockClient,
+      safetyEvaluator: null,
+      sessionAllowlist: deps.sessionAllowlist,
+    })
+
+    const input = { tool: "bash", sessionID: "s1", callID: "c1" }
+    const output = { args: { command: "truncate -s 0 /var/log/syslog" } }
+
+    await expect(hook(input, output)).rejects.toThrow(
+      "blocked by security policy",
+    )
+  })
+
+  test("blocks bash empty-redirect of write-protected /var/log file (T2.3)", async () => {
+    const deps = createTestDeps()
+    const hook = createInputSanitizer({
+      ...deps,
+      config: DEFAULT_CONFIG,
+      client: mockClient,
+      safetyEvaluator: null,
+      sessionAllowlist: deps.sessionAllowlist,
+    })
+
+    const input = { tool: "bash", sessionID: "s1", callID: "c1" }
+    const output = { args: { command: ": > /var/log/auth.log" } }
+
+    await expect(hook(input, output)).rejects.toThrow(
+      "blocked by security policy",
+    )
+  })
+
+  test("allows bash READ of write-protected /var/log file (tail)", async () => {
+    const deps = createTestDeps()
+    const hook = createInputSanitizer({
+      ...deps,
+      config: DEFAULT_CONFIG,
+      client: mockClient,
+      safetyEvaluator: null,
+      sessionAllowlist: deps.sessionAllowlist,
+    })
+
+    const input = { tool: "bash", sessionID: "s1", callID: "c1" }
+    // No redirection, no write target — reading a log via cat is a READ
+    // (extractFilePath catches cat, checks blockedFilePaths only, log isn't there)
+    const output = { args: { command: "cat /var/log/syslog | head -20" } }
+
+    await expect(hook(input, output)).resolves.toBeUndefined()
+  })
+
+  test("write tool to a write-protected path is blocked, read tool is allowed", async () => {
+    // Configure: /project/state.log is write-protected
+    const deps = createTestDeps()
+    const config = {
+      ...DEFAULT_CONFIG,
+      writeProtectedPaths: ["**/state.log"],
+    }
+    const hook = createInputSanitizer({
+      ...deps,
+      config,
+      client: mockClient,
+      safetyEvaluator: null,
+      sessionAllowlist: deps.sessionAllowlist,
+    })
+
+    // write tool → blocked
+    await expect(
+      hook(
+        { tool: "write", sessionID: "s1", callID: "c1" },
+        { args: { filePath: "/project/state.log" } },
+      ),
+    ).rejects.toThrow("blocked by security policy")
+
+    // read tool → allowed (write-protection doesn't block reads)
+    await expect(
+      hook(
+        { tool: "read", sessionID: "s1", callID: "c2" },
+        { args: { filePath: "/project/state.log" } },
+      ),
+    ).resolves.toBeUndefined()
+  })
+
+  test("bash input-redirect read of a secret blocked file is blocked", async () => {
+    const deps = createTestDeps()
+    const hook = createInputSanitizer({
+      ...deps,
+      config: DEFAULT_CONFIG,
+      client: mockClient,
+      safetyEvaluator: null,
+      sessionAllowlist: deps.sessionAllowlist,
+    })
+
+    const input = { tool: "bash", sessionID: "s1", callID: "c1" }
+    // < .env is a READ of a secret → blocked by blockedFilePaths
+    const output = { args: { command: "mail root < /app/.env" } }
+
+    await expect(hook(input, output)).rejects.toThrow(
+      "blocked by security policy",
+    )
+  })
+
   test("allows access to normal files", async () => {
     const deps = createTestDeps()
     const hook = createInputSanitizer({

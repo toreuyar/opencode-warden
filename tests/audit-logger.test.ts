@@ -146,7 +146,7 @@ describe("AuditLogger", () => {
         safetyEvaluation: {
           safe: false,
           riskLevel: "high",
-          riskDimensions: ["destructive-operations"],
+          riskDimensions: ["destruction"],
           explanation: "bulk deletion",
           suggestedAlternative: "delete specific files",
           recommendation: "block",

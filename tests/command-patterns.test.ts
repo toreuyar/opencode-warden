@@ -3,6 +3,7 @@ import {
   compileCommandPattern,
   isAllowedOperation,
   hasDangerousMetachars,
+  hasCommandExecutionPrimitive,
   isSafePipeTarget,
   isPipedCommandSafe,
   stripSudo,
@@ -215,6 +216,78 @@ describe("hasDangerousMetachars", () => {
 
   test("still detects semicolon even with safe redirect", () => {
     expect(hasDangerousMetachars("cmd 2>/dev/null; rm -rf /")).toBe(true)
+  })
+})
+
+// ─── hasCommandExecutionPrimitive ───
+
+describe("hasCommandExecutionPrimitive", () => {
+  test("detects find with -exec", () => {
+    expect(
+      hasCommandExecutionPrimitive("find / -name '*.tmp' -exec rm -f {} +"),
+    ).toBe(true)
+  })
+
+  test("detects find with -execdir", () => {
+    expect(
+      hasCommandExecutionPrimitive("find / -type f -execdir chmod 777 {} \\;"),
+    ).toBe(true)
+  })
+
+  test("detects find with -ok", () => {
+    expect(
+      hasCommandExecutionPrimitive("find / -name '*.tmp' -ok rm -f {} \\;"),
+    ).toBe(true)
+  })
+
+  test("detects find with -okdir", () => {
+    expect(
+      hasCommandExecutionPrimitive("find / -name '*.tmp' -okdir rm {} \\;"),
+    ).toBe(true)
+  })
+
+  test("detects find with -delete", () => {
+    expect(hasCommandExecutionPrimitive("find /tmp -name '*.tmp' -delete")).toBe(
+      true,
+    )
+  })
+
+  test("detects find with -delete at end of command (no trailing space)", () => {
+    expect(hasCommandExecutionPrimitive("find / -name foo -delete")).toBe(true)
+  })
+
+  test("detects find via absolute path /usr/bin/find", () => {
+    expect(
+      hasCommandExecutionPrimitive("/usr/bin/find / -exec rm -f {} +"),
+    ).toBe(true)
+  })
+
+  test("does NOT match find with -executable (unrelated flag)", () => {
+    expect(hasCommandExecutionPrimitive("find / -type f -executable")).toBe(false)
+  })
+
+  test("does NOT match read-only find (no exec/delete flags)", () => {
+    expect(hasCommandExecutionPrimitive("find /etc -name '*.conf'")).toBe(false)
+    expect(hasCommandExecutionPrimitive("find . -type f -name '*.ts'")).toBe(
+      false,
+    )
+  })
+
+  test("does NOT match non-find commands", () => {
+    expect(hasCommandExecutionPrimitive("rm -rf /")).toBe(false)
+    expect(hasCommandExecutionPrimitive("ls -exec something")).toBe(false)
+    expect(hasCommandExecutionPrimitive("grep -exec pattern")).toBe(false)
+  })
+
+  test("handles leading whitespace", () => {
+    expect(
+      hasCommandExecutionPrimitive("  find / -name x -exec rm {} +"),
+    ).toBe(true)
+  })
+
+  test("handles empty command", () => {
+    expect(hasCommandExecutionPrimitive("")).toBe(false)
+    expect(hasCommandExecutionPrimitive("   ")).toBe(false)
   })
 })
 

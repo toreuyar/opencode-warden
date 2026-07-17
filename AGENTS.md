@@ -513,6 +513,19 @@ Tools in `config.excludedTools` (default: `["glob", "list"]`) skip ALL processin
 
 In `src/utils/paths.ts`, the whitelist is checked **before** the blocklist. If a path matches both, it is NOT blocked. This allows patterns like blocking all `.env*` files but whitelisting `.env.example`.
 
+### Read vs Write Access Modes
+
+File protection has two tiers (see `isPathBlockedForMode` in `src/utils/paths.ts`):
+
+- **`blockedFilePaths`** — blocks BOTH read and write (secrets, keys, credentials). Checked for every access.
+- **`writeProtectedPaths`** — blocks WRITE only; reads are allowed (logs, state files). Checked only for write operations.
+
+An access is classified as read or write by the hook based on the tool and operation:
+- **Write**: `write`/`edit`/`patch` tools; bash output-redirects (`>`, `>>`, `&>`), `tee`, `truncate`, `dd of=`; SCP/rsync/rclone **upload** (remote destination).
+- **Read**: `read`/`glob` tools; bash `cat`/`less`/`head`, input-redirect `<`; SCP/rsync/rclone **download** (remote source); SSH inner-command file references.
+
+Bash write/read targets are extracted by `extractBashFileTargets()` (returns `{reads, writes}`). This is what enforces the blocklist against shell redirections — without it, `echo >> authorized_keys` would bypass the file blocker.
+
 ### Permission Deduplication
 
 The `evaluatedCalls: Set<string>` prevents double LLM evaluation. When `permission.ask` fires and evaluates a call, it adds the `callID` to this set. When `tool.execute.before` fires for the same call, it checks the set and skips re-evaluation. This is critical for:

@@ -43,8 +43,15 @@ describe("security-config tool", () => {
   test("shows blocked file paths", async () => {
     const tool = createSecurityConfigTool({ config: DEFAULT_CONFIG })
     const result = await tool.execute()
-    expect(result).toContain("--- Blocked File Paths ---")
+    expect(result).toContain("--- Blocked File Paths (no read, no write) ---")
     expect(result).toContain("**/.env")
+  })
+
+  test("shows write-protected file paths", async () => {
+    const tool = createSecurityConfigTool({ config: DEFAULT_CONFIG })
+    const result = await tool.execute()
+    expect(result).toContain("--- Write-Protected File Paths (read OK, no write) ---")
+    expect(result).toContain("**/var/log/**")
   })
 
   test("shows SSH-only mode", async () => {

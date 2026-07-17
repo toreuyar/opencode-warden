@@ -156,6 +156,7 @@ export const securityGuardConfigSchema = z.object({
   customPatterns: z.array(customPatternSchema).optional(),
   whitelistedPaths: z.array(z.string()).optional(),
   blockedFilePaths: z.array(z.string()).optional(),
+  writeProtectedPaths: z.array(z.string()).optional(),
   excludedTools: z.array(z.string()).optional(),
   blockedTools: z.array(z.string()).optional(),
   sshOnlyMode: z.boolean().optional(),

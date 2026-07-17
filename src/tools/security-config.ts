@@ -101,8 +101,17 @@ export function createSecurityConfigTool(deps: ConfigViewDeps) {
       // Blocked file paths
       if (config.blockedFilePaths.length > 0) {
         lines.push("")
-        lines.push("--- Blocked File Paths ---")
+        lines.push("--- Blocked File Paths (no read, no write) ---")
         for (const p of config.blockedFilePaths) {
+          lines.push(`  ${p}`)
+        }
+      }
+
+      // Write-protected file paths
+      if (config.writeProtectedPaths.length > 0) {
+        lines.push("")
+        lines.push("--- Write-Protected File Paths (read OK, no write) ---")
+        for (const p of config.writeProtectedPaths) {
           lines.push(`  ${p}`)
         }
       }

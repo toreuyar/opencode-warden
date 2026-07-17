@@ -26,8 +26,19 @@ export function buildSecurityPolicyContext(config: SecurityGuardConfig): string 
 
   // Blocked file patterns (only if non-empty)
   if (config.blockedFilePaths.length > 0) {
-    lines.push("### Blocked Files")
+    lines.push("### Blocked Files (no read, no write)")
+    lines.push("Secrets and credentials — access fully denied:")
     for (const pattern of config.blockedFilePaths) {
+      lines.push(`- \`${pattern}\``)
+    }
+    lines.push("")
+  }
+
+  // Write-protected patterns (only if non-empty)
+  if (config.writeProtectedPaths.length > 0) {
+    lines.push("### Write-Protected Files (read OK, no write)")
+    lines.push("Readable for diagnostics, but never modify or truncate:")
+    for (const pattern of config.writeProtectedPaths) {
       lines.push(`- \`${pattern}\``)
     }
     lines.push("")

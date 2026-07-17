@@ -7,8 +7,8 @@ import type {
 } from "../types.js"
 import { isRemoteCommand } from "../utils/ssh.js"
 import {
-  isBlockedPath,
   isAllowlisted,
+  isPathBlockedForMode,
   extractFilePath,
   extractRemoteFilePathsFromArgs,
 } from "../utils/paths.js"
@@ -218,15 +218,16 @@ export function createPermissionHandler(deps: PermissionHandlerDeps) {
       return
     }
 
-    // Check blocked file paths
+    // Check blocked file paths (mode-aware: writes also honor writeProtectedPaths)
     const deterministicFilePath = extractFilePath(toolName, args)
     if (deterministicFilePath) {
+      const accessMode: "read" | "write" = ["write", "edit", "patch"].includes(toolName) ? "write" : "read"
       if (
         !isAllowlisted(deterministicFilePath, sessionAllowlist) &&
-        isBlockedPath(deterministicFilePath, config.blockedFilePaths, config.whitelistedPaths)
+        isPathBlockedForMode(deterministicFilePath, accessMode, config.blockedFilePaths, config.writeProtectedPaths, config.whitelistedPaths)
       ) {
-        debugLog?.(`Permission hook: tool=${toolName} → DENIED (blocked file path: ${deterministicFilePath})`)
-        diagnosticLogger?.decision("permission-handler", toolName, `DENIED file path: ${deterministicFilePath}`)
+        debugLog?.(`Permission hook: tool=${toolName} → DENIED (blocked file path (${accessMode}): ${deterministicFilePath})`)
+        diagnosticLogger?.decision("permission-handler", toolName, `DENIED file path (${accessMode}): ${deterministicFilePath}`)
         output.status = "deny"
 
         await auditLogger.log({
@@ -270,15 +271,15 @@ export function createPermissionHandler(deps: PermissionHandlerDeps) {
       }
     }
 
-    // Check remote file paths (SSH/SCP)
+    // Check remote file paths (SSH/SCP/rsync/rclone) — mode-aware
     const remotePaths = extractRemoteFilePathsFromArgs(toolName, args)
-    for (const remotePath of remotePaths) {
+    for (const { path: remotePath, mode: remoteMode } of remotePaths) {
       if (
         !isAllowlisted(remotePath, sessionAllowlist) &&
-        isBlockedPath(remotePath, config.blockedFilePaths, config.whitelistedPaths)
+        isPathBlockedForMode(remotePath, remoteMode, config.blockedFilePaths, config.writeProtectedPaths, config.whitelistedPaths)
       ) {
-        debugLog?.(`Permission hook: tool=${toolName} → DENIED (blocked remote file path: ${remotePath})`)
-        diagnosticLogger?.decision("permission-handler", toolName, `DENIED remote file path: ${remotePath}`)
+        debugLog?.(`Permission hook: tool=${toolName} → DENIED (blocked remote file path (${remoteMode}): ${remotePath})`)
+        diagnosticLogger?.decision("permission-handler", toolName, `DENIED remote file path (${remoteMode}): ${remotePath}`)
         output.status = "deny"
 
         await auditLogger.log({

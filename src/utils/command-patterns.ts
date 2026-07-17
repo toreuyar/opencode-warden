@@ -105,6 +105,39 @@ export function hasDangerousMetachars(command: string): boolean {
 }
 
 /**
+ * Regex detecting `find` command-execution / deletion primitives.
+ * Matches the flags -exec, -execdir, -ok, -okdir, -delete as whole flags.
+ * -exec/-execdir/-ok/-okdir run an arbitrary command per matched file.
+ * -delete removes every matched file.
+ * `\b` prevents matching the unrelated -executable flag.
+ *
+ * These flags turn an otherwise read-only `find` into a destructive or
+ * execution-invoking operation, so they must force LLM evaluation even when
+ * `find` has been added to a user's bypass list.
+ */
+const FIND_EXEC_PRIMITIVE_RE = /(?:^|\s)-(?:exec|execdir|ok|okdir|delete)\b/
+
+/**
+ * Check whether a command uses a command-execution primitive that must
+ * always go to LLM evaluation, regardless of bypass-list configuration.
+ *
+ * Currently detects `find` (including absolute paths like /usr/bin/find)
+ * combined with -exec / -execdir / -ok / -okdir / -delete.
+ *
+ * Rationale: a user may legitimately put `find` on their bypass list for
+ * read-only searches (`find /etc -name '*.conf'`), but `find ... -exec rm`
+ * or `find ... -delete` is destructive and must never be bypassed. This
+ * protects every user config without forcing them to audit their own list.
+ */
+export function hasCommandExecutionPrimitive(command: string): boolean {
+  const trimmed = command.trimStart()
+  const firstToken = trimmed.split(/\s/)[0] || ""
+  // Only apply to find (including absolute paths like /usr/bin/find)
+  if (firstToken !== "find" && !firstToken.endsWith("/find")) return false
+  return FIND_EXEC_PRIMITIVE_RE.test(command)
+}
+
+/**
  * Check if a pipe segment starts with a safe pipe target command.
  */
 export function isSafePipeTarget(segment: string): boolean {

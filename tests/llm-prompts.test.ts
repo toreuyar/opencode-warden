@@ -242,6 +242,80 @@ describe("DEFAULT_SAFETY_SYSTEM_PROMPT — DevOps awareness", () => {
   })
 })
 
+describe("DEFAULT_SAFETY_SYSTEM_PROMPT — always-block patterns (Group B)", () => {
+  test("has an always-block section keyed by EFFECT not wrapper", () => {
+    expect(DEFAULT_SAFETY_SYSTEM_PROMPT).toContain("ALWAYS-BLOCK")
+    expect(DEFAULT_SAFETY_SYSTEM_PROMPT).toContain("EFFECT, not wrapper")
+  })
+
+  test("flags log/audit truncation and redirect-to-empty as HIGH", () => {
+    expect(DEFAULT_SAFETY_SYSTEM_PROMPT).toContain("/var/log/auth.log")
+    expect(DEFAULT_SAFETY_SYSTEM_PROMPT).toContain("truncate -s 0 /var/log/syslog")
+    expect(DEFAULT_SAFETY_SYSTEM_PROMPT).toContain("Anti-forensics")
+  })
+
+  test("flags home-directory relocation as HIGH", () => {
+    expect(DEFAULT_SAFETY_SYSTEM_PROMPT).toContain("/home/")
+    expect(DEFAULT_SAFETY_SYSTEM_PROMPT).toContain("/tmp/trash")
+  })
+
+  test("flags authorized_keys / sshd_config / ssh-import-id as HIGH persistence", () => {
+    expect(DEFAULT_SAFETY_SYSTEM_PROMPT).toContain("authorized_keys")
+    expect(DEFAULT_SAFETY_SYSTEM_PROMPT).toContain("sshd_config")
+    expect(DEFAULT_SAFETY_SYSTEM_PROMPT).toContain("ssh-import-id")
+    expect(DEFAULT_SAFETY_SYSTEM_PROMPT).toContain("persistence")
+  })
+
+  test("flags sudoers tampering and SUID/SGID as HIGH escalation", () => {
+    expect(DEFAULT_SAFETY_SYSTEM_PROMPT).toContain("/etc/sudoers")
+    expect(DEFAULT_SAFETY_SYSTEM_PROMPT).toContain("NOPASSWD")
+    expect(DEFAULT_SAFETY_SYSTEM_PROMPT).toContain("chmod u+s")
+    expect(DEFAULT_SAFETY_SYSTEM_PROMPT).toContain("install -m 4755")
+  })
+
+  test("flags find -exec/-delete on broad paths as HIGH", () => {
+    expect(DEFAULT_SAFETY_SYSTEM_PROMPT).toContain("-exec")
+    expect(DEFAULT_SAFETY_SYSTEM_PROMPT).toContain("-delete")
+  })
+})
+
+describe("DEFAULT_SAFETY_SYSTEM_PROMPT — decoded-payload executor rule (Group C)", () => {
+  test("has a decoded-payload executor section", () => {
+    expect(DEFAULT_SAFETY_SYSTEM_PROMPT).toContain("DECODED-PAYLOAD EXECUTOR RULE")
+  })
+
+  test("explicitly allows decoded payload with no executor (no-op echo)", () => {
+    expect(DEFAULT_SAFETY_SYSTEM_PROMPT).toContain("no executor")
+    expect(DEFAULT_SAFETY_SYSTEM_PROMPT).toContain("base64 -d")
+    // The canonical no-op example must be present
+    expect(DEFAULT_SAFETY_SYSTEM_PROMPT).toContain('base64 -d            ')
+  })
+
+  test("lists recognized executors", () => {
+    expect(DEFAULT_SAFETY_SYSTEM_PROMPT).toContain("eval")
+    expect(DEFAULT_SAFETY_SYSTEM_PROMPT).toContain("xargs")
+    expect(DEFAULT_SAFETY_SYSTEM_PROMPT).toContain("process substitution")
+  })
+
+  test("JSON examples use canonical lowercase-hyphenated dimension tokens", () => {
+    // The examples should no longer emit the non-canonical "destructive-operations"
+    expect(DEFAULT_SAFETY_SYSTEM_PROMPT).not.toMatch(/"destructive-operations"/)
+    // And should include a persistence example
+    expect(DEFAULT_SAFETY_SYSTEM_PROMPT).toMatch(/"persistence"/)
+  })
+})
+
+describe("DEFAULT_SAFETY_SYSTEM_PROMPT — risk dimension canonicalization", () => {
+  test("lists the exact canonical token set for riskDimensions", () => {
+    expect(DEFAULT_SAFETY_SYSTEM_PROMPT).toContain("exfiltration, destruction, service-disruption")
+    expect(DEFAULT_SAFETY_SYSTEM_PROMPT).toContain("remote-execution, indirect-execution")
+  })
+
+  test("instructs against spaces/uppercase in riskDimensions JSON", () => {
+    expect(DEFAULT_SAFETY_SYSTEM_PROMPT).toContain("Do not use spaces, uppercase")
+  })
+})
+
 describe("buildSafetyPrompt — SSH detection", () => {
   test("SSH command produces SSH context in prompt", () => {
     const result = buildSafetyPrompt("bash", {

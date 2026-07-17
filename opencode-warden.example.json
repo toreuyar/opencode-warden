@@ -47,6 +47,10 @@
     "**/.my.cnf"
   ],
 
+  "writeProtectedPaths": [
+    "**/var/log/**"
+  ],
+
   "excludedTools": ["glob", "list"],
 
   "notifications": true,

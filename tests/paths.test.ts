@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test"
-import { isBlockedPath, matchGlob, extractFilePath, extractRemoteFilePathsFromArgs } from "../src/utils/paths.js"
+import { isBlockedPath, isWriteProtectedPath, isPathBlockedForMode, matchGlob, extractFilePath, extractRemoteFilePathsFromArgs, extractBashFileTargets } from "../src/utils/paths.js"
 import { DEFAULT_CONFIG } from "../src/config/defaults.js"
 
 describe("Path Detection", () => {
@@ -129,18 +129,36 @@ describe("File Path Extraction", () => {
 })
 
 describe("Remote File Path Extraction", () => {
-  test("extracts remote paths from SSH command", () => {
+  test("extracts remote paths from SSH command (read mode)", () => {
     const paths = extractRemoteFilePathsFromArgs("bash", {
       command: 'ssh user@host.com "cat /etc/passwd"',
     })
-    expect(paths).toEqual(["/etc/passwd"])
+    expect(paths).toEqual([{ path: "/etc/passwd", mode: "read" }])
   })
 
-  test("extracts remote paths from SCP command", () => {
+  test("extracts remote paths from SCP download (read mode)", () => {
     const paths = extractRemoteFilePathsFromArgs("bash", {
       command: "scp user@server.com:/etc/shadow ./local/",
     })
-    expect(paths).toEqual(["/etc/shadow"])
+    expect(paths).toEqual([{ path: "/etc/shadow", mode: "read" }])
+  })
+
+  test("extracts remote paths from SCP upload (write mode)", () => {
+    const paths = extractRemoteFilePathsFromArgs("bash", {
+      command: "scp ./local.txt user@server.com:/home/deploy/.env",
+    })
+    expect(paths).toEqual([{ path: "/home/deploy/.env", mode: "write" }])
+  })
+
+  test("extracts remote paths from rsync download (read) and upload (write)", () => {
+    const dl = extractRemoteFilePathsFromArgs("bash", {
+      command: "rsync -avz user@server.com:/home/user/.env ./local/",
+    })
+    expect(dl).toEqual([{ path: "/home/user/.env", mode: "read" }])
+    const ul = extractRemoteFilePathsFromArgs("bash", {
+      command: "rsync -avz ./local.txt user@server.com:/home/deploy/.env",
+    })
+    expect(ul).toEqual([{ path: "/home/deploy/.env", mode: "write" }])
   })
 
   test("returns empty for non-SSH commands", () => {
@@ -155,5 +173,205 @@ describe("Remote File Path Extraction", () => {
       filePath: "/etc/passwd",
     })
     expect(paths).toEqual([])
+  })
+})
+
+describe("extractBashFileTargets", () => {
+  test("extracts append write target from echo >> file", () => {
+    const r = extractBashFileTargets("echo 'ssh-ed25519 AAAA...' >> ~/.ssh/authorized_keys")
+    expect(r.writes).toEqual(["~/.ssh/authorized_keys"])
+    expect(r.reads).toEqual([])
+  })
+
+  test("extracts overwrite write target from > file", () => {
+    expect(extractBashFileTargets("echo data > /project/.env").writes).toEqual([
+      "/project/.env",
+    ])
+  })
+
+  test("extracts write target from cat /dev/null > file", () => {
+    expect(
+      extractBashFileTargets("cat /dev/null > /var/log/auth.log").writes,
+    ).toEqual(["/var/log/auth.log"])
+  })
+
+  test("extracts fd-specific redirect write targets (1>, 2>, 1>>, 2>>)", () => {
+    expect(extractBashFileTargets("cmd 1> /tmp/out.log").writes).toEqual(["/tmp/out.log"])
+    expect(extractBashFileTargets("cmd 2>> /tmp/err.log").writes).toEqual(["/tmp/err.log"])
+  })
+
+  test("extracts bash &> and &>> both-stream write redirects", () => {
+    expect(extractBashFileTargets("cmd &> /tmp/both.log").writes).toEqual(["/tmp/both.log"])
+    expect(extractBashFileTargets("cmd &>> /tmp/both.log").writes).toEqual(["/tmp/both.log"])
+  })
+
+  test("extracts glued write redirect (no space): >file, 2>file, >>file", () => {
+    expect(extractBashFileTargets("echo data >/project/.env").writes).toEqual([
+      "/project/.env",
+    ])
+    expect(extractBashFileTargets("cmd 2>>/tmp/err.log").writes).toEqual([
+      "/tmp/err.log",
+    ])
+  })
+
+  test("extracts truncate write target", () => {
+    expect(
+      extractBashFileTargets("truncate -s 0 /var/log/syslog").writes,
+    ).toEqual(["/var/log/syslog"])
+  })
+
+  test("extracts input redirect as a READ target (< file)", () => {
+    const r = extractBashFileTargets("mail root < /etc/shadow")
+    expect(r.reads).toEqual(["/etc/shadow"])
+    expect(r.writes).toEqual([])
+  })
+
+  test("extracts glued input redirect as READ (<file)", () => {
+    expect(extractBashFileTargets("cmd </etc/shadow").reads).toEqual(["/etc/shadow"])
+  })
+
+  test("extracts tee write target", () => {
+    expect(extractBashFileTargets("echo data | tee /etc/sudoers").writes).toEqual([
+      "/etc/sudoers",
+    ])
+  })
+
+  test("extracts tee -a write target", () => {
+    expect(
+      extractBashFileTargets("echo data | tee -a ~/.ssh/authorized_keys").writes,
+    ).toEqual(["~/.ssh/authorized_keys"])
+  })
+
+  test("extracts multiple tee write targets", () => {
+    expect(
+      extractBashFileTargets("echo data | tee /tmp/a.log /tmp/b.log").writes,
+    ).toEqual(["/tmp/a.log", "/tmp/b.log"])
+  })
+
+  test("tee stops at pipe separator", () => {
+    const r = extractBashFileTargets("echo x | tee /tmp/a.log | grep y")
+    expect(r.writes).toEqual(["/tmp/a.log"])
+  })
+
+  test("extracts dd of= write target", () => {
+    expect(
+      extractBashFileTargets("dd if=/dev/zero of=/etc/sudoers bs=1M count=1").writes,
+    ).toEqual(["/etc/sudoers"])
+  })
+
+  test("skips fd-duplication (2>&1, 1>&2)", () => {
+    expect(extractBashFileTargets("cmd 2>&1").writes).toEqual([])
+    expect(extractBashFileTargets("cmd 1>&2").writes).toEqual([])
+  })
+
+  test("skips fd-close (>&-)", () => {
+    expect(extractBashFileTargets("cmd 2>&-").writes).toEqual([])
+  })
+
+  test("skips /dev/null as a target", () => {
+    expect(extractBashFileTargets("cmd > /dev/null 2>&1").writes).toEqual([])
+  })
+
+  test("skips heredoc markers (<<)", () => {
+    expect(extractBashFileTargets("cat << EOF").writes).toEqual([])
+    expect(extractBashFileTargets("cat <<EOF").writes).toEqual([])
+  })
+
+  test("handles quoted target paths", () => {
+    expect(
+      extractBashFileTargets('echo x >> "~/.ssh/authorized_keys"').writes,
+    ).toEqual(["~/.ssh/authorized_keys"])
+    expect(
+      extractBashFileTargets("echo x > '/project/.env'").writes,
+    ).toEqual(["/project/.env"])
+  })
+
+  test("returns empty for command with no redirections", () => {
+    const r1 = extractBashFileTargets("ls -la /tmp")
+    expect(r1.writes).toEqual([])
+    expect(r1.reads).toEqual([])
+    const r2 = extractBashFileTargets("git status")
+    expect(r2.writes).toEqual([])
+  })
+
+  test("returns empty for empty/whitespace command", () => {
+    expect(extractBashFileTargets("")).toEqual({ reads: [], writes: [] })
+    expect(extractBashFileTargets("   ")).toEqual({ reads: [], writes: [] })
+  })
+
+  test("does not treat > inside a quoted string as a redirect", () => {
+    const r = extractBashFileTargets('grep "a>b" file.txt')
+    expect(r.writes).toEqual([])
+  })
+
+  test("integration: write targets match the default blocklist", () => {
+    const blocked = DEFAULT_CONFIG.blockedFilePaths
+    expect(
+      extractBashFileTargets("echo 'ssh-ed25519 AAAA...' >> ~/.ssh/authorized_keys")
+        .writes.some((p) => isBlockedPath(p, blocked, [])),
+    ).toBe(true)
+    expect(
+      extractBashFileTargets("echo SECRET=x > /app/.env").writes.some((p) =>
+        isBlockedPath(p, blocked, []),
+      ),
+    ).toBe(true)
+  })
+})
+
+describe("isWriteProtectedPath", () => {
+  const wp = ["**/var/log/**"]
+  const wl: string[] = []
+
+  test("matches a write-protected log path", () => {
+    expect(isWriteProtectedPath("/var/log/syslog", wp, wl)).toBe(true)
+    expect(isWriteProtectedPath("/var/log/nginx/access.log", wp, wl)).toBe(true)
+  })
+
+  test("does not match a non-protected path", () => {
+    expect(isWriteProtectedPath("/etc/passwd", wp, wl)).toBe(false)
+    expect(isWriteProtectedPath("/tmp/output.txt", wp, wl)).toBe(false)
+  })
+
+  test("whitelist overrides write-protection", () => {
+    expect(
+      isWriteProtectedPath("/var/log/syslog", wp, ["**/var/log/**"]),
+    ).toBe(false)
+  })
+})
+
+describe("isPathBlockedForMode", () => {
+  const blocked = DEFAULT_CONFIG.blockedFilePaths
+  const wp = DEFAULT_CONFIG.writeProtectedPaths
+  const wl: string[] = []
+
+  test("read of a blocked (secret) file is blocked", () => {
+    expect(isPathBlockedForMode("/app/.env", "read", blocked, wp, wl)).toBe(true)
+  })
+
+  test("write of a blocked (secret) file is blocked", () => {
+    expect(isPathBlockedForMode("/app/.env", "write", blocked, wp, wl)).toBe(true)
+  })
+
+  test("read of a write-protected log is ALLOWED", () => {
+    expect(isPathBlockedForMode("/var/log/syslog", "read", blocked, wp, wl)).toBe(false)
+  })
+
+  test("write of a write-protected log is blocked", () => {
+    expect(isPathBlockedForMode("/var/log/syslog", "write", blocked, wp, wl)).toBe(true)
+  })
+
+  test("truncate target on a write-protected log is blocked for write", () => {
+    expect(isPathBlockedForMode("/var/log/auth.log", "write", blocked, wp, wl)).toBe(true)
+  })
+
+  test("ordinary file is allowed for both modes", () => {
+    expect(isPathBlockedForMode("/project/src/index.ts", "read", blocked, wp, wl)).toBe(false)
+    expect(isPathBlockedForMode("/project/src/index.ts", "write", blocked, wp, wl)).toBe(false)
+  })
+
+  test("whitelist overrides both modes", () => {
+    expect(
+      isPathBlockedForMode("/app/.env", "write", blocked, wp, ["**/.env"]),
+    ).toBe(false)
   })
 })

@@ -4,42 +4,70 @@ const RSYNC_REMOTE_PATH_RE = /^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9._-]+(?:\.[A-Za-z0
 
 const RCLONE_REMOTE_PATH_RE = /^[A-Za-z][A-Za-z0-9_-]*:(.+)$/
 
-function extractRsyncRemotePaths(command: string): string[] {
-  const paths: string[] = []
+function extractRsyncRemotePaths(command: string): { path: string; mode: "read" | "write" }[] {
+  const out: { path: string; mode: "read" | "write" }[] = []
   const tokens = tokenizeCommand(command)
-  
+
   if (tokens.length === 0 || tokens[0] !== "rsync") return []
-  
+
+  // Collect non-flag operands. `-e` consumes the next token (the rsh command).
+  const operands: string[] = []
   for (let i = 1; i < tokens.length; i++) {
     const tok = tokens[i]
+    if (tok === "-e") {
+      i++ // skip rsh argument
+      continue
+    }
     if (tok.startsWith("-")) continue
-    
-    const match = RSYNC_REMOTE_PATH_RE.exec(tok)
+    operands.push(tok)
+  }
+  if (operands.length === 0) return out
+
+  // Last operand is the destination; earlier operands are sources.
+  const lastIdx = operands.length - 1
+  for (let k = 0; k < operands.length; k++) {
+    const match = RSYNC_REMOTE_PATH_RE.exec(operands[k])
     if (match) {
-      paths.push(match[1])
+      out.push({ path: match[1], mode: k === lastIdx ? "write" : "read" })
     }
   }
-  
-  return paths
+
+  return out
 }
 
-function extractRcloneRemotePaths(command: string): string[] {
-  const paths: string[] = []
+function extractRcloneRemotePaths(command: string): { path: string; mode: "read" | "write" }[] {
+  const out: { path: string; mode: "read" | "write" }[] = []
   const tokens = tokenizeCommand(command)
-  
+
   if (tokens.length === 0 || tokens[0] !== "rclone") return []
-  
+
+  // rclone subcommands look like: rclone copy src dest
+  // Collect operands after the subcommand.
+  const operands: string[] = []
+  let seenSubcommand = false
   for (let i = 1; i < tokens.length; i++) {
     const tok = tokens[i]
+    if (!seenSubcommand && /^[a-z]+$/.test(tok)) {
+      seenSubcommand = true
+      continue
+    }
     if (tok.startsWith("-")) continue
-    
-    const match = RCLONE_REMOTE_PATH_RE.exec(tok)
+    operands.push(tok)
+  }
+  if (operands.length === 0) return out
+
+  // For copy/sync/move: last operand is destination (write), earlier are sources (read).
+  // For a single operand (e.g. `rclone ls remote:path`): treat as read.
+  const lastIdx = operands.length - 1
+  for (let k = 0; k < operands.length; k++) {
+    const match = RCLONE_REMOTE_PATH_RE.exec(operands[k])
     if (match) {
-      paths.push(match[1])
+      const mode = operands.length >= 2 && k === lastIdx ? "write" : "read"
+      out.push({ path: match[1], mode })
     }
   }
-  
-  return paths
+
+  return out
 }
 
 function tokenizeCommand(command: string): string[] {
@@ -131,6 +159,58 @@ export function isBlockedPath(
     }
   }
 
+  return false
+}
+
+/**
+ * Check if a file path matches any write-protected pattern.
+ * Write-protected paths may be READ but not WRITTEN (e.g. logs, state files).
+ * Whitelist takes priority — an allowlisted path is never write-protected.
+ *
+ * Callers check writes with: `isBlockedPath(...) || isWriteProtectedPath(...)`.
+ * Read access checks only `isBlockedPath(...)` — write-protection does not
+ * restrict reads.
+ */
+export function isWriteProtectedPath(
+  filePath: string,
+  writeProtectedPatterns: string[],
+  whitelistedPatterns: string[],
+): boolean {
+  const normalized = filePath.replace(/\\/g, "/")
+
+  // Whitelist takes priority
+  for (const pattern of whitelistedPatterns) {
+    if (matchGlob(normalized, pattern)) {
+      return false
+    }
+  }
+
+  for (const pattern of writeProtectedPatterns) {
+    if (matchGlob(normalized, pattern)) {
+      return true
+    }
+  }
+
+  return false
+}
+
+/**
+ * Combined check: is this path blocked for the given access mode?
+ * - "read": blocked if in blockedFilePaths (secrets).
+ * - "write": blocked if in blockedFilePaths OR writeProtectedPaths.
+ * Whitelist always wins.
+ */
+export function isPathBlockedForMode(
+  filePath: string,
+  mode: "read" | "write",
+  blockedPatterns: string[],
+  writeProtectedPatterns: string[],
+  whitelistedPatterns: string[],
+): boolean {
+  if (isBlockedPath(filePath, blockedPatterns, whitelistedPatterns)) return true
+  if (mode === "write" && isWriteProtectedPath(filePath, writeProtectedPatterns, whitelistedPatterns)) {
+    return true
+  }
   return false
 }
 
@@ -252,13 +332,18 @@ export function extractFilePath(
 }
 
 /**
- * Extract remote file paths from SSH/SCP commands in bash tool args.
- * Returns empty array for non-SSH commands.
+ * Extract remote file paths (with access mode) from SSH/SCP/rsync/rclone
+ * commands in bash tool args. Returns empty array for non-remote commands.
+ *
+ * Mode is derived from transfer direction:
+ * - SCP/rsync/rclone upload (local→remote): remote destination is a WRITE.
+ * - SCP/rsync/rclone download (remote→local): remote source is a READ.
+ * - SSH inner-command file references: READS (inner writes are the LLM's job).
  */
 export function extractRemoteFilePathsFromArgs(
   tool: string,
   args: Record<string, unknown>,
-): string[] {
+): { path: string; mode: "read" | "write" }[] {
   if (tool !== "bash") return []
 
   const command = args.command as string | undefined
@@ -278,4 +363,141 @@ export function extractRemoteFilePathsFromArgs(
   }
 
   return []
+}
+
+/**
+ * Returns true if a redirection target string is a real file path (not an
+ * fd-duplication marker, fd-close, /dev/null, or pure number).
+ */
+function isRealRedirectTarget(p: string): boolean {
+  if (!p) return false
+  if (p.startsWith("&")) return false // fd-duplication (&1, &2)
+  if (p === "-") return false // fd-close marker
+  if (p === "/dev/null") return false
+  if (p.startsWith("/dev/fd/")) return false
+  if (/^\d+$/.test(p)) return false // pure number, not a path
+  return true
+}
+
+/**
+ * Extract file paths that a bash command reads or writes via shell redirection,
+ * `tee`, `truncate`, or `dd of=`. Used to enforce the blockedFilePaths and
+ * writeProtectedPaths lists against bash commands — not just read/write/edit
+ * tool calls.
+ *
+ * Without this, an agent could bypass the file blocklist by writing via shell
+ * redirection (e.g. `echo '...' >> ~/.ssh/authorized_keys`, `truncate -s 0 /var/log/syslog`).
+ *
+ * WRITE targets (checked against blockedFilePaths + writeProtectedPaths):
+ *  - Output/append redirect:  > file, >> file, 1> file, 2> file, &> file, 1>> file, 2>> file, &>> file
+ *  - tee:                     tee file, tee -a file, tee file1 file2 ...
+ *  - truncate:                truncate -s 0 file ...
+ *  - dd output file:          dd ... of=file
+ *
+ * READ targets (checked against blockedFilePaths only):
+ *  - Input redirect:          < file
+ *
+ * Skips: fd-duplication (2>&1, <&3), fd-close (>&-), heredocs (<<), /dev/null,
+ * and pure-numeric tokens. Quoting is handled by the tokenizer.
+ *
+ * Known limitation: a redirect operator glued to a PRECEDING word with no space
+ * (e.g. `echo>file`) is not split and won't be caught. Realistic agent-produced
+ * commands use spaces around operators; unusual forms remain covered by the LLM
+ * safety evaluator.
+ */
+export function extractBashFileTargets(command: string): {
+  reads: string[]
+  writes: string[]
+} {
+  const reads: string[] = []
+  const writes: string[] = []
+  if (!command) return { reads, writes }
+
+  const tokens = tokenizeCommand(command)
+
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i]
+
+    // Output/append redirect operator as a standalone token: >, >>, 1>, 2>, &>, 1>>, 2>>, &>>
+    if (/^(\d+|&)?>>?$/.test(tok)) {
+      const next = tokens[i + 1]
+      if (next && isRealRedirectTarget(next)) writes.push(next)
+      continue
+    }
+
+    // Output/append redirect GLUED to target: >file, 2>file, >>file, &>file, &>>file
+    const gluedOut = tok.match(/^(?:\d+|&)?>>?(.+)/)
+    if (gluedOut) {
+      const target = gluedOut[1]
+      if (isRealRedirectTarget(target)) writes.push(target)
+      continue
+    }
+
+    // Input redirect: < file (but NOT << heredoc)
+    if (tok === "<") {
+      const next = tokens[i + 1]
+      if (next && isRealRedirectTarget(next)) reads.push(next)
+      continue
+    }
+    // Glued input redirect: <file (but NOT <<file heredoc)
+    const gluedIn = tok.match(/^<(?!<)(.+)/)
+    if (gluedIn) {
+      const target = gluedIn[1]
+      if (isRealRedirectTarget(target)) reads.push(target)
+      continue
+    }
+
+    // tee <file>... — writes to every non-flag argument until a pipe / separator
+    if (tok === "tee") {
+      let j = i + 1
+      let optsEnded = false
+      while (j < tokens.length) {
+        const t = tokens[j]
+        if (t === "|" || t === ";" || t === "&&" || t === "||") break
+        if (!optsEnded && t === "--") {
+          optsEnded = true
+          j++
+          continue
+        }
+        if (!optsEnded && t.startsWith("-")) {
+          j++
+          continue
+        }
+        if (isRealRedirectTarget(t)) writes.push(t)
+        j++
+      }
+      continue
+    }
+
+    // truncate [opts] <file>... — every non-flag argument is a write target
+    if (tok === "truncate") {
+      let j = i + 1
+      let optsEnded = false
+      while (j < tokens.length) {
+        const t = tokens[j]
+        if (t === "|" || t === ";" || t === "&&" || t === "||") break
+        if (!optsEnded && t === "--") {
+          optsEnded = true
+          j++
+          continue
+        }
+        if (!optsEnded && t.startsWith("-")) {
+          j++
+          continue
+        }
+        if (isRealRedirectTarget(t)) writes.push(t)
+        j++
+      }
+      continue
+    }
+
+    // dd of=<file>
+    if (tok.startsWith("of=")) {
+      const target = tok.slice(3)
+      if (isRealRedirectTarget(target)) writes.push(target)
+      continue
+    }
+  }
+
+  return { reads, writes }
 }

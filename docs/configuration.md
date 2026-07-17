@@ -28,7 +28,8 @@ Warden loads configuration from three layers, each deep-merging into the previou
 | `disabledPatterns` | `string[]` | `[]` | Pattern IDs to disable (e.g., `["generic-bearer-token"]`) |
 | `customPatterns` | `CustomPatternConfig[]` | `[]` | User-defined detection patterns |
 | `whitelistedPaths` | `string[]` | `[]` | Glob patterns that bypass file blocking |
-| `blockedFilePaths` | `string[]` | See [defaults](#default-blocked-file-paths) | Glob patterns of files to block |
+| `blockedFilePaths` | `string[]` | See [defaults](#default-blocked-file-paths) | Glob patterns of files to block **both read and write** (secrets, keys, credentials) |
+| `writeProtectedPaths` | `string[]` | `["**/var/log/**"]` | Glob patterns of files that may be **read but not written** (logs, state files). Closes the anti-forensics hole (log truncation) deterministically. Write attempts via `write`/`edit` tools and shell redirections (`>`, `>>`, `tee`, `truncate`, `dd of=`) are blocked. |
 | `excludedTools` | `string[]` | `["glob", "list"]` | Tools to skip entirely (no scanning, no blocking) |
 | `sshOnlyMode` | `boolean` | `false` | Only monitor remote commands (ssh, scp, sftp, rsync, rclone) — bypass all local operations |
 | `notifications` | `boolean` | `true` | Show toast notifications in the TUI |
@@ -222,6 +223,14 @@ This example shows **every available option** with explanatory comments. In prac
     "**/.netrc",
     "**/.pgpass",
     "**/.my.cnf"
+  ],
+
+  // Files that may be READ but never WRITTEN by the agent.
+  // Write attempts via write/edit tools AND shell redirections
+  // (>, >>, tee, truncate, dd of=) are deterministically blocked.
+  // Reads (cat, tail, head, grep) remain allowed.
+  "writeProtectedPaths": [
+    "**/var/log/**"
   ],
 
   // ── Tool Control ──

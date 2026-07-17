@@ -10,7 +10,7 @@ import type {
   PatternCategory,
   WrittenFileMetadata,
 } from "../types.js"
-import { isBlockedPath, isAllowlisted, extractFilePath, extractRemoteFilePathsFromArgs } from "../utils/paths.js"
+import { isAllowlisted, isPathBlockedForMode, extractFilePath, extractRemoteFilePathsFromArgs, extractBashFileTargets } from "../utils/paths.js"
 import { deepScan } from "../utils/deep-scan.js"
 import {
   extractExecutedFilePaths,
@@ -128,16 +128,17 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
       }
     }
 
-    // Step 1: Check file path blocking
+    // Step 1: Check file path blocking (mode-aware: writes also honor writeProtectedPaths)
     const filePath = extractFilePath(input.tool, output.args)
     if (filePath) {
       const isAllowlistedPath = isAllowlisted(filePath, sessionAllowlist)
+      const accessMode: "read" | "write" = ["write", "edit", "patch"].includes(input.tool) ? "write" : "read"
 
       if (
         !isAllowlistedPath &&
-        isBlockedPath(filePath, config.blockedFilePaths, config.whitelistedPaths)
+        isPathBlockedForMode(filePath, accessMode, config.blockedFilePaths, config.writeProtectedPaths, config.whitelistedPaths)
       ) {
-        diagnosticLogger?.decision("input-sanitizer", input.tool, `BLOCKED file path: ${filePath}`)
+        diagnosticLogger?.decision("input-sanitizer", input.tool, `BLOCKED file path (${accessMode}): ${filePath}`)
         sessionStats.recordBlock(input.tool, filePath, "Blocked file path")
 
         await auditLogger.log({
@@ -168,14 +169,14 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
       }
     }
 
-    // Step 1b: Check remote file paths in SSH/SCP commands
+    // Step 1b: Check remote file paths in SSH/SCP/rsync/rclone commands (mode-aware)
     const remotePaths = extractRemoteFilePathsFromArgs(input.tool, output.args)
-    for (const remotePath of remotePaths) {
+    for (const { path: remotePath, mode: remoteMode } of remotePaths) {
       const isRemoteAllowlistedPath = isAllowlisted(remotePath, sessionAllowlist)
 
       if (
         !isRemoteAllowlistedPath &&
-        isBlockedPath(remotePath, config.blockedFilePaths, config.whitelistedPaths)
+        isPathBlockedForMode(remotePath, remoteMode, config.blockedFilePaths, config.writeProtectedPaths, config.whitelistedPaths)
       ) {
         sessionStats.recordBlock(input.tool, remotePath, "Blocked remote file path")
 
@@ -204,6 +205,55 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
           `This file may contain sensitive data (credentials, keys, secrets). ` +
           `If you need access, ask the user to temporarily allowlist it.`,
         )
+      }
+    }
+
+    // Step 1c: Check bash shell file targets (redirections / tee / truncate / dd) against blocklist.
+    // Write targets (>, >>, tee, truncate, dd of=) check blockedFilePaths + writeProtectedPaths.
+    // Read targets (<) check blockedFilePaths only.
+    // Without this, an agent could write to a blocked/protected file via shell redirection.
+    if (input.tool === "bash" && typeof output.args.command === "string") {
+      const { reads: bashReads, writes: bashWrites } = extractBashFileTargets(output.args.command as string)
+
+      const checkAndBlock = async (target: string, mode: "read" | "write") => {
+        if (isAllowlisted(target, sessionAllowlist)) return
+        if (!isPathBlockedForMode(target, mode, config.blockedFilePaths, config.writeProtectedPaths, config.whitelistedPaths)) return
+
+        diagnosticLogger?.decision("input-sanitizer", input.tool, `BLOCKED bash ${mode} target: ${target}`)
+        sessionStats.recordBlock(input.tool, target, `Blocked bash ${mode} target`)
+
+        await auditLogger.log({
+          timestamp: new Date().toISOString(),
+          tool: input.tool,
+          hook: "before",
+          sessionId: input.sessionID,
+          callId: input.callID,
+          detections: [],
+          blocked: true,
+          blockReason: `Blocked bash ${mode} target: ${target}`,
+          redactedCount: 0,
+        })
+
+        if (config.notifications && canToast(toastState)) {
+          try {
+            await client.tui.showToast({
+              body: { message: `🛡 Blocked: shell ${mode} of ${target} denied`, variant: "error" as const },
+            })
+          } catch { /* toast failure is non-critical */ }
+        }
+
+        throw new Error(
+          `Warden: ${mode === "write" ? "Writing to" : "Reading"} "${target}" via shell redirection is blocked by security policy. ` +
+          `This file is on the sensitive-file blocklist or write-protection list. ` +
+          `If you need to access it, ask the user to temporarily allowlist it.`,
+        )
+      }
+
+      for (const target of bashWrites) {
+        await checkAndBlock(target, "write")
+      }
+      for (const target of bashReads) {
+        await checkAndBlock(target, "read")
       }
     }
 

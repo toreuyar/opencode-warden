@@ -21,6 +21,7 @@
 - **LLM-powered safety evaluation** across 10 risk dimensions (exfiltration, destruction, privilege escalation, and more)
 - **LLM-enhanced output sanitization** — catches context-dependent secrets that regex alone misses
 - **File path blocking** with glob patterns — prevents access to `.env`, `*.pem`, `*.key`, kubeconfig, tfstate, and other sensitive files
+- **Write-protection** for read-only-but-never-modified files (logs, state) — read allowed, writes blocked deterministically including via shell redirections (`>`, `>>`, `tee`, `truncate`)
 - **Environment variable sanitization** — strips secrets from the shell environment before they reach tool calls
 - **SSH-only mode** — monitor only remote commands (ssh, scp, sftp, rsync, rclone) while bypassing all local operations
 - **7 built-in tools** — dashboard, reports, audit queries, dry-run evaluation, config view, and rule management

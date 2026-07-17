@@ -1,6 +1,7 @@
 import type {
   SafetyEvaluation,
   RiskLevel,
+  RiskDimension,
   SecurityGuardConfig,
 } from "../types.js"
 import { ConversationContext } from "./context.js"
@@ -16,6 +17,7 @@ import { resolveAllowedPatterns } from "../config/profiles.js"
 import {
   compileCommandPattern,
   hasDangerousMetachars,
+  hasCommandExecutionPrimitive,
   isAllowedOperation,
   isPipedCommandSafe,
   stripSudo,
@@ -28,6 +30,94 @@ const RISK_LEVEL_ORDER: Record<RiskLevel, number> = {
   medium: 2,
   high: 3,
   critical: 4,
+}
+
+/**
+ * Canonical alias map for risk dimensions. Models emit the same concept in
+ * many surface forms (display headings from the prompt like "DATA EXFILTRATION",
+ * space-separated "supply chain", hyphenated "supply-chain", etc.). This maps
+ * every observed variant to the canonical lowercase-hyphenated token defined
+ * by the RiskDimension type, so downstream consumers and audit logs see one
+ * consistent vocabulary regardless of model drift.
+ *
+ * Keys are lowercased + trimmed before lookup, so case and surrounding
+ * whitespace do not matter. Unknown dimensions are dropped (the type is a
+ * closed union).
+ */
+const RISK_DIMENSION_ALIASES: Record<string, RiskDimension> = {
+  // exfiltration
+  exfiltration: "exfiltration",
+  "data-exfiltration": "exfiltration",
+  "data exfiltration": "exfiltration",
+  "data-exfil": "exfiltration",
+  // destruction
+  destruction: "destruction",
+  "destructive-operations": "destruction",
+  "destructive operations": "destruction",
+  "destructive operation": "destruction",
+  // service-disruption
+  "service-disruption": "service-disruption",
+  "service disruption": "service-disruption",
+  "service-disruptions": "service-disruption",
+  // system-tampering
+  "system-tampering": "system-tampering",
+  "system tampering": "system-tampering",
+  // excessive-collection
+  "excessive-collection": "excessive-collection",
+  "excessive collection": "excessive-collection",
+  "excessive-data-collection": "excessive-collection",
+  "excessive data collection": "excessive-collection",
+  // privilege-escalation
+  "privilege-escalation": "privilege-escalation",
+  "privilege escalation": "privilege-escalation",
+  "priv-esc": "privilege-escalation",
+  privesc: "privilege-escalation",
+  // persistence
+  persistence: "persistence",
+  "backdoor": "persistence",
+  backdoors: "persistence",
+  // resource-abuse
+  "resource-abuse": "resource-abuse",
+  "resource abuse": "resource-abuse",
+  // network-manipulation
+  "network-manipulation": "network-manipulation",
+  "network manipulation": "network-manipulation",
+  // supply-chain
+  "supply-chain": "supply-chain",
+  "supply chain": "supply-chain",
+  supplychain: "supply-chain",
+  // remote-execution
+  "remote-execution": "remote-execution",
+  "remote execution": "remote-execution",
+  // indirect-execution
+  "indirect-execution": "indirect-execution",
+  "indirect execution": "indirect-execution",
+}
+
+/**
+ * Normalize a raw risk-dimension string to its canonical token, or undefined
+ * if no alias matches (in which case the caller drops it).
+ */
+function normalizeRiskDimension(raw: string): RiskDimension | undefined {
+  const key = raw.trim().toLowerCase()
+  return RISK_DIMENSION_ALIASES[key]
+}
+
+/**
+ * Normalize the riskDimensions array emitted by the model: map every entry
+ * to its canonical token, drop unknowns, and dedupe (preserving first-seen
+ * order). Guards against the same concept appearing twice under different
+ * surface forms (e.g. ["DATA EXFILTRATION", "data-exfiltration"]).
+ */
+function normalizeRiskDimensions(raw: unknown): RiskDimension[] {
+  if (!Array.isArray(raw)) return []
+  const seen = new Set<RiskDimension>()
+  for (const item of raw) {
+    if (typeof item !== "string") continue
+    const canonical = normalizeRiskDimension(item)
+    if (canonical) seen.add(canonical)
+  }
+  return [...seen]
 }
 
 export class SafetyEvaluator {
@@ -115,6 +205,10 @@ export class SafetyEvaluator {
 
     // Step 2: Dangerous metacharacters → always go to LLM
     if (hasDangerousMetachars(stripped)) return false
+
+    // Step 2b: Command-execution primitives (e.g. find -exec, find -delete)
+    // → always go to LLM, even if the outer command is on the bypass list
+    if (hasCommandExecutionPrimitive(stripped)) return false
 
     // Step 3: Pipe chains
     if (stripped.includes("|")) {
@@ -351,9 +445,7 @@ export class SafetyEvaluator {
       return {
         safe: Boolean(parsed.safe),
         riskLevel: ((parsed.riskLevel as string) || "none") as RiskLevel,
-        riskDimensions: Array.isArray(parsed.riskDimensions)
-          ? parsed.riskDimensions
-          : [],
+        riskDimensions: normalizeRiskDimensions(parsed.riskDimensions),
         explanation: (parsed.explanation as string) || "",
         suggestedAlternative: (parsed.suggestedAlternative as string) || "",
         recommendation: ((parsed.recommendation as string) || "allow") as SafetyEvaluation["recommendation"],

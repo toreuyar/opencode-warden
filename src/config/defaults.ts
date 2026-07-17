@@ -46,6 +46,12 @@ export const DEFAULT_CONFIG: SecurityGuardConfig = {
     "**/authorized_keys",
     "**/known_hosts",
   ],
+  writeProtectedPaths: [
+    // Readable for diagnostics, but never writable by the agent.
+    // Closes the anti-forensics hole (log truncation/empty-redirect) deterministically
+    // instead of relying on the LLM safety evaluator.
+    "**/var/log/**",
+  ],
   excludedTools: ["list"],
   blockedTools: [],
   sshOnlyMode: false,
