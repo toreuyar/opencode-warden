@@ -286,6 +286,24 @@ describe("Input Sanitizer Hook", () => {
     )
   })
 
+  test("bash truncate reference to a secret blocked file is blocked as a read", async () => {
+    const deps = createTestDeps()
+    const hook = createInputSanitizer({
+      ...deps,
+      config: DEFAULT_CONFIG,
+      client: mockClient,
+      safetyEvaluator: null,
+      sessionAllowlist: deps.sessionAllowlist,
+    })
+
+    const input = { tool: "bash", sessionID: "s1", callID: "c1" }
+    const output = { args: { command: "truncate -r /app/.env /tmp/out" } }
+
+    await expect(hook(input, output)).rejects.toThrow(
+      "blocked by security policy",
+    )
+  })
+
   test("blocks dynamic bash file targets that cannot be checked deterministically", async () => {
     const deps = createTestDeps()
     const hook = createInputSanitizer({

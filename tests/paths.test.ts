@@ -258,19 +258,27 @@ describe("extractBashFileTargets", () => {
 
   test("truncate -r reference file is not treated as a write target", () => {
     // -r /etc/hosts references its size (a read); only the real target is written.
-    expect(
-      extractBashFileTargets("truncate -r /etc/hosts /var/log/syslog").writes,
-    ).toEqual(["/var/log/syslog"])
+    const targets = extractBashFileTargets("truncate -r /etc/hosts /var/log/syslog")
+    expect(targets.reads).toEqual(["/etc/hosts"])
+    expect(targets.writes).toEqual(["/var/log/syslog"])
   })
 
   test("truncate --size/--reference long forms also skip their argument", () => {
     expect(
       extractBashFileTargets("truncate --size 2G /var/log/syslog").writes,
     ).toEqual(["/var/log/syslog"])
+    const targets = extractBashFileTargets("truncate --reference /etc/hosts /var/log/syslog")
+    expect(targets.reads).toEqual(["/etc/hosts"])
+    expect(targets.writes).toEqual(["/var/log/syslog"])
+  })
+
+  test("truncate inline --reference and -r forms are read targets", () => {
     expect(
-      extractBashFileTargets("truncate --reference /etc/hosts /var/log/syslog")
-        .writes,
-    ).toEqual(["/var/log/syslog"])
+      extractBashFileTargets("truncate --reference=/etc/hosts /var/log/syslog"),
+    ).toEqual({ reads: ["/etc/hosts"], writes: ["/var/log/syslog"] })
+    expect(
+      extractBashFileTargets("truncate -r/etc/hosts /var/log/syslog"),
+    ).toEqual({ reads: ["/etc/hosts"], writes: ["/var/log/syslog"] })
   })
 
   test("extracts input redirect as a READ target (< file)", () => {

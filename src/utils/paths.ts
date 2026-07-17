@@ -544,10 +544,10 @@ export function extractBashFileTargets(command: string): {
     }
 
     // truncate [opts] <file>... — every non-flag argument is a write target.
-    // -s/--size and -r/--reference each consume the next token (SIZE or RFILE);
-    // RFILE is a read-reference (truncate reads its size), not a write target.
+    // -s/--size consume a size operand; -r/--reference consume a read-reference file.
     if (tok === "truncate") {
-      const argFlags = new Set(["-s", "-r", "--size", "--reference"])
+      const sizeFlags = new Set(["-s", "--size"])
+      const referenceFlags = new Set(["-r", "--reference"])
       let j = i + 1
       let optsEnded = false
       while (j < tokens.length) {
@@ -558,8 +558,34 @@ export function extractBashFileTargets(command: string): {
           j++
           continue
         }
-        if (!optsEnded && argFlags.has(t)) {
+        if (!optsEnded && sizeFlags.has(t)) {
           j += 2 // skip flag + its argument
+          continue
+        }
+        if (!optsEnded && referenceFlags.has(t)) {
+          const ref = tokens[j + 1]
+          if (ref && isRealRedirectTarget(ref)) reads.push(ref)
+          j += 2
+          continue
+        }
+        if (!optsEnded && t.startsWith("--size=")) {
+          j++
+          continue
+        }
+        if (!optsEnded && t.startsWith("--reference=")) {
+          const ref = t.slice("--reference=".length)
+          if (isRealRedirectTarget(ref)) reads.push(ref)
+          j++
+          continue
+        }
+        if (!optsEnded && t.startsWith("-s") && t.length > 2) {
+          j++
+          continue
+        }
+        if (!optsEnded && t.startsWith("-r") && t.length > 2) {
+          const ref = t.slice(2)
+          if (isRealRedirectTarget(ref)) reads.push(ref)
+          j++
           continue
         }
         if (!optsEnded && t.startsWith("-")) {
