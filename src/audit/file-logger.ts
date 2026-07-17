@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync, statSync, renameSync, appendFileSync } from "fs"
-import { dirname } from "path"
+import { existsSync, lstatSync, statSync, renameSync } from "fs"
 import type { AuditConfig } from "../types.js"
+import { ensureSecureLogTarget, secureAppendFileSync } from "./secure-log-file.js"
 
 export class FileLogger {
   private buffer: string[] = []
@@ -18,11 +18,7 @@ export class FileLogger {
     this.maxFiles = config.maxFiles
     this.onError = onError
 
-    // Ensure directory exists
-    const dir = dirname(this.filePath)
-    if (!existsSync(dir)) {
-      mkdirSync(dir, { recursive: true })
-    }
+    this.ensureWritable()
   }
 
   write(entry: string): void {
@@ -48,7 +44,7 @@ export class FileLogger {
 
     try {
       this.rotateIfNeeded()
-      appendFileSync(this.filePath, data, "utf-8")
+      secureAppendFileSync(this.filePath, data)
     } catch (err) {
       this.onError?.(
         `Failed to write audit log: ${err instanceof Error ? err.message : err}`,
@@ -60,6 +56,9 @@ export class FileLogger {
     if (!existsSync(this.filePath)) return
 
     try {
+      if (lstatSync(this.filePath).isSymbolicLink()) {
+        throw new Error(`Refusing to rotate symlink log target: ${this.filePath}`)
+      }
       const stat = statSync(this.filePath)
       if (stat.size < this.maxFileSize) return
 
@@ -81,6 +80,16 @@ export class FileLogger {
     } catch (err) {
       this.onError?.(
         `Log rotation error: ${err instanceof Error ? err.message : err}`,
+      )
+    }
+  }
+
+  private ensureWritable(): void {
+    try {
+      ensureSecureLogTarget(this.filePath)
+    } catch (err) {
+      this.onError?.(
+        `Failed to initialize audit log: ${err instanceof Error ? err.message : err}`,
       )
     }
   }

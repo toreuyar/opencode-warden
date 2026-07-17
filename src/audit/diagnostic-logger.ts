@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync, statSync, renameSync, appendFileSync } from "fs"
-import { dirname } from "path"
+import { existsSync, lstatSync, statSync, renameSync } from "fs"
 import type { DiagnosticLogConfig } from "../types.js"
+import { ensureSecureLogTarget, secureAppendFileSync } from "./secure-log-file.js"
 
 const THICK_LINE = "═".repeat(63)
 const THIN_LINE = "─".repeat(63)
@@ -16,9 +16,10 @@ export class DiagnosticLogger {
     this.maxFileSize = config.maxFileSize
     this.maxFiles = config.maxFiles
 
-    const dir = dirname(this.filePath)
-    if (!existsSync(dir)) {
-      mkdirSync(dir, { recursive: true })
+    try {
+      ensureSecureLogTarget(this.filePath)
+    } catch {
+      // Diagnostic logging must never break the plugin
     }
   }
 
@@ -127,7 +128,7 @@ export class DiagnosticLogger {
     const block = lines.join("\n") + "\n\n"
     try {
       this.rotateIfNeeded()
-      appendFileSync(this.filePath, block, "utf-8")
+      secureAppendFileSync(this.filePath, block)
     } catch {
       // Diagnostic logging must never break the plugin
     }
@@ -137,6 +138,7 @@ export class DiagnosticLogger {
     if (!existsSync(this.filePath)) return
 
     try {
+      if (lstatSync(this.filePath).isSymbolicLink()) return
       const stat = statSync(this.filePath)
       if (stat.size < this.maxFileSize) return
 

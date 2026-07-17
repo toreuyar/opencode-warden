@@ -6,9 +6,23 @@ import {
   hasCommandExecutionPrimitive,
   isSafePipeTarget,
   isPipedCommandSafe,
+  matchesCommandPrefix,
   stripSudo,
   stripSafeRedirects,
 } from "../src/utils/command-patterns.js"
+
+describe("matchesCommandPrefix", () => {
+  test("matches exact commands and commands followed by whitespace", () => {
+    expect(matchesCommandPrefix("ls", "ls")).toBe(true)
+    expect(matchesCommandPrefix("  git status --short", "git status")).toBe(true)
+  })
+
+  test("does not match command-name prefixes", () => {
+    expect(matchesCommandPrefix("lsof -i", "ls")).toBe(false)
+    expect(matchesCommandPrefix("catch /etc/passwd", "cat")).toBe(false)
+    expect(matchesCommandPrefix("git statusmalicious", "git status")).toBe(false)
+  })
+})
 
 // ─── stripSudo ───
 

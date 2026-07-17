@@ -62,12 +62,10 @@ export const Warden: Plugin = async ({ client: sdkClient, directory }) => {
     })
   }
 
-  // ─── Create Session Stats ───
-  const sessionStats = new SessionStats()
-
   // ─── Create LLM Components (if enabled) ───
-  let llmSanitizer: LlmSanitizer | null = null
-  let safetyEvaluator: SafetyEvaluator | null = null
+  let debugLog: ((msg: string) => void) | undefined
+  let sanitizerChain: ProviderChain | null = null
+  let safetyChain: ProviderChain | null = null
   let outputTriage: OutputTriageEvaluator | null = null
   let outputTextTriage: OutputTextTriageEvaluator | null = null
 
@@ -87,17 +85,14 @@ export const Warden: Plugin = async ({ client: sdkClient, directory }) => {
       : undefined
 
     // Combined: call both if either exists
-    const debugLog = (panelDebugLog || fileDebugLog)
+    debugLog = (panelDebugLog || fileDebugLog)
       ? (msg: string) => { panelDebugLog?.(msg); fileDebugLog?.(msg) }
       : undefined
 
     // Build ProviderChain instances from resolved config
     // Each component uses its own providers (already resolved by config inheritance)
-    const sanitizerChain = new ProviderChain(config.llm.outputSanitizer.providers, debugLog, llmChatLogger)
-    const safetyChain = new ProviderChain(config.llm.safetyEvaluator.providers, debugLog, llmChatLogger)
-
-    llmSanitizer = new LlmSanitizer(config.llm, sanitizerChain, debugLog)
-    safetyEvaluator = new SafetyEvaluator(config.llm, safetyChain, debugLog, config.indirectExecution)
+    sanitizerChain = new ProviderChain(config.llm.outputSanitizer.providers, debugLog, llmChatLogger)
+    safetyChain = new ProviderChain(config.llm.safetyEvaluator.providers, debugLog, llmChatLogger)
 
     if (config.llm.outputTriage.enabled) {
       const triageChain = new ProviderChain(config.llm.outputTriage.providers, debugLog, llmChatLogger)
@@ -110,7 +105,7 @@ export const Warden: Plugin = async ({ client: sdkClient, directory }) => {
     }
 
     // Health check (non-blocking — don't block plugin startup)
-    llmSanitizer.healthCheck().then((healthy) => {
+    sanitizerChain.healthCheck().then((healthy) => {
       if (!healthy) {
         client.app.log({
           body: {
@@ -141,52 +136,107 @@ export const Warden: Plugin = async ({ client: sdkClient, directory }) => {
     }
   }
 
-  // ─── Shared State ───
-  const toastState: ToastState = {
-    lastToastTime: 0,
-    minInterval: 2000, // Max 1 toast per 2 seconds
-  }
-  const sessionAllowlist = new Set<string>()
-  const evaluatedCalls = new Set<string>()
-  const writtenFileRegistry = new Map<string, WrittenFileMetadata>()
-  let policyInjected = false
+  // ─── Session-Scoped State ───
   const securityPolicyText = buildSecurityPolicyContext(config)
+
+  interface SessionSecurityState {
+    sessionStats: SessionStats
+    toastState: ToastState
+    sessionAllowlist: Set<string>
+    evaluatedCalls: Set<string>
+    writtenFileRegistry: Map<string, WrittenFileMetadata>
+    policyInjected: boolean
+    llmSanitizer: LlmSanitizer | null
+    safetyEvaluator: SafetyEvaluator | null
+    lastAccessed: number
+  }
+
+  const sessions = new Map<string, SessionSecurityState>()
+  let latestSessionID = "__default__"
+
+  const createSessionState = (sessionID: string): SessionSecurityState => ({
+    sessionStats: new SessionStats(sessionID === "__default__" ? "" : sessionID),
+    toastState: {
+      lastToastTime: 0,
+      minInterval: 2000, // Max 1 toast per 2 seconds, per session
+    },
+    sessionAllowlist: new Set<string>(),
+    evaluatedCalls: new Set<string>(),
+    writtenFileRegistry: new Map<string, WrittenFileMetadata>(),
+    policyInjected: false,
+    llmSanitizer: config.llm.enabled && sanitizerChain
+      ? new LlmSanitizer(config.llm, sanitizerChain, debugLog)
+      : null,
+    safetyEvaluator: config.llm.enabled && safetyChain
+      ? new SafetyEvaluator(config.llm, safetyChain, debugLog, config.indirectExecution)
+      : null,
+    lastAccessed: Date.now(),
+  })
+
+  const getSessionState = (sessionID: string): SessionSecurityState => {
+    const id = sessionID || "__default__"
+    let state = sessions.get(id)
+    if (!state) {
+      state = createSessionState(id)
+      sessions.set(id, state)
+    }
+    state.lastAccessed = Date.now()
+    latestSessionID = id
+    return state
+  }
+
+  const getLatestSessionState = () => getSessionState(latestSessionID)
+
+  const resetSessionState = (sessionID: string): void => {
+    const id = sessionID || "__default__"
+    sessions.set(id, createSessionState(id))
+    latestSessionID = id
+  }
+
+  const extractEventSessionID = (event: unknown): string => {
+    if (!event || typeof event !== "object") return ""
+    const record = event as Record<string, unknown>
+    if (typeof record.sessionID === "string") return record.sessionID
+    if (typeof record.sessionId === "string") return record.sessionId
+    if (typeof record.id === "string") return record.id
+    const session = record.session
+    if (session && typeof session === "object") {
+      const sessionRecord = session as Record<string, unknown>
+      if (typeof sessionRecord.id === "string") return sessionRecord.id
+    }
+    return ""
+  }
 
   // ─── Create Hooks ───
   const inputSanitizer = createInputSanitizer({
     engine,
     config,
     auditLogger,
-    sessionStats,
+    projectDir: directory,
     client,
-    safetyEvaluator,
-    toastState,
-    sessionAllowlist,
-    evaluatedCalls,
     diagnosticLogger,
-    writtenFileRegistry,
+    getSessionState,
   })
 
   const outputRedactor = createOutputRedactor({
     engine,
     config,
     auditLogger,
-    sessionStats,
+    projectDir: directory,
     client,
-    llmSanitizer,
     outputTriage,
     outputTextTriage,
-    toastState,
     diagnosticLogger,
+    getSessionState,
   })
 
   const envSanitizer = createEnvSanitizer({
     engine,
     config,
     auditLogger,
-    sessionStats,
+    sessionStats: getLatestSessionState().sessionStats,
     client,
-    toastState,
+    toastState: getLatestSessionState().toastState,
     diagnosticLogger,
   })
 
@@ -195,21 +245,22 @@ export const Warden: Plugin = async ({ client: sdkClient, directory }) => {
   const permissionHandler = createPermissionHandler({
     config,
     client,
-    safetyEvaluator,
-    evaluatedCalls,
-    sessionAllowlist,
+    projectDir: directory,
     auditLogger,
     diagnosticLogger,
+    getSessionState,
   })
 
   // ─── Create Custom Tools ───
   const dashboardToolDef = createSecurityDashboardTool({
-    sessionStats,
+    getSessionStats: () => getLatestSessionState().sessionStats,
     config,
-    llmSanitizer,
+    getLlmSanitizer: () => getLatestSessionState().llmSanitizer,
   })
 
-  const reportToolDef = createSecurityReportTool({ sessionStats })
+  const reportToolDef = createSecurityReportTool({
+    getSessionStats: () => getLatestSessionState().sessionStats,
+  })
 
   const rulesToolDef = createRulesManageTool({
     engine,
@@ -220,12 +271,12 @@ export const Warden: Plugin = async ({ client: sdkClient, directory }) => {
   const helpToolDef = createSecurityHelpTool()
 
   const auditToolDef = createSecurityAuditTool({
-    auditLogPath: join(directory, config.audit.filePath),
+    auditLogPath: resolvedAuditConfig.filePath,
     maxFiles: config.audit.maxFiles,
   })
 
   const evaluateToolDef = createSecurityEvaluateTool({
-    safetyEvaluator,
+    getSafetyEvaluator: () => getLatestSessionState().safetyEvaluator,
   })
 
   const configToolDef = createSecurityConfigTool({ config })
@@ -275,9 +326,10 @@ export const Warden: Plugin = async ({ client: sdkClient, directory }) => {
       input: { tool: string; sessionID: string; callID: string },
       output: { args: Record<string, unknown> },
     ) => {
+      const sessionState = getSessionState(input.sessionID)
       // Inject security policy into session on first tool call
-      if (!policyInjected && input.sessionID) {
-        policyInjected = true
+      if (!sessionState.policyInjected && input.sessionID) {
+        sessionState.policyInjected = true
         try {
           await client.session.prompt({
             path: { id: input.sessionID },
@@ -299,14 +351,9 @@ export const Warden: Plugin = async ({ client: sdkClient, directory }) => {
 
     event: async ({ event }) => {
       if (event.type === "session.created") {
-        diagnosticLogger?.info("Session reset: clearing all state")
-        sessionStats.reset("")
-        sessionAllowlist.clear()
-        evaluatedCalls.clear()
-        writtenFileRegistry.clear()
-        policyInjected = false
-        llmSanitizer?.reset()
-        safetyEvaluator?.reset()
+        const sessionID = extractEventSessionID(event)
+        diagnosticLogger?.info(`Session reset: clearing state for ${sessionID || "default session"}`)
+        resetSessionState(sessionID)
       }
     },
 

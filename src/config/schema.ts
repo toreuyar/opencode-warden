@@ -80,6 +80,7 @@ const llmProviderSchema = llmEndpointSchema.extend({
 const llmOutputSanitizerSchema = llmEndpointSchema.extend({
   enabled: z.boolean().optional(),
   providers: z.array(llmProviderSchema).optional(),
+  retryCount: z.number().int().min(0).optional(),
   tools: z.array(z.string()).optional(),
   bypassedCommands: z.array(z.string()).optional(),
   skipWhenRegexClean: z.boolean().optional(),
@@ -128,6 +129,7 @@ const llmOutputTextTriageSchema = llmEndpointSchema.extend({
 const llmConfigSchema = z.object({
   enabled: z.boolean().optional(),
   debug: z.boolean().optional(),
+  retryCount: z.number().int().min(0).optional(),
   contextAccumulation: z.boolean().optional(),
   contextDetectionsOnly: z.boolean().optional(),
   maxContextPairs: z.number().int().positive().optional(),

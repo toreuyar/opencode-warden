@@ -20,6 +20,7 @@ import {
   hasCommandExecutionPrimitive,
   isAllowedOperation,
   isPipedCommandSafe,
+  matchesCommandPrefix,
   stripSudo,
 } from "../utils/command-patterns.js"
 import { tryParseJsonObject } from "../utils/json-repair.js"
@@ -223,7 +224,7 @@ export class SafetyEvaluator {
     const trimmed = stripped.trimStart()
     if (
       this.config.bypassedCommands.some((prefix) =>
-        trimmed.startsWith(prefix),
+        matchesCommandPrefix(trimmed, prefix),
       )
     ) {
       return true

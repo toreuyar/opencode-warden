@@ -244,6 +244,67 @@ describe("ProviderChain.call fallback logic", () => {
     restoreFetch()
   })
 
+  test("retries validator failures on the same provider", async () => {
+    let callCount = 0
+    globalThis.fetch = mock(async () => {
+      callCount++
+      const content = callCount === 1 ? "invalid" : "valid"
+      return new Response(
+        JSON.stringify({
+          choices: [{ message: { content } }],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      )
+    }) as any
+
+    const chain = new ProviderChain([makeProvider({ name: "primary" })])
+    const result = await chain.callValidated(
+      MESSAGES,
+      (response) => {
+        if (response !== "valid") throw new Error("bad contract")
+        return response
+      },
+      { componentName: "test", retryCount: 1 },
+    )
+
+    expect(result).toBe("valid")
+    expect(callCount).toBe(2)
+
+    restoreFetch()
+  })
+
+  test("falls back to next provider after validator retries are exhausted", async () => {
+    let callCount = 0
+    globalThis.fetch = mock(async () => {
+      callCount++
+      const content = callCount <= 2 ? "invalid" : "fallback-valid"
+      return new Response(
+        JSON.stringify({
+          choices: [{ message: { content } }],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      )
+    }) as any
+
+    const chain = new ProviderChain([
+      makeProvider({ name: "primary" }),
+      makeProvider({ name: "secondary" }),
+    ])
+    const result = await chain.callValidated(
+      MESSAGES,
+      (response) => {
+        if (response !== "fallback-valid") throw new Error("bad contract")
+        return response
+      },
+      { componentName: "test", retryCount: 1 },
+    )
+
+    expect(result).toBe("fallback-valid")
+    expect(callCount).toBe(3)
+
+    restoreFetch()
+  })
+
   test("skips provider on cooldown after exhaustion", async () => {
     let callCount = 0
     const urls: string[] = []

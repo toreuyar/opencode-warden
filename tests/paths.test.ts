@@ -1,6 +1,23 @@
-import { describe, test, expect } from "bun:test"
-import { isBlockedPath, isWriteProtectedPath, isPathBlockedForMode, matchGlob, extractFilePath, extractRemoteFilePathsFromArgs, extractBashFileTargets } from "../src/utils/paths.js"
+import { describe, test, expect, afterEach } from "bun:test"
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "fs"
+import { join } from "path"
+import { tmpdir } from "os"
+import { isBlockedPath, isWriteProtectedPath, isPathBlockedForMode, matchGlob, extractFilePath, extractRemoteFilePathsFromArgs, extractBashFileTargets, isDynamicPathTarget } from "../src/utils/paths.js"
 import { DEFAULT_CONFIG } from "../src/config/defaults.js"
+
+const tempDirs: string[] = []
+
+afterEach(() => {
+  for (const dir of tempDirs.splice(0)) {
+    if (existsSync(dir)) rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+function makeTempDir(): string {
+  const dir = mkdtempSync(join(tmpdir(), "warden-paths-"))
+  tempDirs.push(dir)
+  return dir
+}
 
 describe("Path Detection", () => {
   const blocked = DEFAULT_CONFIG.blockedFilePaths
@@ -62,9 +79,15 @@ describe("Path Detection", () => {
     expect(isBlockedPath("/project/package.json", blocked, whitelisted)).toBe(false)
   })
 
-  test("whitelist overrides blocklist", () => {
+  test("glob-like whitelist entries do not override the blocklist", () => {
     expect(
       isBlockedPath("/project/config/.env.example", blocked, whitelisted),
+    ).toBe(true)
+  })
+
+  test("exact whitelist entries override the blocklist", () => {
+    expect(
+      isBlockedPath("/project/config/.env.example", blocked, ["/project/config/.env.example"]),
     ).toBe(false)
   })
 })
@@ -206,6 +229,9 @@ describe("extractBashFileTargets", () => {
   })
 
   test("extracts glued write redirect (no space): >file, 2>file, >>file", () => {
+    expect(extractBashFileTargets("echo data>/project/.env").writes).toEqual([
+      "/project/.env",
+    ])
     expect(extractBashFileTargets("echo data >/project/.env").writes).toEqual([
       "/project/.env",
     ])
@@ -228,6 +254,14 @@ describe("extractBashFileTargets", () => {
 
   test("extracts glued input redirect as READ (<file)", () => {
     expect(extractBashFileTargets("cmd </etc/shadow").reads).toEqual(["/etc/shadow"])
+  })
+
+  test("detects dynamic shell path targets", () => {
+    expect(isDynamicPathTarget("$HOME/.ssh/id_rsa")).toBe(true)
+    expect(isDynamicPathTarget("${HOME}/.env")).toBe(true)
+    expect(isDynamicPathTarget("$(pwd)/.env")).toBe(true)
+    expect(isDynamicPathTarget("`pwd`/.env")).toBe(true)
+    expect(isDynamicPathTarget("/tmp/static.env")).toBe(false)
   })
 
   test("extracts tee write target", () => {
@@ -332,9 +366,9 @@ describe("isWriteProtectedPath", () => {
     expect(isWriteProtectedPath("/tmp/output.txt", wp, wl)).toBe(false)
   })
 
-  test("whitelist overrides write-protection", () => {
+  test("exact whitelist overrides write-protection", () => {
     expect(
-      isWriteProtectedPath("/var/log/syslog", wp, ["**/var/log/**"]),
+      isWriteProtectedPath("/var/log/syslog", wp, ["/var/log/syslog"]),
     ).toBe(false)
   })
 })
@@ -369,9 +403,39 @@ describe("isPathBlockedForMode", () => {
     expect(isPathBlockedForMode("/project/src/index.ts", "write", blocked, wp, wl)).toBe(false)
   })
 
-  test("whitelist overrides both modes", () => {
+  test("exact whitelist overrides both modes", () => {
     expect(
-      isPathBlockedForMode("/app/.env", "write", blocked, wp, ["**/.env"]),
+      isPathBlockedForMode("/app/.env", "write", blocked, wp, ["/app/.env"]),
     ).toBe(false)
+  })
+
+  test("existing symlink target is checked through its canonical path", () => {
+    const root = makeTempDir()
+    const secretDir = join(root, "secret")
+    const publicDir = join(root, "public")
+    mkdirSync(secretDir)
+    mkdirSync(publicDir)
+    const secretPath = join(secretDir, ".env")
+    const linkPath = join(publicDir, "link")
+    writeFileSync(secretPath, "TOKEN=value")
+    symlinkSync(secretPath, linkPath)
+
+    expect(
+      isPathBlockedForMode(linkPath, "read", ["**/.env"], [], [], root),
+    ).toBe(true)
+  })
+
+  test("write checks resolve through the nearest existing symlink parent", () => {
+    const root = makeTempDir()
+    const secretDir = join(root, "secret")
+    const publicDir = join(root, "public")
+    mkdirSync(secretDir)
+    mkdirSync(publicDir)
+    const linkDir = join(publicDir, "linked")
+    symlinkSync(secretDir, linkDir, "dir")
+
+    expect(
+      isPathBlockedForMode(join(linkDir, ".env"), "write", ["**/.env"], [], [], root),
+    ).toBe(true)
   })
 })

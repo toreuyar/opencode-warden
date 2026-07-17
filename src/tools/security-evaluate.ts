@@ -1,11 +1,12 @@
 import type { SafetyEvaluator } from "../llm/safety-evaluator.js"
 
 interface EvaluateDeps {
-  safetyEvaluator: SafetyEvaluator | null
+  safetyEvaluator?: SafetyEvaluator | null
+  getSafetyEvaluator?: () => SafetyEvaluator | null
 }
 
 export function createSecurityEvaluateTool(deps: EvaluateDeps) {
-  const { safetyEvaluator } = deps
+  const getSafetyEvaluator = () => deps.getSafetyEvaluator?.() ?? deps.safetyEvaluator ?? null
 
   return {
     description:
@@ -32,6 +33,7 @@ export function createSecurityEvaluateTool(deps: EvaluateDeps) {
       command?: string
       args?: string
     }): Promise<string> {
+      const safetyEvaluator = getSafetyEvaluator()
       if (!safetyEvaluator) {
         return "Safety evaluator is not enabled. Enable LLM in your Warden configuration to use this tool."
       }

@@ -294,6 +294,13 @@ describe("isInnerCommandBypassed", () => {
     expect(isInnerCommandBypassed(parsed, bypassedCommands)).toBe(true)
   })
 
+  test("does not bypass inner commands that only share a prefix", () => {
+    const lsof = parseSshCommand('ssh user@host.com "lsof -i"')!
+    const catchCmd = parseSshCommand('ssh user@host.com "catch /etc/passwd"')!
+    expect(isInnerCommandBypassed(lsof, bypassedCommands)).toBe(false)
+    expect(isInnerCommandBypassed(catchCmd, bypassedCommands)).toBe(false)
+  })
+
   test("does not bypass dangerous commands", () => {
     const parsed = parseSshCommand('ssh user@host.com "rm -rf /"')!
     expect(isInnerCommandBypassed(parsed, bypassedCommands)).toBe(false)

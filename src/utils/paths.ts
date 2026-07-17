@@ -1,3 +1,5 @@
+import { existsSync, realpathSync } from "fs"
+import { dirname, isAbsolute, join, normalize, resolve } from "path"
 import { parseSshCommand, extractRemoteFilePaths } from "./ssh.js"
 
 const RSYNC_REMOTE_PATH_RE = /^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9._-]+(?:\.[A-Za-z0-9._-]+)*:(.+)$/
@@ -109,6 +111,23 @@ function tokenizeCommand(command: string): string[] {
       continue
     }
 
+    if ((ch === ">" || ch === "<") && !inSingle && !inDouble) {
+      let op = ch
+      if (command[i + 1] === ch) {
+        op += command[i + 1]
+        i++
+      }
+
+      if (/^(?:\d+|&)$/.test(current)) {
+        tokens.push(current + op)
+      } else {
+        if (current.length > 0) tokens.push(current)
+        tokens.push(op)
+      }
+      current = ""
+      continue
+    }
+
     current += ch
   }
 
@@ -120,17 +139,80 @@ function tokenizeCommand(command: string): string[] {
 }
 
 /**
- * Check if a path is in the session allowlist (exact match or glob pattern).
+ * Check if a path is in the session allowlist. Allowlists are exact path
+ * matches only; broad pattern matching belongs in the blocklist.
  */
-export function isAllowlisted(filePath: string, allowlist: Set<string>): boolean {
-  if (allowlist.has(filePath)) return true
-  return [...allowlist].some((pattern) => {
-    try {
-      return new RegExp(pattern.replace(/\*/g, ".*")).test(filePath)
-    } catch {
-      return false
+export function isAllowlisted(filePath: string, allowlist: Set<string>, cwd?: string): boolean {
+  const candidates = getPathCandidates(filePath, "read", cwd)
+  const allowCandidates = [...allowlist].flatMap((p) => getPathCandidates(p, "read", cwd))
+  return candidates.some((candidate) => allowCandidates.includes(candidate))
+}
+
+function normalizeForMatch(filePath: string): string {
+  return normalize(filePath).replace(/\\/g, "/")
+}
+
+function toAbsolutePath(filePath: string, cwd?: string): string {
+  if (filePath.startsWith("~/")) {
+    const home = process.env.HOME || process.env.USERPROFILE || ""
+    if (home) return resolve(home, filePath.slice(2))
+  }
+  return isAbsolute(filePath)
+    ? resolve(filePath)
+    : resolve(cwd || process.cwd(), filePath)
+}
+
+function nearestExistingParent(filePath: string): string | null {
+  let current = dirname(filePath)
+  while (current && current !== dirname(current)) {
+    if (existsSync(current)) return current
+    current = dirname(current)
+  }
+  return existsSync(current) ? current : null
+}
+
+export function getPathCandidates(
+  filePath: string,
+  mode: "read" | "write",
+  cwd?: string,
+): string[] {
+  const candidates = new Set<string>()
+  if (!filePath) return []
+
+  candidates.add(normalizeForMatch(filePath))
+
+  const absolute = toAbsolutePath(filePath, cwd)
+  candidates.add(normalizeForMatch(absolute))
+
+  try {
+    if (existsSync(absolute)) {
+      candidates.add(normalizeForMatch(realpathSync(absolute)))
+    } else if (mode === "write") {
+      const parent = nearestExistingParent(absolute)
+      if (parent) {
+        const realParent = realpathSync(parent)
+        const relativeRemainder = absolute.slice(parent.length).replace(/^[/\\]+/, "")
+        candidates.add(normalizeForMatch(join(realParent, relativeRemainder)))
+      }
     }
-  })
+  } catch {
+    // Keep lexical candidates when canonicalization is unavailable.
+  }
+
+  return [...candidates]
+}
+
+function isExactlyWhitelisted(
+  filePath: string,
+  whitelistedPatterns: string[],
+  mode: "read" | "write",
+  cwd?: string,
+): boolean {
+  const pathCandidates = getPathCandidates(filePath, mode, cwd)
+  const whitelistCandidates = whitelistedPatterns.flatMap((p) =>
+    getPathCandidates(p, mode, cwd),
+  )
+  return pathCandidates.some((candidate) => whitelistCandidates.includes(candidate))
 }
 
 /**
@@ -141,21 +223,16 @@ export function isBlockedPath(
   filePath: string,
   blockedPatterns: string[],
   whitelistedPatterns: string[],
+  cwd?: string,
 ): boolean {
-  // Normalize path
-  const normalized = filePath.replace(/\\/g, "/")
-
-  // Check whitelist first (takes priority)
-  for (const pattern of whitelistedPatterns) {
-    if (matchGlob(normalized, pattern)) {
-      return false
-    }
-  }
+  if (isExactlyWhitelisted(filePath, whitelistedPatterns, "read", cwd)) return false
 
   // Check blocklist
-  for (const pattern of blockedPatterns) {
-    if (matchGlob(normalized, pattern)) {
-      return true
+  for (const candidate of getPathCandidates(filePath, "read", cwd)) {
+    for (const pattern of blockedPatterns) {
+      if (matchGlob(candidate, pattern)) {
+        return true
+      }
     }
   }
 
@@ -175,19 +252,15 @@ export function isWriteProtectedPath(
   filePath: string,
   writeProtectedPatterns: string[],
   whitelistedPatterns: string[],
+  cwd?: string,
 ): boolean {
-  const normalized = filePath.replace(/\\/g, "/")
+  if (isExactlyWhitelisted(filePath, whitelistedPatterns, "write", cwd)) return false
 
-  // Whitelist takes priority
-  for (const pattern of whitelistedPatterns) {
-    if (matchGlob(normalized, pattern)) {
-      return false
-    }
-  }
-
-  for (const pattern of writeProtectedPatterns) {
-    if (matchGlob(normalized, pattern)) {
-      return true
+  for (const candidate of getPathCandidates(filePath, "write", cwd)) {
+    for (const pattern of writeProtectedPatterns) {
+      if (matchGlob(candidate, pattern)) {
+        return true
+      }
     }
   }
 
@@ -206,9 +279,10 @@ export function isPathBlockedForMode(
   blockedPatterns: string[],
   writeProtectedPatterns: string[],
   whitelistedPatterns: string[],
+  cwd?: string,
 ): boolean {
-  if (isBlockedPath(filePath, blockedPatterns, whitelistedPatterns)) return true
-  if (mode === "write" && isWriteProtectedPath(filePath, writeProtectedPatterns, whitelistedPatterns)) {
+  if (isBlockedPath(filePath, blockedPatterns, whitelistedPatterns, cwd)) return true
+  if (mode === "write" && isWriteProtectedPath(filePath, writeProtectedPatterns, whitelistedPatterns, cwd)) {
     return true
   }
   return false
@@ -379,6 +453,10 @@ function isRealRedirectTarget(p: string): boolean {
   return true
 }
 
+export function isDynamicPathTarget(p: string): boolean {
+  return /(?:^|[^\\])(?:\$[{(]?|`)/.test(p)
+}
+
 /**
  * Extract file paths that a bash command reads or writes via shell redirection,
  * `tee`, `truncate`, or `dd of=`. Used to enforce the blockedFilePaths and
@@ -397,13 +475,9 @@ function isRealRedirectTarget(p: string): boolean {
  * READ targets (checked against blockedFilePaths only):
  *  - Input redirect:          < file
  *
- * Skips: fd-duplication (2>&1, <&3), fd-close (>&-), heredocs (<<), /dev/null,
- * and pure-numeric tokens. Quoting is handled by the tokenizer.
- *
- * Known limitation: a redirect operator glued to a PRECEDING word with no space
- * (e.g. `echo>file`) is not split and won't be caught. Realistic agent-produced
- * commands use spaces around operators; unusual forms remain covered by the LLM
- * safety evaluator.
+   * Skips: fd-duplication (2>&1, <&3), fd-close (>&-), heredocs (<<), /dev/null,
+   * and pure-numeric tokens. Quoting and glued redirection operators are handled
+   * by the tokenizer.
  */
 export function extractBashFileTargets(command: string): {
   reads: string[]

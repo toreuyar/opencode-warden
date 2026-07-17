@@ -65,12 +65,12 @@ describe("LlmSanitizer", () => {
     test("returns findings when LLM detects secrets", async () => {
       const config = makeLlmConfig()
       const chain = new ProviderChain([makeProvider()])
-      chain.call = mock(async () => JSON.stringify({
+      chain.callValidated = mock(async (_messages, validate) => validate(JSON.stringify({
         needsSanitization: true,
         findings: [
           { sensitive: "sk-abc123", category: "api-key", occurrences: 1 },
         ],
-      }))
+      })))
       const sanitizer = new LlmSanitizer(config, chain)
       const result = await sanitizer.sanitize("bash", "Output: sk-abc123")
       expect(result.needsSanitization).toBe(true)
@@ -81,10 +81,10 @@ describe("LlmSanitizer", () => {
     test("returns clean result when no secrets found", async () => {
       const config = makeLlmConfig()
       const chain = new ProviderChain([makeProvider()])
-      chain.call = mock(async () => JSON.stringify({
+      chain.callValidated = mock(async (_messages, validate) => validate(JSON.stringify({
         needsSanitization: false,
         findings: [],
-      }))
+      })))
       const sanitizer = new LlmSanitizer(config, chain)
       const result = await sanitizer.sanitize("bash", "safe output")
       expect(result.needsSanitization).toBe(false)
@@ -94,7 +94,7 @@ describe("LlmSanitizer", () => {
     test("throws on LLM unreachable (fail-closed)", async () => {
       const config = makeLlmConfig()
       const chain = new ProviderChain([makeProvider()])
-      chain.call = mock(async () => { throw new Error("connection refused") })
+      chain.callValidated = mock(async () => { throw new Error("connection refused") })
       const sanitizer = new LlmSanitizer(config, chain)
       await expect(sanitizer.sanitize("bash", "output")).rejects.toThrow("LLM sanitization failed")
     })
@@ -102,7 +102,7 @@ describe("LlmSanitizer", () => {
     test("throws on timeout", async () => {
       const config = makeLlmConfig()
       const chain = new ProviderChain([makeProvider()])
-      chain.call = mock(async () => { throw new Error("request timed out") })
+      chain.callValidated = mock(async () => { throw new Error("request timed out") })
       const sanitizer = new LlmSanitizer(config, chain)
       await expect(sanitizer.sanitize("bash", "output")).rejects.toThrow("timed out")
     })
@@ -110,36 +110,66 @@ describe("LlmSanitizer", () => {
     test("throws on unparseable LLM response", async () => {
       const config = makeLlmConfig()
       const chain = new ProviderChain([makeProvider()])
-      chain.call = mock(async () => "not json")
+      chain.callValidated = mock(async (_messages, validate) => validate("not json"))
       const sanitizer = new LlmSanitizer(config, chain)
-      await expect(sanitizer.sanitize("bash", "output")).rejects.toThrow("parsing failed")
+      await expect(sanitizer.sanitize("bash", "output")).rejects.toThrow("no JSON found")
     })
 
     test("throws on inconsistency: needsSanitization=true but no findings", async () => {
       const config = makeLlmConfig()
       const chain = new ProviderChain([makeProvider()])
-      chain.call = mock(async () => JSON.stringify({
+      chain.callValidated = mock(async (_messages, validate) => validate(JSON.stringify({
         needsSanitization: true,
         findings: [],
-      }))
+      })))
       const sanitizer = new LlmSanitizer(config, chain)
       await expect(sanitizer.sanitize("bash", "output")).rejects.toThrow("inconsistency")
     })
 
-    test("filters out findings with empty sensitive field", async () => {
+    test("throws on findings with empty sensitive field", async () => {
       const config = makeLlmConfig()
       const chain = new ProviderChain([makeProvider()])
-      chain.call = mock(async () => JSON.stringify({
+      chain.callValidated = mock(async (_messages, validate) => validate(JSON.stringify({
         needsSanitization: true,
         findings: [
           { sensitive: "real-secret", category: "api-key", occurrences: 1 },
           { sensitive: "", category: "unknown", occurrences: 0 },
         ],
-      }))
+      })))
       const sanitizer = new LlmSanitizer(config, chain)
-      const result = await sanitizer.sanitize("bash", "output with real-secret")
-      expect(result.findings).toHaveLength(1)
-      expect(result.findings[0].sensitive).toBe("real-secret")
+      await expect(sanitizer.sanitize("bash", "output with real-secret")).rejects.toThrow(
+        "missing non-empty sensitive",
+      )
+    })
+
+    test("throws when sensitive string is not present in output", async () => {
+      const config = makeLlmConfig()
+      const chain = new ProviderChain([makeProvider()])
+      chain.callValidated = mock(async (_messages, validate) => validate(JSON.stringify({
+        needsSanitization: true,
+        findings: [
+          { sensitive: "missing-secret", category: "api-key", occurrences: 1 },
+        ],
+      })))
+      const sanitizer = new LlmSanitizer(config, chain)
+      await expect(sanitizer.sanitize("bash", "output")).rejects.toThrow(
+        "was not found",
+      )
+    })
+
+    test("throws when occurrence count does not match output", async () => {
+      const config = makeLlmConfig()
+      const chain = new ProviderChain([makeProvider()])
+      chain.callValidated = mock(async (_messages, validate) => validate(JSON.stringify({
+        needsSanitization: true,
+        findings: [
+          { sensitive: "same-secret", category: "api-key", occurrences: 2 },
+        ],
+      })))
+      const sanitizer = new LlmSanitizer(config, chain)
+      await expect(sanitizer.sanitize("bash", "same-secret")).rejects.toThrow(
+        "occurrence count",
+      )
     })
   })
 

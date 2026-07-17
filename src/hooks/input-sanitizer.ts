@@ -10,7 +10,7 @@ import type {
   PatternCategory,
   WrittenFileMetadata,
 } from "../types.js"
-import { isAllowlisted, isPathBlockedForMode, extractFilePath, extractRemoteFilePathsFromArgs, extractBashFileTargets } from "../utils/paths.js"
+import { isAllowlisted, isPathBlockedForMode, extractFilePath, extractRemoteFilePathsFromArgs, extractBashFileTargets, isDynamicPathTarget } from "../utils/paths.js"
 import { deepScan } from "../utils/deep-scan.js"
 import {
   extractExecutedFilePaths,
@@ -25,14 +25,23 @@ interface InputSanitizerDeps {
   engine: DetectionEngine
   config: SecurityGuardConfig
   auditLogger: AuditLogger
-  sessionStats: SessionStats
+  projectDir?: string
+  sessionStats?: SessionStats
   client: PluginClient
-  safetyEvaluator: SafetyEvaluator | null
-  toastState: ToastState
-  sessionAllowlist: Set<string>
-  evaluatedCalls: Set<string>
+  safetyEvaluator?: SafetyEvaluator | null
+  toastState?: ToastState
+  sessionAllowlist?: Set<string>
+  evaluatedCalls?: Set<string>
   diagnosticLogger: DiagnosticLogger | null
-  writtenFileRegistry: Map<string, WrittenFileMetadata>
+  writtenFileRegistry?: Map<string, WrittenFileMetadata>
+  getSessionState?: (sessionID: string) => {
+    sessionStats: SessionStats
+    safetyEvaluator: SafetyEvaluator | null
+    toastState: ToastState
+    sessionAllowlist: Set<string>
+    evaluatedCalls: Set<string>
+    writtenFileRegistry: Map<string, WrittenFileMetadata>
+  }
 }
 
 function canToast(state: ToastState): boolean {
@@ -47,21 +56,47 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
     engine,
     config,
     auditLogger,
-    sessionStats,
+    projectDir,
     client,
-    safetyEvaluator,
-    toastState,
-    sessionAllowlist,
-    evaluatedCalls,
     diagnosticLogger,
-    writtenFileRegistry,
+    getSessionState,
   } = deps
+
+  const getState = (sessionID: string) => {
+    if (getSessionState) return getSessionState(sessionID)
+    if (
+      !deps.sessionStats ||
+      !deps.toastState ||
+      !deps.sessionAllowlist ||
+      !deps.evaluatedCalls ||
+      !deps.writtenFileRegistry
+    ) {
+      throw new Error("Warden: input sanitizer session state is not configured")
+    }
+    return {
+      sessionStats: deps.sessionStats,
+      safetyEvaluator: deps.safetyEvaluator ?? null,
+      toastState: deps.toastState,
+      sessionAllowlist: deps.sessionAllowlist,
+      evaluatedCalls: deps.evaluatedCalls,
+      writtenFileRegistry: deps.writtenFileRegistry,
+    }
+  }
 
   return async (
     input: { tool: string; sessionID: string; callID: string },
     output: { args: Record<string, unknown> },
   ) => {
     const hookStart = Date.now()
+    const {
+      sessionStats,
+      safetyEvaluator,
+      toastState,
+      sessionAllowlist,
+      evaluatedCalls,
+      writtenFileRegistry,
+    } = getState(input.sessionID)
+
     diagnosticLogger?.hookStart("input-sanitizer", input.tool, input.callID, input.sessionID, { args: output.args })
 
     sessionStats.recordToolCall()
@@ -131,12 +166,12 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
     // Step 1: Check file path blocking (mode-aware: writes also honor writeProtectedPaths)
     const filePath = extractFilePath(input.tool, output.args)
     if (filePath) {
-      const isAllowlistedPath = isAllowlisted(filePath, sessionAllowlist)
+      const isAllowlistedPath = isAllowlisted(filePath, sessionAllowlist, projectDir)
       const accessMode: "read" | "write" = ["write", "edit", "patch"].includes(input.tool) ? "write" : "read"
 
       if (
         !isAllowlistedPath &&
-        isPathBlockedForMode(filePath, accessMode, config.blockedFilePaths, config.writeProtectedPaths, config.whitelistedPaths)
+        isPathBlockedForMode(filePath, accessMode, config.blockedFilePaths, config.writeProtectedPaths, config.whitelistedPaths, projectDir)
       ) {
         diagnosticLogger?.decision("input-sanitizer", input.tool, `BLOCKED file path (${accessMode}): ${filePath}`)
         sessionStats.recordBlock(input.tool, filePath, "Blocked file path")
@@ -216,8 +251,26 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
       const { reads: bashReads, writes: bashWrites } = extractBashFileTargets(output.args.command as string)
 
       const checkAndBlock = async (target: string, mode: "read" | "write") => {
-        if (isAllowlisted(target, sessionAllowlist)) return
-        if (!isPathBlockedForMode(target, mode, config.blockedFilePaths, config.writeProtectedPaths, config.whitelistedPaths)) return
+        if (isDynamicPathTarget(target)) {
+          diagnosticLogger?.decision("input-sanitizer", input.tool, `BLOCKED dynamic bash ${mode} target: ${target}`)
+          await auditLogger.log({
+            timestamp: new Date().toISOString(),
+            tool: input.tool,
+            hook: "before",
+            sessionId: input.sessionID,
+            callId: input.callID,
+            detections: [],
+            blocked: true,
+            blockReason: `Dynamic bash ${mode} target cannot be verified deterministically: ${target}`,
+            redactedCount: 0,
+          })
+          throw new Error(
+            `Warden: ${mode === "write" ? "Writing to" : "Reading"} dynamic shell target "${target}" is blocked by security policy. ` +
+            `Use an explicit path so Warden can verify the target deterministically.`,
+          )
+        }
+        if (isAllowlisted(target, sessionAllowlist, projectDir)) return
+        if (!isPathBlockedForMode(target, mode, config.blockedFilePaths, config.writeProtectedPaths, config.whitelistedPaths, projectDir)) return
 
         diagnosticLogger?.decision("input-sanitizer", input.tool, `BLOCKED bash ${mode} target: ${target}`)
         sessionStats.recordBlock(input.tool, target, `Blocked bash ${mode} target`)

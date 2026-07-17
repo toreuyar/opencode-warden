@@ -3,13 +3,21 @@ import type { SecurityGuardConfig, PatternCategory } from "../types.js"
 import type { LlmSanitizer } from "../llm/index.js"
 
 interface DashboardDeps {
-  sessionStats: SessionStats
+  sessionStats?: SessionStats
+  getSessionStats?: () => SessionStats
   config: SecurityGuardConfig
-  llmSanitizer: LlmSanitizer | null
+  llmSanitizer?: LlmSanitizer | null
+  getLlmSanitizer?: () => LlmSanitizer | null
 }
 
 export function createSecurityDashboardTool(deps: DashboardDeps) {
-  const { sessionStats, config, llmSanitizer } = deps
+  const { config } = deps
+  const getSessionStats = () => {
+    const stats = deps.getSessionStats?.() ?? deps.sessionStats
+    if (!stats) throw new Error("Warden: dashboard session stats are not configured")
+    return stats
+  }
+  const getLlmSanitizer = () => deps.getLlmSanitizer?.() ?? deps.llmSanitizer ?? null
 
   return {
     description:
@@ -22,6 +30,8 @@ export function createSecurityDashboardTool(deps: DashboardDeps) {
       },
     },
     async execute(args: { mode?: string }): Promise<string> {
+      const sessionStats = getSessionStats()
+      const llmSanitizer = getLlmSanitizer()
       const summary = sessionStats.getSummary()
 
       if (args.mode === "brief") {

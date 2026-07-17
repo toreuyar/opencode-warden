@@ -120,10 +120,11 @@ export const DEFAULT_CONFIG: SecurityGuardConfig = {
     systemPrompt: "",
     promptTemplate: "",
   },
-  llm: {
-    enabled: false,
-    debug: true,
-    contextAccumulation: false,
+	  llm: {
+	    enabled: false,
+	    debug: true,
+	    retryCount: 1,
+	    contextAccumulation: false,
     contextDetectionsOnly: true,
     maxContextPairs: 5,
     maxContextChars: 16000,

@@ -11,6 +11,7 @@ export class LlmSanitizer {
   private context: ConversationContext
   private endpointConfig: SecurityGuardConfig["llm"]["outputSanitizer"]
   private llmEnabled: boolean
+  private retryCount: number
   private debugLog?: (msg: string) => void
   private providerChain: ProviderChain
 
@@ -21,6 +22,7 @@ export class LlmSanitizer {
   ) {
     this.endpointConfig = config.outputSanitizer
     this.llmEnabled = config.enabled
+    this.retryCount = config.outputSanitizer.retryCount ?? config.retryCount
     this.debugLog = debugLog
     this.providerChain = providerChain
     const systemPrompt =
@@ -90,13 +92,24 @@ export class LlmSanitizer {
     )
     this.context.addUserMessage(prompt)
 
-    // Step 1: Network call via provider chain (handles fallback internally)
-    let response: string
+    // Step 1: Network call via provider chain (handles fallback/retry internally)
+    let response = ""
     try {
-      response = await this.providerChain.call(
+      const result = await this.providerChain.callValidated(
         this.context.getMessages(),
-        { componentName: "output-sanitizer" },
+        (rawResponse) => {
+          response = rawResponse
+          return this.parseResponse(rawResponse, rawOutput)
+        },
+        { componentName: "output-sanitizer", retryCount: this.retryCount },
       )
+      this.context.addAssistantMessage(response, result.findings.length > 0)
+
+      log?.(
+        `Output sanitizer result: needsSanitization=${result.needsSanitization} ${result.findings.length} finding(s) (${Date.now() - start}ms)\nPARSED RESULT:\n${JSON.stringify(result, null, 2)}`,
+      )
+
+      return result
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err)
       const isTimeout = errMsg.includes("timed out") || errMsg.includes("aborted") || errMsg.includes("AbortError")
@@ -107,35 +120,13 @@ export class LlmSanitizer {
         `LLM sanitization ${isTimeout ? "timed out" : "failed"}: ${errMsg}`,
       )
     }
-
-    // Step 2: Parse response — errors here do NOT affect connection state
-    // The LLM responded successfully but the output may not be parseable
-    try {
-      const result = this.parseResponse(response)
-      this.context.addAssistantMessage(response, result.findings.length > 0)
-
-      log?.(
-        `Output sanitizer result: needsSanitization=${result.needsSanitization} ${result.findings.length} finding(s) (${Date.now() - start}ms)\nPARSED RESULT:\n${JSON.stringify(result, null, 2)}`,
-      )
-
-      return result
-    } catch (parseErr) {
-      // Parse failure — LLM is reachable but produced unparseable output
-      // Do NOT set connected=false — this is a content issue, not a connectivity issue
-      const parseMsg = parseErr instanceof Error ? parseErr.message : String(parseErr)
-      log?.(
-        `Output sanitizer: PARSE ERROR after successful LLM call (${Date.now() - start}ms): ${parseMsg}\nRAW RESPONSE:\n${response.substring(0, 500)}`,
-      )
-      // Fail closed: callers must handle this as a block, but LLM stays "connected"
-      throw new Error(`LLM response parsing failed: ${parseMsg}`)
-    }
   }
 
   reset(): void {
     this.context.reset()
   }
 
-  private parseResponse(response: string): LlmSanitizeResult {
+  private parseResponse(response: string, rawOutput: string): LlmSanitizeResult {
     // Try parsing with JSON repair (handles unescaped quotes from small LLMs)
     const parsed = tryParseJsonObject(response)
     if (!parsed) {
@@ -145,17 +136,52 @@ export class LlmSanitizer {
       throw new Error("Could not parse LLM sanitization response — missing needsSanitization field")
     }
 
-    const findings: LlmSanitizeFinding[] = Array.isArray(parsed.findings)
-      ? parsed.findings.filter(
-          (f: Record<string, unknown>) =>
-            typeof f.sensitive === "string" && f.sensitive.length > 0,
-        )
-      : []
+    const rawFindings = Array.isArray(parsed.findings) ? parsed.findings : []
+    const findings: LlmSanitizeFinding[] = []
+
+    for (const rawFinding of rawFindings) {
+      const finding = rawFinding as Record<string, unknown>
+      if (typeof finding.sensitive !== "string" || finding.sensitive.length === 0) {
+        throw new Error("LLM finding is missing non-empty sensitive string — fail closed")
+      }
+      if (typeof finding.category !== "string" || finding.category.length === 0) {
+        throw new Error("LLM finding is missing category — fail closed")
+      }
+      if (!Number.isInteger(finding.occurrences) || (finding.occurrences as number) <= 0) {
+        throw new Error("LLM finding has invalid occurrences — fail closed")
+      }
+
+      let actualCount = 0
+      let searchPos = 0
+      while (true) {
+        const idx = rawOutput.indexOf(finding.sensitive, searchPos)
+        if (idx === -1) break
+        actualCount++
+        searchPos = idx + finding.sensitive.length
+      }
+      if (actualCount === 0) {
+        throw new Error("LLM finding sensitive string was not found in output — fail closed")
+      }
+      if (actualCount !== finding.occurrences) {
+        throw new Error("LLM finding occurrence count does not match output — fail closed")
+      }
+
+      findings.push({
+        sensitive: finding.sensitive,
+        category: finding.category,
+        occurrences: finding.occurrences,
+      })
+    }
 
     // Consistency check: needsSanitization=true but no findings → fail closed
     if (parsed.needsSanitization && findings.length === 0) {
       throw new Error(
         "LLM inconsistency: needsSanitization=true but findings is empty — fail closed",
+      )
+    }
+    if (!parsed.needsSanitization && rawFindings.length > 0) {
+      throw new Error(
+        "LLM inconsistency: needsSanitization=false but findings is not empty — fail closed",
       )
     }
 

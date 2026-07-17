@@ -33,6 +33,7 @@ function normalizeProvider(raw: Partial<LlmProviderConfig>, index: number): LlmP
 export interface ProviderCallOptions {
   temperature?: number
   componentName?: string
+  retryCount?: number
 }
 
 /**
@@ -69,7 +70,21 @@ export class ProviderChain {
    * Execute an LLM call with automatic fallback through the provider chain.
    */
   async call(messages: LlmMessage[], options: ProviderCallOptions = {}): Promise<string> {
+    return this.callValidated(messages, (response) => response, options)
+  }
+
+  /**
+   * Execute an LLM call and validate the response before accepting it. Validator
+   * failures retry the same provider up to retryCount, then fall back to the next
+   * provider. If all providers fail validation or transport, the call fails closed.
+   */
+  async callValidated<T>(
+    messages: LlmMessage[],
+    validate: (response: string) => T,
+    options: ProviderCallOptions = {},
+  ): Promise<T> {
     const errors: string[] = []
+    const retryCount = Math.max(0, options.retryCount ?? 0)
 
     for (let i = 0; i < this.providers.length; i++) {
       const provider = this.providers[i]
@@ -83,48 +98,59 @@ export class ProviderChain {
         continue
       }
 
-      try {
-        this.debugLog?.(`ProviderChain: trying ${name} (${provider.baseUrl} model=${provider.model})`)
+      for (let attempt = 0; attempt <= retryCount; attempt++) {
+        try {
+          this.debugLog?.(`ProviderChain: trying ${name} (${provider.baseUrl} model=${provider.model}) attempt=${attempt + 1}/${retryCount + 1}`)
 
-        const headers = buildLlmHeaders(provider.apiKey, provider.headers)
-        const response = await callLlm({
-          baseUrl: provider.baseUrl,
-          completionsPath: provider.completionsPath,
-          model: provider.model,
-          messages,
-          temperature: options.temperature ?? provider.temperature,
-          timeout: provider.timeout,
-          headers,
-          debugLog: this.debugLog,
-          chatLogger: this.chatLogger,
-          componentName: options.componentName,
-        })
+          const headers = buildLlmHeaders(provider.apiKey, provider.headers)
+          const response = await callLlm({
+            baseUrl: provider.baseUrl,
+            completionsPath: provider.completionsPath,
+            model: provider.model,
+            messages,
+            temperature: options.temperature ?? provider.temperature,
+            timeout: provider.timeout,
+            headers,
+            debugLog: this.debugLog,
+            chatLogger: this.chatLogger,
+            componentName: options.componentName,
+          })
 
-        // Success — reset cooldown for this provider
-        this.exhaustedAt.delete(i)
+          const validated = validate(response)
 
-        if (i > 0) {
-          this.debugLog?.(`ProviderChain: ${name} succeeded (fallback from provider #1)`)
-        }
+          // Success — reset cooldown for this provider
+          this.exhaustedAt.delete(i)
 
-        return response
-      } catch (err) {
-        const errMsg = err instanceof Error ? err.message : String(err)
-
-        if (err instanceof LlmApiError && isExhausted(err.statusCode)) {
-          // Exhaustion — mark with cooldown timestamp
-          if (provider.cooldown > 0) {
-            this.exhaustedAt.set(i, Date.now())
-            this.debugLog?.(`ProviderChain: ${name} exhausted (HTTP ${err.statusCode}) — cooldown ${provider.cooldown}ms`)
-          } else {
-            this.debugLog?.(`ProviderChain: ${name} exhausted (HTTP ${err.statusCode}) — no cooldown, will retry next call`)
+          if (i > 0) {
+            this.debugLog?.(`ProviderChain: ${name} succeeded (fallback from provider #1)`)
           }
-          errors.push(`${name}: exhausted (${err.statusCode})`)
-        } else {
-          // Transient error — no cooldown, try next
+
+          return validated
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : String(err)
+
+          if (err instanceof LlmApiError && isExhausted(err.statusCode)) {
+            // Exhaustion — mark with cooldown timestamp
+            if (provider.cooldown > 0) {
+              this.exhaustedAt.set(i, Date.now())
+              this.debugLog?.(`ProviderChain: ${name} exhausted (HTTP ${err.statusCode}) — cooldown ${provider.cooldown}ms`)
+            } else {
+              this.debugLog?.(`ProviderChain: ${name} exhausted (HTTP ${err.statusCode}) — no cooldown, will retry next call`)
+            }
+            errors.push(`${name}: exhausted (${err.statusCode})`)
+            break
+          }
+
+          if (attempt < retryCount) {
+            this.debugLog?.(`ProviderChain: ${name} attempt ${attempt + 1} failed, retrying: ${errMsg}`)
+            continue
+          }
+
+          // Transient or validator error — no cooldown, try next provider
           this.debugLog?.(`ProviderChain: ${name} failed: ${errMsg}`)
           errors.push(`${name}: ${errMsg}`)
         }
+        break
       }
     }
 

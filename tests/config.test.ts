@@ -65,6 +65,11 @@ describe("Configuration", () => {
     expect(DEFAULT_CONFIG.llm.debug).toBe(true)
   })
 
+  test("default LLM retry count is configured", () => {
+    expect(DEFAULT_CONFIG.llm.retryCount).toBe(1)
+    expect(DEFAULT_CONFIG.llm.outputSanitizer.retryCount).toBeUndefined()
+  })
+
   test("Zod schema validates empty config", () => {
     const result = securityGuardConfigSchema.safeParse({})
     expect(result.success).toBe(true)
@@ -177,9 +182,11 @@ describe("Configuration", () => {
         },
         completionsPath: "/chat/completions?api-version=2024-02-15-preview",
         healthCheckPath: "/health",
+        retryCount: 2,
         outputSanitizer: {
           systemPrompt: "Custom sanitizer prompt",
           promptTemplate: "Sanitize: {{toolName}} {{output}}",
+          retryCount: 3,
         },
         safetyEvaluator: {
           systemPrompt: "Custom safety prompt",

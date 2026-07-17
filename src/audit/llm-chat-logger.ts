@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync, statSync, renameSync, appendFileSync } from "fs"
-import { dirname } from "path"
+import { existsSync, lstatSync, statSync, renameSync } from "fs"
 import type { LlmMessage } from "../types.js"
+import { ensureSecureLogTarget, secureAppendFileSync } from "./secure-log-file.js"
 
 const THICK_LINE = "═".repeat(63)
 
@@ -26,9 +26,10 @@ export class LlmChatLogger {
     this.maxFileSize = config.maxFileSize
     this.maxFiles = config.maxFiles
 
-    const dir = dirname(this.filePath)
-    if (!existsSync(dir)) {
-      mkdirSync(dir, { recursive: true })
+    try {
+      ensureSecureLogTarget(this.filePath)
+    } catch {
+      // Chat logging must never break the plugin
     }
   }
 
@@ -135,7 +136,7 @@ export class LlmChatLogger {
 
   private write(text: string): void {
     try {
-      appendFileSync(this.filePath, text, "utf-8")
+      secureAppendFileSync(this.filePath, text)
     } catch {
       // Chat logging must never break the plugin
     }
@@ -145,6 +146,7 @@ export class LlmChatLogger {
     if (!existsSync(this.filePath)) return
 
     try {
+      if (lstatSync(this.filePath).isSymbolicLink()) return
       const stat = statSync(this.filePath)
       if (stat.size < this.maxFileSize) return
 

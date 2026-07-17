@@ -286,6 +286,24 @@ describe("Input Sanitizer Hook", () => {
     )
   })
 
+  test("blocks dynamic bash file targets that cannot be checked deterministically", async () => {
+    const deps = createTestDeps()
+    const hook = createInputSanitizer({
+      ...deps,
+      config: DEFAULT_CONFIG,
+      client: mockClient,
+      safetyEvaluator: null,
+      sessionAllowlist: deps.sessionAllowlist,
+    })
+
+    const input = { tool: "bash", sessionID: "s1", callID: "c1" }
+    const output = { args: { command: "echo SECRET=x > $HOME/.env" } }
+
+    await expect(hook(input, output)).rejects.toThrow(
+      "dynamic shell target",
+    )
+  })
+
   test("allows access to normal files", async () => {
     const deps = createTestDeps()
     const hook = createInputSanitizer({
@@ -974,6 +992,50 @@ describe("SSH-Only Mode", () => {
       await hook(input, output)
       expect(output.env.MY_SECRET).toBe("exposed")
       expect(output.env.AWS_SECRET_ACCESS_KEY).toBe("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+    })
+  })
+
+  describe("Session-scoped state", () => {
+    test("does not share allowlisted paths between sessions", async () => {
+      const deps = createTestDeps()
+      const states = new Map<string, ReturnType<typeof createTestDeps>>()
+      const getSessionState = (sessionID: string) => {
+        let state = states.get(sessionID)
+        if (!state) {
+          state = createTestDeps()
+          states.set(sessionID, state)
+        }
+        return {
+          sessionStats: state.sessionStats,
+          safetyEvaluator: null,
+          toastState: state.toastState,
+          sessionAllowlist: state.sessionAllowlist,
+          evaluatedCalls: state.evaluatedCalls,
+          writtenFileRegistry: state.writtenFileRegistry,
+        }
+      }
+      getSessionState("s1").sessionAllowlist.add("/project/.env")
+
+      const hook = createInputSanitizer({
+        engine: deps.engine,
+        config: DEFAULT_CONFIG,
+        auditLogger: deps.auditLogger,
+        client: mockClient,
+        diagnosticLogger: null,
+        getSessionState,
+      })
+
+      await hook(
+        { tool: "read", sessionID: "s1", callID: "c1" },
+        { args: { filePath: "/project/.env" } },
+      )
+
+      await expect(
+        hook(
+          { tool: "read", sessionID: "s2", callID: "c2" },
+          { args: { filePath: "/project/.env" } },
+        ),
+      ).rejects.toThrow("blocked by security policy")
     })
   })
 })

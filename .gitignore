@@ -6,3 +6,4 @@ dist/
 .codemogger/
 .opencode/
 .playwright-mcp/
+opencode-warden.json

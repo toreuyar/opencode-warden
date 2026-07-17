@@ -76,6 +76,16 @@ describe("SafetyEvaluator", () => {
       expect(evaluator.isBypassed("bash", { command: "pwd" })).toBe(true)
     })
 
+    test("does not bypass command names that only share a prefix", () => {
+      const config = makeLlmConfig({
+        safetyEvaluator: { bypassedCommands: ["ls", "cat"] },
+      })
+      const chain = new ProviderChain([makeProvider()])
+      const evaluator = new SafetyEvaluator(config, chain)
+      expect(evaluator.isBypassed("bash", { command: "lsof -i" })).toBe(false)
+      expect(evaluator.isBypassed("bash", { command: "catch /etc/passwd" })).toBe(false)
+    })
+
     test("returns false for dangerous commands", () => {
       const config = makeLlmConfig()
       const chain = new ProviderChain([makeProvider()])

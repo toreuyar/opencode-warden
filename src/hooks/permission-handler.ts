@@ -28,23 +28,40 @@ interface PermissionInput {
 interface PermissionHandlerDeps {
   config: SecurityGuardConfig
   client: PluginClient
-  safetyEvaluator: SafetyEvaluator | null
-  evaluatedCalls: Set<string>
-  sessionAllowlist: Set<string>
+  projectDir?: string
+  safetyEvaluator?: SafetyEvaluator | null
+  evaluatedCalls?: Set<string>
+  sessionAllowlist?: Set<string>
   auditLogger: AuditLogger
   diagnosticLogger: DiagnosticLogger | null
+  getSessionState?: (sessionID: string) => {
+    safetyEvaluator: SafetyEvaluator | null
+    evaluatedCalls: Set<string>
+    sessionAllowlist: Set<string>
+  }
 }
 
 export function createPermissionHandler(deps: PermissionHandlerDeps) {
   const {
     config,
     client,
-    safetyEvaluator,
-    evaluatedCalls,
-    sessionAllowlist,
+    projectDir,
     auditLogger,
     diagnosticLogger,
+    getSessionState,
   } = deps
+
+  const getState = (sessionID: string) => {
+    if (getSessionState) return getSessionState(sessionID)
+    if (!deps.evaluatedCalls || !deps.sessionAllowlist) {
+      throw new Error("Warden: permission handler session state is not configured")
+    }
+    return {
+      safetyEvaluator: deps.safetyEvaluator ?? null,
+      evaluatedCalls: deps.evaluatedCalls,
+      sessionAllowlist: deps.sessionAllowlist,
+    }
+  }
 
   const debugLog = config.llm.debug
     ? (msg: string) => {
@@ -59,6 +76,8 @@ export function createPermissionHandler(deps: PermissionHandlerDeps) {
     output: { status: "ask" | "deny" | "allow" },
   ) => {
     const hookStart = Date.now()
+    const { safetyEvaluator, evaluatedCalls, sessionAllowlist } = getState(input.sessionID)
+
     diagnosticLogger?.hookStart("permission-handler", input.type, input.callID ?? input.id, input.sessionID, {
       title: input.title,
       status: output.status,
@@ -223,8 +242,8 @@ export function createPermissionHandler(deps: PermissionHandlerDeps) {
     if (deterministicFilePath) {
       const accessMode: "read" | "write" = ["write", "edit", "patch"].includes(toolName) ? "write" : "read"
       if (
-        !isAllowlisted(deterministicFilePath, sessionAllowlist) &&
-        isPathBlockedForMode(deterministicFilePath, accessMode, config.blockedFilePaths, config.writeProtectedPaths, config.whitelistedPaths)
+        !isAllowlisted(deterministicFilePath, sessionAllowlist, projectDir) &&
+        isPathBlockedForMode(deterministicFilePath, accessMode, config.blockedFilePaths, config.writeProtectedPaths, config.whitelistedPaths, projectDir)
       ) {
         debugLog?.(`Permission hook: tool=${toolName} → DENIED (blocked file path (${accessMode}): ${deterministicFilePath})`)
         diagnosticLogger?.decision("permission-handler", toolName, `DENIED file path (${accessMode}): ${deterministicFilePath}`)

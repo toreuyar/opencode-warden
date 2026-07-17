@@ -170,6 +170,7 @@ export interface SecurityGuardConfig {
   llm: {
     enabled: boolean
     debug: boolean
+    retryCount: number
     contextAccumulation: boolean
     contextDetectionsOnly: boolean
     maxContextPairs: number
@@ -203,6 +204,7 @@ export interface SecurityGuardConfig {
     outputSanitizer: LlmEndpointConfig & {
       enabled: boolean
       providers: LlmProviderConfig[]
+      retryCount?: number
       tools: string[]
       bypassedCommands: string[]
       skipWhenRegexClean: boolean

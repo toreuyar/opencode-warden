@@ -1,4 +1,5 @@
 import type { ParsedSshCommand, SshCommandType } from "../types.js"
+import { matchesCommandPrefix } from "./command-patterns.js"
 
 /**
  * Regex to match user@host or just host in SSH-style commands.
@@ -418,7 +419,7 @@ export function isInnerCommandBypassed(
   if (!parsed.innerCommand) return false
 
   const inner = parsed.innerCommand.trimStart()
-  return bypassedCommands.some((prefix) => inner.startsWith(prefix))
+  return bypassedCommands.some((prefix) => matchesCommandPrefix(inner, prefix))
 }
 
 const RSYNC_REMOTE_PATH_RE = /^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9._-]+(?:\.[A-Za-z0-9._-]+)*:/

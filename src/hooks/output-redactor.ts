@@ -16,6 +16,7 @@ import {
   stripSudo,
   hasDangerousMetachars,
   isPipedCommandSafe,
+  matchesCommandPrefix,
 } from "../utils/command-patterns.js"
 import { isBlockedPath } from "../utils/paths.js"
 import { isRemoteCommand } from "../utils/ssh.js"
@@ -24,13 +25,19 @@ interface OutputRedactorDeps {
   engine: DetectionEngine
   config: SecurityGuardConfig
   auditLogger: AuditLogger
-  sessionStats: SessionStats
+  projectDir?: string
+  sessionStats?: SessionStats
   client: PluginClient
-  llmSanitizer: LlmSanitizer | null
+  llmSanitizer?: LlmSanitizer | null
   outputTriage: OutputTriageEvaluator | null
   outputTextTriage: OutputTextTriageEvaluator | null
-  toastState: ToastState
+  toastState?: ToastState
   diagnosticLogger: DiagnosticLogger | null
+  getSessionState?: (sessionID: string) => {
+    sessionStats: SessionStats
+    llmSanitizer: LlmSanitizer | null
+    toastState: ToastState
+  }
 }
 
 interface RedactionResult {
@@ -94,14 +101,25 @@ export function createOutputRedactor(deps: OutputRedactorDeps) {
     engine,
     config,
     auditLogger,
-    sessionStats,
+    projectDir,
     client,
-    llmSanitizer,
     outputTriage,
     outputTextTriage,
-    toastState,
     diagnosticLogger,
+    getSessionState,
   } = deps
+
+  const getState = (sessionID: string) => {
+    if (getSessionState) return getSessionState(sessionID)
+    if (!deps.sessionStats || !deps.toastState) {
+      throw new Error("Warden: output redactor session state is not configured")
+    }
+    return {
+      sessionStats: deps.sessionStats,
+      llmSanitizer: deps.llmSanitizer ?? null,
+      toastState: deps.toastState,
+    }
+  }
 
   const outputBypassPrefixes = config.llm.outputSanitizer.bypassedCommands
 
@@ -122,7 +140,7 @@ export function createOutputRedactor(deps: OutputRedactorDeps) {
     // Simple prefix match (no pipes)
     if (!command.includes("|")) {
       return outputBypassPrefixes.some((prefix) =>
-        command.trimStart().startsWith(prefix),
+        matchesCommandPrefix(command, prefix),
       )
     }
 
@@ -136,6 +154,7 @@ export function createOutputRedactor(deps: OutputRedactorDeps) {
     output: { output: string; title: string; metadata: Record<string, unknown> },
   ) => {
     const hookStart = Date.now()
+    const { sessionStats, llmSanitizer, toastState } = getState(input.sessionID)
     const outputLen = typeof output.output === "string" ? output.output.length : 0
     diagnosticLogger?.hookStart("output-redactor", input.tool, input.callID, input.sessionID, { outputLength: outputLen })
 
@@ -179,7 +198,7 @@ export function createOutputRedactor(deps: OutputRedactorDeps) {
       let strippedCount = 0
       for (const line of lines) {
         const trimmed = line.trim()
-        if (trimmed && isBlockedPath(trimmed, config.blockedFilePaths, config.whitelistedPaths)) {
+        if (trimmed && isBlockedPath(trimmed, config.blockedFilePaths, config.whitelistedPaths, projectDir)) {
           strippedCount++
         } else {
           filtered.push(line)

@@ -1,6 +1,6 @@
 import { describe, test, expect, afterEach } from "bun:test"
 import { FileLogger } from "../src/audit/file-logger.js"
-import { existsSync, readFileSync, rmSync, mkdirSync } from "fs"
+import { existsSync, readFileSync, rmSync, mkdirSync, statSync, symlinkSync, writeFileSync } from "fs"
 import { join } from "path"
 
 const TMP_DIR = join(process.cwd(), ".test-tmp-file-logger")
@@ -37,8 +37,8 @@ describe("FileLogger", () => {
   test("write buffers entries", () => {
     const logger = new FileLogger(makeConfig())
     logger.write('{"test": 1}')
-    // File should not exist yet (buffered)
-    expect(existsSync(LOG_PATH)).toBe(false)
+    // File is created during initialization so permissions can be pinned to 0600.
+    expect(readFileSync(LOG_PATH, "utf-8")).toBe("")
     logger.destroy()
   })
 
@@ -57,8 +57,16 @@ describe("FileLogger", () => {
   test("flush is no-op when buffer is empty", () => {
     const logger = new FileLogger(makeConfig())
     logger.flush()
-    expect(existsSync(LOG_PATH)).toBe(false)
+    expect(readFileSync(LOG_PATH, "utf-8")).toBe("")
     logger.destroy()
+  })
+
+  test("creates log directory as 0700 and log file as 0600", () => {
+    const logger = new FileLogger(makeConfig())
+    logger.destroy()
+
+    expect(statSync(TMP_DIR).mode & 0o777).toBe(0o700)
+    expect(statSync(LOG_PATH).mode & 0o777).toBe(0o600)
   })
 
   test("auto-flushes when buffer reaches threshold (10 entries)", () => {
@@ -108,22 +116,21 @@ describe("FileLogger", () => {
     logger.destroy()
   })
 
-  test("calls onError callback on write failure", () => {
+  test("calls onError callback and refuses symlink log target", () => {
     let errorMsg = ""
-    // Create a read-only directory so appendFileSync fails with EACCES
-    const readonlyDir = join(TMP_DIR, "readonly")
-    mkdirSync(readonlyDir, { recursive: true })
-    const { chmodSync } = require("fs")
-    chmodSync(readonlyDir, 0o444)
-    const badPath = join(readonlyDir, "audit.log")
+    const target = join(TMP_DIR, "target.log")
+    const badPath = join(TMP_DIR, "audit.log")
+    mkdirSync(TMP_DIR, { recursive: true })
+    writeFileSync(target, "")
+    symlinkSync(target, badPath)
+
     const logger = new FileLogger(
       makeConfig({ filePath: badPath }),
       (msg) => { errorMsg = msg },
     )
     logger.write("test")
     logger.flush()
-    // Restore permissions so cleanup can remove the directory
-    chmodSync(readonlyDir, 0o755)
+
     expect(errorMsg).toContain("Failed to write audit log")
     logger.destroy()
   })

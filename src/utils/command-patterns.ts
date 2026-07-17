@@ -96,6 +96,22 @@ export function isAllowedOperation(
 }
 
 /**
+ * Boundary-aware bypass-prefix check.
+ *
+ * A configured prefix like `ls` should match `ls` and `ls -la`, but not `lsof`.
+ * A multi-token prefix like `git status` should match `git status --short`, but
+ * not `git statusmalicious`.
+ */
+export function matchesCommandPrefix(command: string, prefix: string): boolean {
+  const trimmed = command.trimStart()
+  const normalizedPrefix = prefix.trim()
+  if (!normalizedPrefix) return false
+  if (trimmed === normalizedPrefix) return true
+  if (!trimmed.startsWith(normalizedPrefix)) return false
+  return /\s/.test(trimmed[normalizedPrefix.length] || "")
+}
+
+/**
  * Check whether a command string contains dangerous shell metacharacters
  * (anything that enables chaining, substitution, or redirection beyond simple pipes).
  */
@@ -235,7 +251,7 @@ export function isPipedCommandSafe(
   // First segment: must match bypass prefix or allowed pattern
   const first = segments[0]
   const firstMatchesPrefix = bypassPrefixes.some((prefix) =>
-    first.trimStart().startsWith(prefix),
+    matchesCommandPrefix(first, prefix),
   )
   const firstMatchesPattern = isAllowedOperation(first, compiledPatterns)
 
