@@ -314,7 +314,7 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
     // Skipped when ANY of these apply:
     //   - redactionEnabled is false (global kill switch for ALL tools)
     //   - redactOnWrite is false AND this is a write/edit/patch tool
-    //   - the write target matches redactionExemptPaths (write/edit/patch tool,
+    //   - every write target matches redactionExemptPaths (write/edit/patch tool,
     //     local bash redirection/tee/truncate/dd target, or remote upload via
     //     SSH/SCP/rsync/rclone)
     // File blocking and LLM safety eval still apply — only secret redaction is skipped.
@@ -340,7 +340,9 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
     const exemptedTarget = writeTargets.find((t) =>
       isRedactionExempt(t.path, config.redactionExemptPaths, { cwd: projectDir, host: t.host }),
     )
-    const pathExempt = !!exemptedTarget
+    const pathExempt = writeTargets.length > 0 && writeTargets.every((t) =>
+      isRedactionExempt(t.path, config.redactionExemptPaths, { cwd: projectDir, host: t.host }),
+    )
     const redactionExempt = allDisabled || writeDisabled || pathExempt
 
     let totalDetections = 0

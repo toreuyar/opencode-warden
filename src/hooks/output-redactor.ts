@@ -227,7 +227,9 @@ export function createOutputRedactor(deps: OutputRedactorDeps) {
         ? (input.args.filePath as string)
         : undefined
 
-    // Collect all read targets this call touches, then check exemption.
+    // Collect all read targets this call touches, then check exemption. A
+    // path-based exemption is all-or-nothing for multi-target commands because
+    // merged shell output cannot be attributed back to individual files.
     const readTargets: Array<{ path: string; host?: string }> = []
     if (typeof readFilePath === "string") {
       readTargets.push({ path: readFilePath })
@@ -244,7 +246,9 @@ export function createOutputRedactor(deps: OutputRedactorDeps) {
     const exemptedTarget = readTargets.find((t) =>
       isRedactionExempt(t.path, config.redactionExemptPaths, { cwd: projectDir, host: t.host }),
     )
-    const pathExempt = !!exemptedTarget
+    const pathExempt = readTargets.length > 0 && readTargets.every((t) =>
+      isRedactionExempt(t.path, config.redactionExemptPaths, { cwd: projectDir, host: t.host }),
+    )
     const redactionExempt = redactionGloballyDisabled || pathExempt
 
     if (redactionExempt) {

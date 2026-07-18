@@ -786,6 +786,60 @@ describe("Input Sanitizer Hook", () => {
     expect(output.args.command as string).not.toContain("[REDACTED]")
   })
 
+  test("redactionExemptPaths: bash tee to mixed exempt and non-exempt paths still redacts", async () => {
+    const deps = createTestDeps()
+    const configWithExemption = {
+      ...DEFAULT_CONFIG,
+      redactionExemptPaths: ["src/config.ts"],
+    }
+    const hook = createInputSanitizer({
+      ...deps,
+      config: configWithExemption,
+      client: mockClient,
+      safetyEvaluator: null,
+      sessionAllowlist: deps.sessionAllowlist,
+    })
+
+    const input = { tool: "bash", sessionID: "s1", callID: "c1" }
+    const output = {
+      args: {
+        command:
+          'echo "sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxx" | tee /project/src/config.ts /tmp/leak.txt',
+      },
+    }
+
+    await hook(input, output)
+    expect(output.args.command as string).toContain("[REDACTED]")
+    expect(output.args.command as string).not.toContain("sk-proj-")
+  })
+
+  test("redactionExemptPaths: bash tee to multiple exempt paths preserves secret", async () => {
+    const deps = createTestDeps()
+    const configWithExemption = {
+      ...DEFAULT_CONFIG,
+      redactionExemptPaths: ["src/config.ts", "src/fixture.ts"],
+    }
+    const hook = createInputSanitizer({
+      ...deps,
+      config: configWithExemption,
+      client: mockClient,
+      safetyEvaluator: null,
+      sessionAllowlist: deps.sessionAllowlist,
+    })
+
+    const input = { tool: "bash", sessionID: "s1", callID: "c1" }
+    const output = {
+      args: {
+        command:
+          'echo "sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxx" | tee /project/src/config.ts /project/src/fixture.ts',
+      },
+    }
+
+    await hook(input, output)
+    expect(output.args.command as string).toContain("sk-proj-")
+    expect(output.args.command as string).not.toContain("[REDACTED]")
+  })
+
   test("redactOnWrite=false disables redaction globally for write tool", async () => {
     const deps = createTestDeps()
     const configNoWriteRedact = { ...DEFAULT_CONFIG, redactOnWrite: false }
@@ -1184,6 +1238,63 @@ describe("Output Redactor Hook", () => {
     expect(output.output).toContain("sk-proj-")
   })
 
+  test("redactionExemptPaths: bash cat of mixed exempt and non-exempt paths still redacts output", async () => {
+    const deps = createTestDeps()
+    const configWithExemption = {
+      ...DEFAULT_CONFIG,
+      redactionExemptPaths: ["src/config.ts"],
+    }
+    const hook = createOutputRedactor({
+      ...deps,
+      config: configWithExemption,
+      client: mockClient,
+      llmSanitizer: null,
+    })
+
+    const input = {
+      tool: "bash",
+      sessionID: "s1",
+      callID: "c1",
+      args: { command: "cat /project/src/config.ts /tmp/leak.txt" },
+    }
+    const output = {
+      output: "KEY=sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxx\n",
+      title: "bash",
+      metadata: {},
+    }
+
+    await hook(input, output)
+    expect(output.output).toContain("[REDACTED]")
+    expect(output.output).not.toContain("sk-proj-")
+  })
+
+  test("redactionExemptPaths: bash cat of multiple exempt paths preserves output", async () => {
+    const deps = createTestDeps()
+    const configWithExemption = {
+      ...DEFAULT_CONFIG,
+      redactionExemptPaths: ["src/config.ts", "src/fixture.ts"],
+    }
+    const hook = createOutputRedactor({
+      ...deps,
+      config: configWithExemption,
+      client: mockClient,
+      llmSanitizer: null,
+    })
+
+    const input = {
+      tool: "bash",
+      sessionID: "s1",
+      callID: "c1",
+      args: { command: "cat /project/src/config.ts /project/src/fixture.ts" },
+    }
+    const originalOutput = "KEY=sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
+    const output = { output: originalOutput, title: "bash", metadata: {} }
+
+    await hook(input, output)
+    expect(output.output).toBe(originalOutput)
+    expect(output.output).toContain("sk-proj-")
+  })
+
   test("redactionExemptPaths: host-scoped entry covers remote SSH cat output", async () => {
     const deps = createTestDeps()
     const configWithExemption = {
@@ -1209,6 +1320,39 @@ describe("Output Redactor Hook", () => {
     await hook(input, output)
     expect(output.output).toBe(originalOutput)
     expect(output.output).toContain("sk-proj-")
+  })
+
+  test("redactionExemptPaths: remote SSH mixed exempt and non-exempt paths still redacts output", async () => {
+    const deps = createTestDeps()
+    const configWithExemption = {
+      ...DEFAULT_CONFIG,
+      redactionExemptPaths: ["host:web-*:/etc/myapp/**"],
+    }
+    const hook = createOutputRedactor({
+      ...deps,
+      config: configWithExemption,
+      client: mockClient,
+      llmSanitizer: null,
+    })
+
+    const input = {
+      tool: "bash",
+      sessionID: "s1",
+      callID: "c1",
+      args: {
+        command:
+          'ssh user@web-01.example.com "cat /etc/myapp/config.conf /tmp/leak.txt"',
+      },
+    }
+    const output = {
+      output: "KEY=sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxx\n",
+      title: "ssh",
+      metadata: {},
+    }
+
+    await hook(input, output)
+    expect(output.output).toContain("[REDACTED]")
+    expect(output.output).not.toContain("sk-proj-")
   })
 
   test("redactionExemptPaths: host-scoped entry does NOT match unmatched host", async () => {

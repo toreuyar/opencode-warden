@@ -232,6 +232,15 @@ describe("extractRemoteFilePaths", () => {
     expect(paths).toContainEqual({ host: "host.com", path: "/var/log/syslog", mode: "read" })
   })
 
+  test("extracts multiple operands from one SSH read command", () => {
+    const parsed = parseSshCommand(
+      'ssh user@host.com "cat /etc/passwd /tmp/leak.txt"',
+    )!
+    const paths = extractRemoteFilePaths(parsed)
+    expect(paths).toContainEqual({ host: "host.com", path: "/etc/passwd", mode: "read" })
+    expect(paths).toContainEqual({ host: "host.com", path: "/tmp/leak.txt", mode: "read" })
+  })
+
   test("extracts less target (read)", () => {
     const parsed = parseSshCommand('ssh user@host.com "less /home/user/.env"')!
     const paths = extractRemoteFilePaths(parsed)

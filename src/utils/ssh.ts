@@ -6,6 +6,7 @@ import { matchesCommandPrefix } from "./command-patterns.js"
  * Captures: (user)@(host) or just (host).
  */
 const USER_HOST_RE = /^(?:([A-Za-z0-9._-]+)@)?([A-Za-z0-9._-]+(?:\.[A-Za-z0-9._-]+)*)$/
+const REMOTE_READ_COMMANDS = new Set(["cat", "less", "head", "tail", "more", "vi", "vim", "nano", "view"])
 
 /**
  * Strip leading env var assignments (e.g., `VAR=val VAR2=val2 ssh ...`).
@@ -361,14 +362,30 @@ export function extractRemoteFilePaths(parsed: ParsedSshCommand): { host: string
   const paths: { host: string; path: string; mode: "read" | "write" }[] = []
 
   if (parsed.type === "ssh" && parsed.innerCommand) {
-    // Extract file paths from common read commands in inner command.
-    // SSH inner-command file references are treated as reads. Writes inside
-    // the inner command are the LLM SSH-safety prompt's responsibility.
-    const readCmdRe =
-      /\b(?:cat|less|head|tail|more|vi|vim|nano|view)\s+['"]?([^\s'";&|>]+)/g
-    let match: RegExpExecArray | null
-    while ((match = readCmdRe.exec(parsed.innerCommand)) !== null) {
-      paths.push({ host: parsed.host, path: match[1], mode: "read" })
+    const tokens = tokenize(parsed.innerCommand)
+    for (let i = 0; i < tokens.length; i++) {
+      const tok = tokens[i]
+      if (!REMOTE_READ_COMMANDS.has(tok)) continue
+
+      let j = i + 1
+      let optsEnded = false
+      while (j < tokens.length) {
+        const t = tokens[j]
+        if (t === "|" || t === ";" || t === "&&" || t === "||" || t.includes(">")) break
+        if (!optsEnded && t === "--") {
+          optsEnded = true
+          j++
+          continue
+        }
+        if (!optsEnded && t.startsWith("-")) {
+          j++
+          continue
+        }
+        if (t && t !== "/dev/null") {
+          paths.push({ host: parsed.host, path: t, mode: "read" })
+        }
+        j++
+      }
     }
   }
 
