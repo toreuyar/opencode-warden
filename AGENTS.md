@@ -183,11 +183,12 @@ Warden registers these OpenCode plugin hooks (see `src/index.ts`):
 
 ### Session Lifecycle
 
-Warden maintains per-session state in a `Map<sessionID, SessionSecurityState>` (`src/index.ts`). New entries are created lazily via `getSessionState()` and reset via `resetSessionState()` on `session.created`. Cleanup happens three ways:
+Warden maintains per-session state in a `Map<sessionID, SessionSecurityState>` (`src/index.ts`). New entries are created lazily via `getSessionState()` and reset via `resetSessionState()` on `session.created`. Cleanup happens two ways:
 
 1. **`session.deleted` event** — removes the entry from the map immediately
-2. **TTL sweep** — `setInterval` (hourly) calls `sweepStaleSessions()` (`src/hooks/session-context.ts`) to drop entries whose `lastAccessed` is older than 24 hours; the timer is `unref`'d so it can't keep the process alive
-3. **`dispose` hook** — clears the sweep timer and the entire map when the plugin unloads
+2. **TTL sweep** — `setInterval` (hourly) calls `sweepStaleSessions()` (`src/hooks/session-context.ts`) to drop entries whose `lastAccessed` is older than 24 hours; the timer is `unref`'d so it can't keep the process alive (process exit reclaims all memory)
+
+A `dispose` hook would be the natural third path, but it's not in the published `@opencode-ai/plugin` types as of 1.3.9. When it ships in a published release, wiring it up is a one-liner.
 
 `SessionSecurityState` carries: `sessionStats`, `toastState`, `sessionAllowlist`, `evaluatedCalls`, `writtenFileRegistry`, `policyInjected`, `llmSanitizer`, `safetyEvaluator`, `lastAgent`/`lastModel`/`lastVariant` (captured from `chat.message` and passed to the policy-injection prompt body so the synthetic message lands in the user's actual agent/model context, not the default).
 

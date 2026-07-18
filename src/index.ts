@@ -367,11 +367,11 @@ export const Warden: Plugin = async ({ client: sdkClient, directory }) => {
   if (typeof sweepTimer.unref === "function") sweepTimer.unref()
 
   // ─── Return Plugin Hooks & Tools ───
+  // Note: `dispose` is not in the published @opencode-ai/plugin types (1.3.9).
+  // We rely on the sweep timer's `.unref()` to not keep the process alive —
+  // when the process exits, all in-memory state (sessions map, timer) is
+  // reclaimed automatically.
   return {
-    dispose: async () => {
-      clearInterval(sweepTimer)
-      sessions.clear()
-    },
     "tool.execute.before": async (
       input: { tool: string; sessionID: string; callID: string },
       output: { args: Record<string, unknown> },
