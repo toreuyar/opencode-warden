@@ -8,7 +8,7 @@ import { createOutputRedactor } from "../src/hooks/output-redactor.js"
 import { createEnvSanitizer } from "../src/hooks/env-sanitizer.js"
 import { createCompactionContext } from "../src/hooks/compaction-context.js"
 import { createPromptSanitizer } from "../src/hooks/prompt-sanitizer.js"
-import { createSessionContextCapture, sweepStaleSessions } from "../src/hooks/session-context.js"
+import { createSessionContextCapture, sweepStaleSessions, extractEventSessionID } from "../src/hooks/session-context.js"
 import type { PluginClient, ToastState, WrittenFileMetadata } from "../src/types.js"
 
 const mockClient: PluginClient = {
@@ -2080,35 +2080,71 @@ describe("Session Context Capture (chat.message wrapper)", () => {
     lastAccessed: number
   }
 
-  test("captures agent, model, and variant on the session state", async () => {
-    const sessions = new Map<string, CapturedState>()
-    const getState = (id: string) => {
-      let s = sessions.get(id)
-      if (!s) {
-        s = { lastAccessed: Date.now() }
-        sessions.set(id, s)
-      }
-      return s
+  const mkState = (): CapturedState => ({ lastAccessed: Date.now() })
+  const mkGetState = (sessions: Map<string, CapturedState>) => (id: string) => {
+    let s = sessions.get(id)
+    if (!s) {
+      s = mkState()
+      sessions.set(id, s)
     }
-    const capture = createSessionContextCapture(getState)
+    return s
+  }
 
-    await capture({
-      sessionID: "s1",
-      agent: "devops",
-      model: { providerID: "anthropic", modelID: "claude-sonnet-4" },
-      variant: "reasoning",
-    })
+  test("captures resolved agent/model from output.message and variant from input", async () => {
+    const sessions = new Map<string, CapturedState>()
+    const capture = createSessionContextCapture(mkGetState(sessions))
+
+    await capture(
+      {
+        sessionID: "s1",
+        agent: "requested-but-overridden",
+        model: { providerID: "wrong", modelID: "wrong" },
+        variant: "reasoning",
+      },
+      {
+        message: {
+          agent: "devops",
+          model: { providerID: "anthropic", modelID: "claude-sonnet-4" },
+        },
+      },
+    )
 
     const s = sessions.get("s1")!
+    // Resolved values from output.message win over input.* fields
     expect(s.lastAgent).toBe("devops")
     expect(s.lastModel).toEqual({ providerID: "anthropic", modelID: "claude-sonnet-4" })
+    // Variant comes from input (not on UserMessage in SDK 1.3.9)
     expect(s.lastVariant).toBe("reasoning")
   })
 
-  test("captures partial fields without overwriting existing ones", async () => {
+  test("resolved values from output.message win over request values on input", async () => {
+    // OpenCode resolves the actual agent/model from agent config + session state.
+    // The resolved message reflects what was selected; input.* reflects what
+    // was requested. We must capture the resolved values.
+    const sessions = new Map<string, CapturedState>()
+    const capture = createSessionContextCapture(mkGetState(sessions))
+
+    await capture(
+      { sessionID: "s1", agent: "requested-agent" },
+      {
+        message: {
+          agent: "resolved-agent",
+          model: { providerID: "anthropic", modelID: "claude-sonnet-4" },
+        },
+      },
+    )
+
+    expect(sessions.get("s1")?.lastAgent).toBe("resolved-agent")
+    expect(sessions.get("s1")?.lastModel?.modelID).toBe("claude-sonnet-4")
+  })
+
+  test("new agent with absent variant clears stale variant (no mixed state)", async () => {
+    // Regression: previously, a message that only specified agent would
+    // inherit model/variant from an earlier message — producing a mixed
+    // context that never existed in OpenCode.
     const sessions = new Map<string, CapturedState>([
       ["s1", {
-        lastAgent: "devops",
+        lastAgent: "agent-a",
         lastModel: { providerID: "anthropic", modelID: "claude-sonnet-4" },
         lastVariant: "reasoning",
         lastAccessed: Date.now(),
@@ -2116,24 +2152,31 @@ describe("Session Context Capture (chat.message wrapper)", () => {
     ])
     const capture = createSessionContextCapture((id) => sessions.get(id)!)
 
-    // Second call with only agent — should preserve model and variant
-    await capture({ sessionID: "s1", agent: "reviewer" })
+    // Second message: agent B, no variant in input. Resolved message has agent B
+    // and a different model (because agent B's default model differs).
+    await capture(
+      { sessionID: "s1" },  // no agent/model/variant in input
+      {
+        message: {
+          agent: "agent-b",
+          model: { providerID: "openai", modelID: "gpt-4o" },
+        },
+      },
+    )
 
     const s = sessions.get("s1")!
-    expect(s.lastAgent).toBe("reviewer")          // updated
-    expect(s.lastModel?.modelID).toBe("claude-sonnet-4")  // preserved
-    expect(s.lastVariant).toBe("reasoning")       // preserved
+    expect(s.lastAgent).toBe("agent-b")
+    expect(s.lastModel).toEqual({ providerID: "openai", modelID: "gpt-4o" })
+    // Stale variant from agent-a's message must be cleared — agent-b may not
+    // even support that variant.
+    expect(s.lastVariant).toBeUndefined()
   })
 
   test("no-op when sessionID is empty", async () => {
     const sessions = new Map<string, CapturedState>()
-    const capture = createSessionContextCapture((id) => {
-      const s = { lastAccessed: Date.now() }
-      sessions.set(id, s)
-      return s
-    })
+    const capture = createSessionContextCapture(mkGetState(sessions))
 
-    await capture({ sessionID: "", agent: "test" })
+    await capture({ sessionID: "", agent: "test" }, { message: { agent: "x" } })
     expect(sessions.size).toBe(0)
   })
 
@@ -2145,27 +2188,260 @@ describe("Session Context Capture (chat.message wrapper)", () => {
 
     // Must NOT throw — capture is non-blocking
     await expect(
-      capture({ sessionID: "s1", agent: "test" }),
+      capture(
+        { sessionID: "s1", agent: "test" },
+        { message: { agent: "x" } },
+      ),
     ).resolves.toBeUndefined()
   })
 
   test("different sessions have independent state", async () => {
     const sessions = new Map<string, CapturedState>()
-    const getState = (id: string) => {
-      let s = sessions.get(id)
-      if (!s) {
-        s = { lastAccessed: Date.now() }
-        sessions.set(id, s)
-      }
-      return s
-    }
-    const capture = createSessionContextCapture(getState)
+    const capture = createSessionContextCapture(mkGetState(sessions))
 
-    await capture({ sessionID: "s1", agent: "devops" })
-    await capture({ sessionID: "s2", agent: "reviewer" })
+    await capture(
+      { sessionID: "s1" },
+      { message: { agent: "devops", model: { providerID: "x", modelID: "y" } } },
+    )
+    await capture(
+      { sessionID: "s2" },
+      { message: { agent: "reviewer", model: { providerID: "x", modelID: "z" } } },
+    )
 
     expect(sessions.get("s1")?.lastAgent).toBe("devops")
     expect(sessions.get("s2")?.lastAgent).toBe("reviewer")
+  })
+
+  test("two-message regression: latest resolved context wins", async () => {
+    // Mirrors the policy-injection scenario from the bug report:
+    //   Message 1: agent A + model A + variant A (no tool call)
+    //   Message 2: agent B, omits model/variant (no tool call)
+    //   Tool call fires → policy injection must use agent B's context
+    const sessions = new Map<string, CapturedState>()
+    const capture = createSessionContextCapture(mkGetState(sessions))
+
+    await capture(
+      {
+        sessionID: "s1",
+        agent: "agent-a",
+        model: { providerID: "anthropic", modelID: "model-a" },
+        variant: "reasoning",
+      },
+      {
+        message: {
+          agent: "agent-a",
+          model: { providerID: "anthropic", modelID: "model-a" },
+        },
+      },
+    )
+
+    await capture(
+      { sessionID: "s1", agent: "agent-b" },  // user requests agent B
+      {
+        // OpenCode resolves to agent B's actual model
+        message: {
+          agent: "agent-b",
+          model: { providerID: "openai", modelID: "model-b" },
+        },
+      },
+    )
+
+    const s = sessions.get("s1")!
+    expect(s.lastAgent).toBe("agent-b")
+    expect(s.lastModel).toEqual({ providerID: "openai", modelID: "model-b" })
+    expect(s.lastVariant).toBeUndefined()  // cleared because message 2 didn't specify
+  })
+
+  test("blocked-prompt context is overwritten by next allowed message", async () => {
+    // Scenario: message 1 is blocked by promptSanitizer (contains a secret),
+    // but capture runs BEFORE the sanitizer, so it records message 1's context.
+    // Message 2 is allowed. The policy injection must use message 2's context,
+    // not message 1's.
+    //
+    // With the new capture-from-output semantics, message 2's resolved values
+    // overwrite message 1's recorded values, so no contamination is possible.
+    const sessions = new Map<string, CapturedState>()
+    const capture = createSessionContextCapture(mkGetState(sessions))
+
+    // Message 1 (would be blocked by sanitizer in real flow)
+    await capture(
+      {
+        sessionID: "s1",
+        agent: "blocked-agent",
+        variant: "blocked-variant",
+      },
+      {
+        message: {
+          agent: "blocked-agent",
+          model: { providerID: "x", modelID: "blocked-model" },
+        },
+      },
+    )
+
+    // Message 2 (allowed) — different agent, no variant in input
+    await capture(
+      { sessionID: "s1", agent: "allowed-agent" },
+      {
+        message: {
+          agent: "allowed-agent",
+          model: { providerID: "x", modelID: "allowed-model" },
+        },
+      },
+    )
+
+    const s = sessions.get("s1")!
+    expect(s.lastAgent).toBe("allowed-agent")
+    expect(s.lastModel?.modelID).toBe("allowed-model")
+    expect(s.lastVariant).toBeUndefined()  // stale blocked-variant cleared
+  })
+})
+
+describe("extractEventSessionID", () => {
+  test("reads session.created shape: properties.info.id", () => {
+    const event = {
+      type: "session.created",
+      properties: {
+        info: {
+          id: "sess-abc-123",
+          title: "My session",
+          projectID: "proj-1",
+          directory: "/proj",
+          version: "1",
+        },
+      },
+    }
+    expect(extractEventSessionID(event)).toBe("sess-abc-123")
+  })
+
+  test("reads session.deleted shape: properties.info.id", () => {
+    const event = {
+      type: "session.deleted",
+      properties: {
+        info: {
+          id: "sess-to-delete",
+          title: "",
+          projectID: "",
+          directory: "",
+          version: "",
+        },
+      },
+    }
+    expect(extractEventSessionID(event)).toBe("sess-to-delete")
+  })
+
+  test("reads properties.sessionID for events like session.idle / session.status", () => {
+    const event = {
+      type: "session.idle",
+      properties: { sessionID: "sess-idle-1" },
+    }
+    expect(extractEventSessionID(event)).toBe("sess-idle-1")
+  })
+
+  test("returns empty string for non-object event", () => {
+    expect(extractEventSessionID(null)).toBe("")
+    expect(extractEventSessionID(undefined)).toBe("")
+    expect(extractEventSessionID("not-an-event")).toBe("")
+  })
+
+  test("returns empty string when no session id can be found", () => {
+    expect(extractEventSessionID({ type: "unrelated.event" })).toBe("")
+    expect(extractEventSessionID({ properties: {} })).toBe("")
+    expect(extractEventSessionID({ properties: { info: {} } })).toBe("")
+  })
+
+  test("does NOT match legacy top-level fields when properties is present but empty", () => {
+    // Verifies the new shape is preferred; legacy fallbacks only kick in when
+    // the typed shape is entirely absent.
+    expect(
+      extractEventSessionID({
+      type: "session.created",
+      properties: { info: { id: "from-properties" } },
+      sessionID: "from-top-level",  // legacy field present but should be ignored
+    }),
+    ).toBe("from-properties")
+  })
+})
+
+describe("Session Lifecycle Event Handling", () => {
+  // Integration-level tests for the event handler logic.
+  // We can't easily exercise the actual plugin entry point, so we test the
+  // behavior via the public helpers it composes (extractEventSessionID +
+  // createSessionContextCapture + a simulated sessions map).
+
+  type State = {
+    sessionStats: { resetCount: number }
+    lastAccessed: number
+    policyInjected: boolean
+  }
+
+  test("session.created resets ONLY the specified session", () => {
+    const sessions = new Map<string, State>([
+      ["s1", { sessionStats: { resetCount: 0 }, lastAccessed: 1, policyInjected: true }],
+      ["s2", { sessionStats: { resetCount: 0 }, lastAccessed: 2, policyInjected: true }],
+    ])
+
+    const resetSession = (id: string) => {
+      sessions.set(id, { sessionStats: { resetCount: 0 }, lastAccessed: Date.now(), policyInjected: false })
+    }
+
+    // Fire session.created for s1
+    const event = {
+      type: "session.created" as const,
+      properties: { info: { id: "s1", title: "", projectID: "", directory: "", version: "" } },
+    }
+    const id = extractEventSessionID(event)
+    expect(id).toBe("s1")
+    resetSession(id)
+
+    // s1 was reset
+    expect(sessions.get("s1")?.policyInjected).toBe(false)
+    // s2 is UNCHANGED
+    expect(sessions.get("s2")?.policyInjected).toBe(true)
+    expect(sessions.get("s2")?.lastAccessed).toBe(2)
+  })
+
+  test("session.deleted removes ONLY the specified session", () => {
+    const sessions = new Map<string, State>([
+      ["s1", { sessionStats: { resetCount: 5 }, lastAccessed: 1, policyInjected: true }],
+      ["s2", { sessionStats: { resetCount: 3 }, lastAccessed: 2, policyInjected: true }],
+      ["s3", { sessionStats: { resetCount: 1 }, lastAccessed: 3, policyInjected: false }],
+    ])
+
+    const event = {
+      type: "session.deleted" as const,
+      properties: { info: { id: "s2", title: "", projectID: "", directory: "", version: "" } },
+    }
+    const id = extractEventSessionID(event)
+    expect(id).toBe("s2")
+    sessions.delete(id)
+
+    // s2 is gone
+    expect(sessions.has("s2")).toBe(false)
+    // s1 and s3 unchanged
+    expect(sessions.has("s1")).toBe(true)
+    expect(sessions.has("s3")).toBe(true)
+    expect(sessions.get("s1")?.sessionStats.resetCount).toBe(5)
+    expect(sessions.get("s3")?.sessionStats.resetCount).toBe(1)
+  })
+
+  test("realistic session.created event payload shape", () => {
+    // Verifies we correctly handle the full SDK Session object, not just {id}
+    const event = {
+      type: "session.created" as const,
+      properties: {
+        info: {
+          id: "01HABCDEFGH",
+          projectID: "01HPROJECT",
+          directory: "/home/user/project",
+          title: "New session",
+          version: "1.0.0",
+          parentID: undefined,
+          summary: undefined,
+          share: undefined,
+        },
+      },
+    }
+    expect(extractEventSessionID(event)).toBe("01HABCDEFGH")
   })
 })
 

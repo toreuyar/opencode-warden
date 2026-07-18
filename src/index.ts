@@ -11,7 +11,7 @@ import { createPermissionHandler } from "./hooks/permission-handler.js"
 import { createEnvSanitizer } from "./hooks/env-sanitizer.js"
 import { createCompactionContext } from "./hooks/compaction-context.js"
 import { createPromptSanitizer } from "./hooks/prompt-sanitizer.js"
-import { createSessionContextCapture, sweepStaleSessions } from "./hooks/session-context.js"
+import { createSessionContextCapture, sweepStaleSessions, extractEventSessionID } from "./hooks/session-context.js"
 import { buildSecurityPolicyContext } from "./hooks/security-policy.js"
 import { createSecurityDashboardTool } from "./tools/security-dashboard.js"
 import { createSecurityReportTool } from "./tools/security-report.js"
@@ -207,20 +207,6 @@ export const Warden: Plugin = async ({ client: sdkClient, directory }) => {
     const id = sessionID || "__default__"
     sessions.set(id, createSessionState(id))
     latestSessionID = id
-  }
-
-  const extractEventSessionID = (event: unknown): string => {
-    if (!event || typeof event !== "object") return ""
-    const record = event as Record<string, unknown>
-    if (typeof record.sessionID === "string") return record.sessionID
-    if (typeof record.sessionId === "string") return record.sessionId
-    if (typeof record.id === "string") return record.id
-    const session = record.session
-    if (session && typeof session === "object") {
-      const sessionRecord = session as Record<string, unknown>
-      if (typeof sessionRecord.id === "string") return sessionRecord.id
-    }
-    return ""
   }
 
   // ─── Create Hooks ───
@@ -421,11 +407,13 @@ export const Warden: Plugin = async ({ client: sdkClient, directory }) => {
       },
       output: { message: unknown; parts: { type: string; [key: string]: unknown }[] },
     ) => {
-      // Capture per-session context (agent/model/variant) BEFORE delegating
-      // to promptSanitizer. The sanitizer may throw (blocking the prompt),
-      // but context capture is non-throwing and should still record what the
-      // user tried to send — useful for forensic audit of blocked prompts.
-      await sessionContextCapture(input)
+      // Capture RESOLVED per-session context (agent/model from output.message,
+      // variant from input) BEFORE delegating to promptSanitizer. The sanitizer
+      // may throw (blocking the prompt), but context capture is non-throwing.
+      // Sanitizer throwing means the message never persists; subsequent
+      // messages will overwrite this state with their own resolved context,
+      // so blocked-prompt state cannot contaminate later allowed messages.
+      await sessionContextCapture(input, output)
       return promptSanitizer(input, output)
     },
 
