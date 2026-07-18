@@ -11,6 +11,7 @@ import { createPermissionHandler } from "./hooks/permission-handler.js"
 import { createEnvSanitizer } from "./hooks/env-sanitizer.js"
 import { createCompactionContext } from "./hooks/compaction-context.js"
 import { createPromptSanitizer } from "./hooks/prompt-sanitizer.js"
+import { createSessionContextCapture, sweepStaleSessions } from "./hooks/session-context.js"
 import { buildSecurityPolicyContext } from "./hooks/security-policy.js"
 import { createSecurityDashboardTool } from "./tools/security-dashboard.js"
 import { createSecurityReportTool } from "./tools/security-report.js"
@@ -149,11 +150,25 @@ export const Warden: Plugin = async ({ client: sdkClient, directory }) => {
     policyInjected: boolean
     llmSanitizer: LlmSanitizer | null
     safetyEvaluator: SafetyEvaluator | null
+    // Last-seen agent/model/variant for this session, captured from chat.message.
+    // Used to keep the synthetic policy-injection message on the same agent/model
+    // as the user's actual session — without this, OpenCode would silently
+    // switch the session to the default agent when we POST without these fields.
+    lastAgent?: string
+    lastModel?: { providerID: string; modelID: string }
+    lastVariant?: string
     lastAccessed: number
   }
 
   const sessions = new Map<string, SessionSecurityState>()
   let latestSessionID = "__default__"
+
+  // TTL: sessions whose lastAccessed is older than this are eligible for sweep.
+  // 24h is well beyond any reasonable "user stepped away" window — even full
+  // workdays. The only cost of sweeping an actually-still-alive session is
+  // re-injecting the policy and resetting sessionStats, both harmless.
+  const SESSION_TTL_MS = 24 * 60 * 60 * 1000
+  const SESSION_SWEEP_INTERVAL_MS = 60 * 60 * 1000 // hourly
 
   const createSessionState = (sessionID: string): SessionSecurityState => ({
     sessionStats: new SessionStats(sessionID === "__default__" ? "" : sessionID),
@@ -252,6 +267,8 @@ export const Warden: Plugin = async ({ client: sdkClient, directory }) => {
     getSessionState,
   })
 
+  const sessionContextCapture = createSessionContextCapture(getSessionState)
+
   const permissionHandler = createPermissionHandler({
     config,
     client,
@@ -330,23 +347,59 @@ export const Warden: Plugin = async ({ client: sdkClient, directory }) => {
     }
   }
 
+  // ─── Session State TTL Sweep ───
+  // Sessions whose lastAccessed is older than SESSION_TTL_MS get swept hourly.
+  // Bound the map's growth for long-lived plugin processes (e.g., a daemon
+  // running for weeks). Active sessions are never swept — lastAccessed is
+  // refreshed on every getSessionState call.
+  const sweepTimer = setInterval(() => {
+    try {
+      const swept = sweepStaleSessions(sessions, Date.now(), SESSION_TTL_MS)
+      if (swept.length > 0) {
+        diagnosticLogger?.info(`Session TTL sweep: removed ${swept.length} stale session(s)`, { swept })
+        if (swept.includes(latestSessionID)) latestSessionID = "__default__"
+      }
+    } catch {
+      // Sweep must never crash the runtime
+    }
+  }, SESSION_SWEEP_INTERVAL_MS)
+  // Allow the Node/Bun process to exit even if the timer is still active
+  if (typeof sweepTimer.unref === "function") sweepTimer.unref()
+
   // ─── Return Plugin Hooks & Tools ───
   return {
+    dispose: async () => {
+      clearInterval(sweepTimer)
+      sessions.clear()
+    },
     "tool.execute.before": async (
       input: { tool: string; sessionID: string; callID: string },
       output: { args: Record<string, unknown> },
     ) => {
       const sessionState = getSessionState(input.sessionID)
-      // Inject security policy into session on first tool call
+      // Inject security policy into session on first tool call.
+      // Pass captured agent/model/variant (from chat.message) so the synthetic
+      // message lands in the same context the user actually chose — without
+      // this, OpenCode would silently switch the session to the default agent.
       if (!sessionState.policyInjected && input.sessionID) {
         sessionState.policyInjected = true
         try {
+          const body: {
+            noReply: true
+            parts: { type: "text"; text: string }[]
+            agent?: string
+            model?: { providerID: string; modelID: string }
+            variant?: string
+          } = {
+            noReply: true,
+            parts: [{ type: "text", text: securityPolicyText }],
+          }
+          if (sessionState.lastAgent) body.agent = sessionState.lastAgent
+          if (sessionState.lastModel) body.model = sessionState.lastModel
+          if (sessionState.lastVariant) body.variant = sessionState.lastVariant
           await client.session.prompt({
             path: { id: input.sessionID },
-            body: {
-              noReply: true,
-              parts: [{ type: "text", text: securityPolicyText }],
-            },
+            body,
           })
         } catch {
           // Non-critical — compaction context is the fallback
@@ -358,13 +411,39 @@ export const Warden: Plugin = async ({ client: sdkClient, directory }) => {
     "permission.ask": permissionHandler,
     "shell.env": envSanitizer,
     "experimental.session.compacting": compactionContext,
-    "chat.message": promptSanitizer,
+    "chat.message": async (
+      input: {
+        sessionID: string
+        agent?: string
+        model?: { providerID: string; modelID: string }
+        messageID?: string
+        variant?: string
+      },
+      output: { message: unknown; parts: { type: string; [key: string]: unknown }[] },
+    ) => {
+      // Capture per-session context (agent/model/variant) BEFORE delegating
+      // to promptSanitizer. The sanitizer may throw (blocking the prompt),
+      // but context capture is non-throwing and should still record what the
+      // user tried to send — useful for forensic audit of blocked prompts.
+      await sessionContextCapture(input)
+      return promptSanitizer(input, output)
+    },
 
     event: async ({ event }) => {
-      if (event.type === "session.created") {
-        const sessionID = extractEventSessionID(event)
-        diagnosticLogger?.info(`Session reset: clearing state for ${sessionID || "default session"}`)
-        resetSessionState(sessionID)
+      try {
+        if (event.type === "session.created") {
+          const sessionID = extractEventSessionID(event)
+          diagnosticLogger?.info(`Session reset: clearing state for ${sessionID || "default session"}`)
+          resetSessionState(sessionID)
+        } else if (event.type === "session.deleted") {
+          const sessionID = extractEventSessionID(event)
+          if (sessionID && sessions.delete(sessionID)) {
+            diagnosticLogger?.info(`Session deleted: removed state for ${sessionID}`)
+            if (latestSessionID === sessionID) latestSessionID = "__default__"
+          }
+        }
+      } catch {
+        // Non-critical — event handler must never crash the runtime
       }
     },
 

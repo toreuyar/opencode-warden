@@ -177,9 +177,19 @@ Warden registers these OpenCode plugin hooks (see `src/index.ts`):
 | `permission.ask` | `permission-handler.ts` | LLM safety eval integrated with OpenCode permission prompts |
 | `shell.env` | `env-sanitizer.ts` | Strip sensitive env vars before bash execution |
 | `experimental.session.compacting` | `compaction-context.ts` | Inject security context into compaction prompt |
-| `chat.message` | `prompt-sanitizer.ts` | Scan user-typed prompts; **throw to block creation** before they reach the LLM or session storage. **Opt-in** — only fires when `config.scanUserPrompts: true` (default `false`). Also gated by `redactionEnabled`. |
+| `chat.message` | `index.ts` (composes `session-context.ts` + `prompt-sanitizer.ts`) | Two-pass handler: (1) `session-context.ts` captures per-session `{agent, model, variant}` for later policy injection target — never throws; (2) `prompt-sanitizer.ts` scans user-typed prompts and throws to block creation. **The scanner is opt-in** (`config.scanUserPrompts: true`, default `false`, also gated by `redactionEnabled`); context capture always runs. |
 
 `chat.message` is unique in that **throwing aborts message creation cleanly** — the OpenCode runtime saves the message and parts only AFTER the hook returns. A throw means the user's prompt never persists and never reaches the model. The trade-off (verified in OpenCode source): the TUI surfaces a generic `"Session error"` toast regardless of the error message, so the detailed reason is only available in the audit log. This UX limitation is why the feature ships opt-in. See `packages/opencode/src/session/prompt.ts:1000` for the upstream call site.
+
+### Session Lifecycle
+
+Warden maintains per-session state in a `Map<sessionID, SessionSecurityState>` (`src/index.ts`). New entries are created lazily via `getSessionState()` and reset via `resetSessionState()` on `session.created`. Cleanup happens three ways:
+
+1. **`session.deleted` event** — removes the entry from the map immediately
+2. **TTL sweep** — `setInterval` (hourly) calls `sweepStaleSessions()` (`src/hooks/session-context.ts`) to drop entries whose `lastAccessed` is older than 24 hours; the timer is `unref`'d so it can't keep the process alive
+3. **`dispose` hook** — clears the sweep timer and the entire map when the plugin unloads
+
+`SessionSecurityState` carries: `sessionStats`, `toastState`, `sessionAllowlist`, `evaluatedCalls`, `writtenFileRegistry`, `policyInjected`, `llmSanitizer`, `safetyEvaluator`, `lastAgent`/`lastModel`/`lastVariant` (captured from `chat.message` and passed to the policy-injection prompt body so the synthetic message lands in the user's actual agent/model context, not the default).
 
 ### Shared Mutable State
 
@@ -508,17 +518,9 @@ The `deepMerge()` function **replaces arrays entirely**. If a user config specif
 
 ### Session Reset
 
-When `session.created` event fires, ALL mutable state must be reset:
-```typescript
-sessionStats.reset("")
-sessionAllowlist.clear()
-evaluatedCalls.clear()
-policyInjected = false
-llmSanitizer?.reset()
-safetyEvaluator?.reset()
-```
+When `session.created` fires, `resetSessionState(sessionID)` replaces ONLY that session's entry in the `sessions` map with a fresh `createSessionState()` (all defaults). Other sessions are unaffected. This is critical for multi-session correctness — see `src/index.ts`.
 
-If you add new mutable state, add its reset to the event handler in `src/index.ts`.
+If you add new mutable state to `SessionSecurityState`, add it to `createSessionState()` so it gets a sensible default on session creation.
 
 ### Tool Exclusion
 

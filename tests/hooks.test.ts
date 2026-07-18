@@ -8,6 +8,7 @@ import { createOutputRedactor } from "../src/hooks/output-redactor.js"
 import { createEnvSanitizer } from "../src/hooks/env-sanitizer.js"
 import { createCompactionContext } from "../src/hooks/compaction-context.js"
 import { createPromptSanitizer } from "../src/hooks/prompt-sanitizer.js"
+import { createSessionContextCapture, sweepStaleSessions } from "../src/hooks/session-context.js"
 import type { PluginClient, ToastState, WrittenFileMetadata } from "../src/types.js"
 
 const mockClient: PluginClient = {
@@ -2068,5 +2069,152 @@ describe("SSH-Only Mode", () => {
         ),
       ).rejects.toThrow("blocked by security policy")
     })
+  })
+})
+
+describe("Session Context Capture (chat.message wrapper)", () => {
+  type CapturedState = {
+    lastAgent?: string
+    lastModel?: { providerID: string; modelID: string }
+    lastVariant?: string
+    lastAccessed: number
+  }
+
+  test("captures agent, model, and variant on the session state", async () => {
+    const sessions = new Map<string, CapturedState>()
+    const getState = (id: string) => {
+      let s = sessions.get(id)
+      if (!s) {
+        s = { lastAccessed: Date.now() }
+        sessions.set(id, s)
+      }
+      return s
+    }
+    const capture = createSessionContextCapture(getState)
+
+    await capture({
+      sessionID: "s1",
+      agent: "devops",
+      model: { providerID: "anthropic", modelID: "claude-sonnet-4" },
+      variant: "reasoning",
+    })
+
+    const s = sessions.get("s1")!
+    expect(s.lastAgent).toBe("devops")
+    expect(s.lastModel).toEqual({ providerID: "anthropic", modelID: "claude-sonnet-4" })
+    expect(s.lastVariant).toBe("reasoning")
+  })
+
+  test("captures partial fields without overwriting existing ones", async () => {
+    const sessions = new Map<string, CapturedState>([
+      ["s1", {
+        lastAgent: "devops",
+        lastModel: { providerID: "anthropic", modelID: "claude-sonnet-4" },
+        lastVariant: "reasoning",
+        lastAccessed: Date.now(),
+      }],
+    ])
+    const capture = createSessionContextCapture((id) => sessions.get(id)!)
+
+    // Second call with only agent — should preserve model and variant
+    await capture({ sessionID: "s1", agent: "reviewer" })
+
+    const s = sessions.get("s1")!
+    expect(s.lastAgent).toBe("reviewer")          // updated
+    expect(s.lastModel?.modelID).toBe("claude-sonnet-4")  // preserved
+    expect(s.lastVariant).toBe("reasoning")       // preserved
+  })
+
+  test("no-op when sessionID is empty", async () => {
+    const sessions = new Map<string, CapturedState>()
+    const capture = createSessionContextCapture((id) => {
+      const s = { lastAccessed: Date.now() }
+      sessions.set(id, s)
+      return s
+    })
+
+    await capture({ sessionID: "", agent: "test" })
+    expect(sessions.size).toBe(0)
+  })
+
+  test("swallows errors from getSessionState (must not throw)", async () => {
+    const failingGetState = (): CapturedState => {
+      throw new Error("session lookup failed")
+    }
+    const capture = createSessionContextCapture(failingGetState)
+
+    // Must NOT throw — capture is non-blocking
+    await expect(
+      capture({ sessionID: "s1", agent: "test" }),
+    ).resolves.toBeUndefined()
+  })
+
+  test("different sessions have independent state", async () => {
+    const sessions = new Map<string, CapturedState>()
+    const getState = (id: string) => {
+      let s = sessions.get(id)
+      if (!s) {
+        s = { lastAccessed: Date.now() }
+        sessions.set(id, s)
+      }
+      return s
+    }
+    const capture = createSessionContextCapture(getState)
+
+    await capture({ sessionID: "s1", agent: "devops" })
+    await capture({ sessionID: "s2", agent: "reviewer" })
+
+    expect(sessions.get("s1")?.lastAgent).toBe("devops")
+    expect(sessions.get("s2")?.lastAgent).toBe("reviewer")
+  })
+})
+
+describe("sweepStaleSessions", () => {
+  type State = { lastAccessed: number }
+
+  test("removes entries older than TTL", () => {
+    const now = 10_000_000
+    const sessions = new Map<string, State>([
+      ["fresh", { lastAccessed: now - 1000 }],         // 1s old — keep
+      ["old", { lastAccessed: now - 20_000 }],          // 20s old — sweep (TTL=10s)
+      ["ancient", { lastAccessed: now - 100_000 }],     // 100s old — sweep
+    ])
+
+    const swept = sweepStaleSessions(sessions, now, 10_000)
+    expect(swept.sort()).toEqual(["ancient", "old"])
+    expect(sessions.has("fresh")).toBe(true)
+    expect(sessions.has("old")).toBe(false)
+    expect(sessions.has("ancient")).toBe(false)
+  })
+
+  test("returns empty array when nothing is stale", () => {
+    const now = 10_000
+    const sessions = new Map<string, State>([
+      ["a", { lastAccessed: now }],
+      ["b", { lastAccessed: now - 500 }],
+    ])
+    const swept = sweepStaleSessions(sessions, now, 60_000)
+    expect(swept).toEqual([])
+    expect(sessions.size).toBe(2)
+  })
+
+  test("handles empty map", () => {
+    const sessions = new Map<string, State>()
+    const swept = sweepStaleSessions(sessions, Date.now(), 1000)
+    expect(swept).toEqual([])
+  })
+
+  test("boundary: lastAccessed exactly at cutoff is kept (>=)", () => {
+    const now = 1000
+    const ttl = 500
+    // cutoff = now - ttl = 500. Entry at exactly 500 should be KEPT (not stale).
+    // Entry at 499 should be SWEPT.
+    const sessions = new Map<string, State>([
+      ["boundary", { lastAccessed: now - ttl }],  // exactly at cutoff
+      ["just-before", { lastAccessed: now - ttl - 1 }],  // 1ms older
+    ])
+    const swept = sweepStaleSessions(sessions, now, ttl)
+    expect(swept).toEqual(["just-before"])
+    expect(sessions.has("boundary")).toBe(true)
   })
 })
