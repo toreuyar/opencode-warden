@@ -352,9 +352,13 @@ export function extractInnerCommand(
  * Extract remote file paths referenced in the command.
  * - SSH: parses inner command for cat, less, head, tail targets.
  * - SCP: extracts path from host:path notation.
+ *
+ * `host` is included per entry so callers can match against host-scoped
+ * exemption patterns. SSH and SCP always populate host; rsync/rclone paths
+ * populate host from the `[user@]host:` prefix (see extractRemoteFilePathsFromArgs).
  */
-export function extractRemoteFilePaths(parsed: ParsedSshCommand): { path: string; mode: "read" | "write" }[] {
-  const paths: { path: string; mode: "read" | "write" }[] = []
+export function extractRemoteFilePaths(parsed: ParsedSshCommand): { host: string; path: string; mode: "read" | "write" }[] {
+  const paths: { host: string; path: string; mode: "read" | "write" }[] = []
 
   if (parsed.type === "ssh" && parsed.innerCommand) {
     // Extract file paths from common read commands in inner command.
@@ -364,27 +368,27 @@ export function extractRemoteFilePaths(parsed: ParsedSshCommand): { path: string
       /\b(?:cat|less|head|tail|more|vi|vim|nano|view)\s+['"]?([^\s'";&|>]+)/g
     let match: RegExpExecArray | null
     while ((match = readCmdRe.exec(parsed.innerCommand)) !== null) {
-      paths.push({ path: match[1], mode: "read" })
+      paths.push({ host: parsed.host, path: match[1], mode: "read" })
     }
   }
 
   if (parsed.type === "scp") {
     const remotePathRe =
-      /^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9._-]+(?:\.[A-Za-z0-9._-]+)*:(.+)$/
+      /^(?:[A-Za-z0-9._-]+@)?([A-Za-z0-9._-]+(?:\.[A-Za-z0-9._-]+)*):(.+)$/
 
     if (parsed.scpDirection === "download") {
       // Download: remote paths are in the sources → reads
       if (parsed.scpSources) {
         for (const src of parsed.scpSources) {
           const m = remotePathRe.exec(src)
-          if (m) paths.push({ path: m[1], mode: "read" })
+          if (m) paths.push({ host: m[1], path: m[2], mode: "read" })
         }
       }
     } else if (parsed.scpDirection === "upload") {
       // Upload: remote path is the destination → write
       if (parsed.scpDestination) {
         const m = remotePathRe.exec(parsed.scpDestination)
-        if (m) paths.push({ path: m[1], mode: "write" })
+        if (m) paths.push({ host: m[1], path: m[2], mode: "write" })
       }
     } else {
       // Direction unknown (shouldn't happen for valid SCP) — check both,
@@ -392,12 +396,12 @@ export function extractRemoteFilePaths(parsed: ParsedSshCommand): { path: string
       if (parsed.scpSources) {
         for (const src of parsed.scpSources) {
           const m = remotePathRe.exec(src)
-          if (m) paths.push({ path: m[1], mode: "read" })
+          if (m) paths.push({ host: m[1], path: m[2], mode: "read" })
         }
       }
       if (parsed.scpDestination) {
         const m = remotePathRe.exec(parsed.scpDestination)
-        if (m) paths.push({ path: m[1], mode: "write" })
+        if (m) paths.push({ host: m[1], path: m[2], mode: "write" })
       }
     }
   }

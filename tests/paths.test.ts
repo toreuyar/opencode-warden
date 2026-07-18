@@ -2,7 +2,7 @@ import { describe, test, expect, afterEach } from "bun:test"
 import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "fs"
 import { join } from "path"
 import { tmpdir } from "os"
-import { isBlockedPath, isWriteProtectedPath, isPathBlockedForMode, matchGlob, extractFilePath, extractRemoteFilePathsFromArgs, extractBashFileTargets, isDynamicPathTarget } from "../src/utils/paths.js"
+import { isBlockedPath, isWriteProtectedPath, isPathBlockedForMode, isRedactionExempt, matchGlob, extractFilePath, extractRemoteFilePathsFromArgs, extractBashFileTargets, isDynamicPathTarget } from "../src/utils/paths.js"
 import { DEFAULT_CONFIG } from "../src/config/defaults.js"
 
 const tempDirs: string[] = []
@@ -156,32 +156,32 @@ describe("Remote File Path Extraction", () => {
     const paths = extractRemoteFilePathsFromArgs("bash", {
       command: 'ssh user@host.com "cat /etc/passwd"',
     })
-    expect(paths).toEqual([{ path: "/etc/passwd", mode: "read" }])
+    expect(paths).toEqual([{ host: "host.com", path: "/etc/passwd", mode: "read" }])
   })
 
   test("extracts remote paths from SCP download (read mode)", () => {
     const paths = extractRemoteFilePathsFromArgs("bash", {
       command: "scp user@server.com:/etc/shadow ./local/",
     })
-    expect(paths).toEqual([{ path: "/etc/shadow", mode: "read" }])
+    expect(paths).toEqual([{ host: "server.com", path: "/etc/shadow", mode: "read" }])
   })
 
   test("extracts remote paths from SCP upload (write mode)", () => {
     const paths = extractRemoteFilePathsFromArgs("bash", {
       command: "scp ./local.txt user@server.com:/home/deploy/.env",
     })
-    expect(paths).toEqual([{ path: "/home/deploy/.env", mode: "write" }])
+    expect(paths).toEqual([{ host: "server.com", path: "/home/deploy/.env", mode: "write" }])
   })
 
   test("extracts remote paths from rsync download (read) and upload (write)", () => {
     const dl = extractRemoteFilePathsFromArgs("bash", {
       command: "rsync -avz user@server.com:/home/user/.env ./local/",
     })
-    expect(dl).toEqual([{ path: "/home/user/.env", mode: "read" }])
+    expect(dl).toEqual([{ host: "server.com", path: "/home/user/.env", mode: "read" }])
     const ul = extractRemoteFilePathsFromArgs("bash", {
       command: "rsync -avz ./local.txt user@server.com:/home/deploy/.env",
     })
-    expect(ul).toEqual([{ path: "/home/deploy/.env", mode: "write" }])
+    expect(ul).toEqual([{ host: "server.com", path: "/home/deploy/.env", mode: "write" }])
   })
 
   test("returns empty for non-SSH commands", () => {
@@ -472,5 +472,103 @@ describe("isPathBlockedForMode", () => {
     expect(
       isPathBlockedForMode(join(linkDir, ".env"), "write", ["**/.env"], [], [], root),
     ).toBe(true)
+  })
+})
+
+describe("isRedactionExempt", () => {
+  test("returns false when no exempt patterns are provided", () => {
+    expect(isRedactionExempt("/project/src/config.ts", [])).toBe(false)
+  })
+
+  test("matches an exact relative path", () => {
+    expect(isRedactionExempt("src/config.ts", ["src/config.ts"])).toBe(true)
+  })
+
+  test("matches an absolute path against a relative pattern", () => {
+    const cwd = process.cwd()
+    const abs = join(cwd, "src/config.ts").replace(/\\/g, "/")
+    expect(isRedactionExempt(abs, ["src/config.ts"], { cwd })).toBe(true)
+  })
+
+  test("matches a glob pattern", () => {
+    expect(isRedactionExempt("src/secrets.json", ["**/secrets.json"])).toBe(true)
+    expect(isRedactionExempt("config/secrets.json", ["**/secrets.json"])).toBe(true)
+  })
+
+  test("does not match an unrelated path", () => {
+    expect(isRedactionExempt("src/index.ts", ["src/config.ts", "**/secrets.json"])).toBe(false)
+  })
+
+  test("works for paths under a directory glob", () => {
+    expect(isRedactionExempt("config/local.json", ["config/**"])).toBe(true)
+  })
+
+  test("local entries do NOT match remote operations", () => {
+    // Same path string, but operation is remote — plain entry must not apply
+    expect(
+      isRedactionExempt("/etc/foo.conf", ["/etc/foo.conf"], { host: "server.com" }),
+    ).toBe(false)
+  })
+
+  test("host:* entry matches any remote host", () => {
+    expect(
+      isRedactionExempt("/etc/foo.conf", ["host:*:/etc/foo.conf"], { host: "any.host.com" }),
+    ).toBe(true)
+  })
+
+  test("host:<glob> entry matches hosts satisfying the glob", () => {
+    expect(
+      isRedactionExempt("/etc/app.conf", ["host:web-*:/etc/app.conf"], { host: "web-01.example.com" }),
+    ).toBe(true)
+    expect(
+      isRedactionExempt("/etc/app.conf", ["host:web-*:/etc/app.conf"], { host: "db-01.example.com" }),
+    ).toBe(false)
+  })
+
+  test("host:<exact> entry matches only that host", () => {
+    expect(
+      isRedactionExempt(
+        "/etc/specific.conf",
+        ["host:prod-01.example.com:/etc/specific.conf"],
+        { host: "prod-01.example.com" },
+      ),
+    ).toBe(true)
+    expect(
+      isRedactionExempt(
+        "/etc/specific.conf",
+        ["host:prod-01.example.com:/etc/specific.conf"],
+        { host: "prod-02.example.com" },
+      ),
+    ).toBe(false)
+  })
+
+  test("host: entry does NOT apply to local operations", () => {
+    expect(
+      isRedactionExempt("/etc/foo.conf", ["host:*:/etc/foo.conf"]),
+    ).toBe(false)
+  })
+
+  test("host: entry supports path globs", () => {
+    expect(
+      isRedactionExempt(
+        "/var/log/app.log",
+        ["host:prod-*:/var/log/**"],
+        { host: "prod-west-1" },
+      ),
+    ).toBe(true)
+  })
+
+  test("mix of local and host entries applies the right scope", () => {
+    const patterns = ["src/local.txt", "host:*:/etc/remote.conf"]
+    // Local op: only local entry applies
+    expect(isRedactionExempt("src/local.txt", patterns)).toBe(true)
+    expect(isRedactionExempt("/etc/remote.conf", patterns)).toBe(false)
+    // Remote op: only host entry applies
+    expect(
+      isRedactionExempt("/etc/remote.conf", patterns, { host: "any" }),
+    ).toBe(true)
+    expect(
+      isRedactionExempt("src/local.txt", patterns, { host: "any" }),
+    ).toBe(false)
   })
 })

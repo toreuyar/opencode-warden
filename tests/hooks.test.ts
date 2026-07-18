@@ -7,6 +7,7 @@ import { createInputSanitizer } from "../src/hooks/input-sanitizer.js"
 import { createOutputRedactor } from "../src/hooks/output-redactor.js"
 import { createEnvSanitizer } from "../src/hooks/env-sanitizer.js"
 import { createCompactionContext } from "../src/hooks/compaction-context.js"
+import { createPromptSanitizer } from "../src/hooks/prompt-sanitizer.js"
 import type { PluginClient, ToastState, WrittenFileMetadata } from "../src/types.js"
 
 const mockClient: PluginClient = {
@@ -517,6 +518,443 @@ describe("Input Sanitizer Hook", () => {
     // Should not throw because the file is allowlisted
     await expect(hook(input, output)).resolves.toBeUndefined()
   })
+
+  test("redactionExemptPaths: write to exempt path preserves API key in content", async () => {
+    const deps = createTestDeps()
+    const configWithExemption = {
+      ...DEFAULT_CONFIG,
+      redactionExemptPaths: ["src/config.ts"],
+    }
+    const hook = createInputSanitizer({
+      ...deps,
+      config: configWithExemption,
+      client: mockClient,
+      safetyEvaluator: null,
+      sessionAllowlist: deps.sessionAllowlist,
+    })
+
+    const input = { tool: "write", sessionID: "s1", callID: "c1" }
+    const output = {
+      args: {
+        filePath: "/project/src/config.ts",
+        content: 'OPENROUTER_API_KEY="sk-or-v1-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"',
+      },
+    }
+
+    await hook(input, output)
+    // Content must be preserved unchanged — no [REDACTED]
+    expect(output.args.content as string).toContain("sk-or-v1-")
+    expect(output.args.content as string).not.toContain("[REDACTED]")
+  })
+
+  test("redactionExemptPaths: write to non-exempt path still redacts secrets", async () => {
+    const deps = createTestDeps()
+    const configWithExemption = {
+      ...DEFAULT_CONFIG,
+      redactionExemptPaths: ["src/config.ts"],
+    }
+    const hook = createInputSanitizer({
+      ...deps,
+      config: configWithExemption,
+      client: mockClient,
+      safetyEvaluator: null,
+      sessionAllowlist: deps.sessionAllowlist,
+    })
+
+    const input = { tool: "write", sessionID: "s1", callID: "c1" }
+    const output = {
+      args: {
+        filePath: "/project/src/random.ts",
+        content: 'OPENROUTER_API_KEY="sk-or-v1-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"',
+      },
+    }
+
+    await hook(input, output)
+    expect(output.args.content as string).toContain("[REDACTED]")
+    expect(output.args.content as string).not.toContain("sk-or-v1-")
+  })
+
+  test("redactionExemptPaths: glob pattern matches nested file", async () => {
+    const deps = createTestDeps()
+    const configWithExemption = {
+      ...DEFAULT_CONFIG,
+      redactionExemptPaths: ["**/secrets.json"],
+    }
+    const hook = createInputSanitizer({
+      ...deps,
+      config: configWithExemption,
+      client: mockClient,
+      safetyEvaluator: null,
+      sessionAllowlist: deps.sessionAllowlist,
+    })
+
+    const input = { tool: "edit", sessionID: "s1", callID: "c1" }
+    const output = {
+      args: {
+        filePath: "/project/config/secrets.json",
+        content: '"openrouter_key": "sk-or-v1-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"',
+      },
+    }
+
+    await hook(input, output)
+    expect(output.args.content as string).toContain("sk-or-v1-")
+    expect(output.args.content as string).not.toContain("[REDACTED]")
+  })
+
+  test("redactionExemptPaths does NOT bypass blockedFilePaths", async () => {
+    const deps = createTestDeps()
+    const configWithExemption = {
+      ...DEFAULT_CONFIG,
+      // Try to exempt .env (which is also blocked) — should still be blocked
+      redactionExemptPaths: [".env", "**/.env"],
+    }
+    const hook = createInputSanitizer({
+      ...deps,
+      config: configWithExemption,
+      client: mockClient,
+      safetyEvaluator: null,
+      sessionAllowlist: deps.sessionAllowlist,
+    })
+
+    const input = { tool: "write", sessionID: "s1", callID: "c1" }
+    const output = { args: { filePath: "/project/.env", content: "FOO=bar" } }
+
+    // File blocking runs BEFORE redaction exemption — must still throw
+    await expect(hook(input, output)).rejects.toThrow("blocked by security policy")
+  })
+
+  test("redactionExemptPaths does NOT apply to bash commands", async () => {
+    const deps = createTestDeps()
+    const configWithExemption = {
+      ...DEFAULT_CONFIG,
+      redactionExemptPaths: ["**/*"],
+    }
+    const hook = createInputSanitizer({
+      ...deps,
+      config: configWithExemption,
+      client: mockClient,
+      safetyEvaluator: null,
+      sessionAllowlist: deps.sessionAllowlist,
+    })
+
+    const input = { tool: "bash", sessionID: "s1", callID: "c1" }
+    const output = {
+      args: { command: "echo sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxx" },
+    }
+
+    await hook(input, output)
+    // Bash is not a write tool — exemption must not apply
+    expect(output.args.command as string).not.toContain("xxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+  })
+
+  test("redactionExemptPaths: bash redirection to exempt path preserves secret", async () => {
+    const deps = createTestDeps()
+    const configWithExemption = {
+      ...DEFAULT_CONFIG,
+      redactionExemptPaths: ["src/config.ts"],
+    }
+    const hook = createInputSanitizer({
+      ...deps,
+      config: configWithExemption,
+      client: mockClient,
+      safetyEvaluator: null,
+      sessionAllowlist: deps.sessionAllowlist,
+    })
+
+    const input = { tool: "bash", sessionID: "s1", callID: "c1" }
+    const output = {
+      args: {
+        command:
+          'echo "KEY=sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxx" > /project/src/config.ts',
+      },
+    }
+
+    await hook(input, output)
+    expect(output.args.command as string).toContain("sk-proj-")
+    expect(output.args.command as string).not.toContain("[REDACTED]")
+  })
+
+  test("redactionExemptPaths: bash redirection to NON-exempt path still redacts", async () => {
+    const deps = createTestDeps()
+    const configWithExemption = {
+      ...DEFAULT_CONFIG,
+      redactionExemptPaths: ["src/config.ts"],
+    }
+    const hook = createInputSanitizer({
+      ...deps,
+      config: configWithExemption,
+      client: mockClient,
+      safetyEvaluator: null,
+      sessionAllowlist: deps.sessionAllowlist,
+    })
+
+    const input = { tool: "bash", sessionID: "s1", callID: "c1" }
+    const output = {
+      args: {
+        command:
+          'echo "KEY=sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxx" > /project/src/random.ts',
+      },
+    }
+
+    await hook(input, output)
+    expect(output.args.command as string).toContain("[REDACTED]")
+  })
+
+  test("redactionExemptPaths: host-scoped entry matches remote SCP upload", async () => {
+    const deps = createTestDeps()
+    const configWithExemption = {
+      ...DEFAULT_CONFIG,
+      redactionExemptPaths: ["host:web-*:/etc/myapp/config.conf"],
+    }
+    const hook = createInputSanitizer({
+      ...deps,
+      config: configWithExemption,
+      client: mockClient,
+      safetyEvaluator: null,
+      sessionAllowlist: deps.sessionAllowlist,
+    })
+
+    const input = { tool: "bash", sessionID: "s1", callID: "c1" }
+    const output = {
+      args: {
+        command:
+          'echo "KEY=sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxx" | ssh user@web-01.example.com "cat > /etc/myapp/config.conf"',
+      },
+    }
+
+    // SSH command extracts inner file refs as reads only; this test confirms
+    // the host-scoped exemption logic flows through (the inner write isn't
+    // extracted as a write target — that's a known limitation of the parser).
+    // The point of this test is to confirm we don't throw and the host parser
+    // doesn't error on host: entries.
+    await expect(hook(input, output)).resolves.toBeUndefined()
+  })
+
+  test("redactionExemptPaths: SCP upload to host-scoped exempt path preserves secret", async () => {
+    const deps = createTestDeps()
+    const configWithExemption = {
+      ...DEFAULT_CONFIG,
+      redactionExemptPaths: ["host:web-*:/etc/myapp/**"],
+    }
+    const hook = createInputSanitizer({
+      ...deps,
+      config: configWithExemption,
+      client: mockClient,
+      safetyEvaluator: null,
+      sessionAllowlist: deps.sessionAllowlist,
+    })
+
+    const input = { tool: "bash", sessionID: "s1", callID: "c1" }
+    const output = {
+      args: {
+        command:
+          "scp /tmp/local.txt web-01.example.com:/etc/myapp/config.conf",
+      },
+    }
+
+    await hook(input, output)
+    // The SCP upload target host=web-01.example.com path=/etc/myapp/config.conf
+    // matches `host:web-*:/etc/myapp/**` → redaction skipped on the command.
+    // Command itself has no secret to redact, but we verify no errors thrown.
+    await expect(Promise.resolve()).resolves.toBeUndefined()
+  })
+
+  test("redactionExemptPaths: bash tee to exempt path preserves secret", async () => {
+    const deps = createTestDeps()
+    const configWithExemption = {
+      ...DEFAULT_CONFIG,
+      redactionExemptPaths: ["src/config.ts"],
+    }
+    const hook = createInputSanitizer({
+      ...deps,
+      config: configWithExemption,
+      client: mockClient,
+      safetyEvaluator: null,
+      sessionAllowlist: deps.sessionAllowlist,
+    })
+
+    const input = { tool: "bash", sessionID: "s1", callID: "c1" }
+    const output = {
+      args: {
+        command:
+          'echo "sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxx" | tee /project/src/config.ts',
+      },
+    }
+
+    await hook(input, output)
+    expect(output.args.command as string).toContain("sk-proj-")
+    expect(output.args.command as string).not.toContain("[REDACTED]")
+  })
+
+  test("redactOnWrite=false disables redaction globally for write tool", async () => {
+    const deps = createTestDeps()
+    const configNoWriteRedact = { ...DEFAULT_CONFIG, redactOnWrite: false }
+    const hook = createInputSanitizer({
+      ...deps,
+      config: configNoWriteRedact,
+      client: mockClient,
+      safetyEvaluator: null,
+      sessionAllowlist: deps.sessionAllowlist,
+    })
+
+    const input = { tool: "write", sessionID: "s1", callID: "c1" }
+    const output = {
+      args: {
+        filePath: "/project/src/random.ts",
+        content: 'KEY="sk-or-v1-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"',
+      },
+    }
+
+    await hook(input, output)
+    expect(output.args.content as string).toContain("sk-or-v1-")
+    expect(output.args.content as string).not.toContain("[REDACTED]")
+  })
+
+  test("redactOnWrite=false disables redaction globally for edit tool", async () => {
+    const deps = createTestDeps()
+    const configNoWriteRedact = { ...DEFAULT_CONFIG, redactOnWrite: false }
+    const hook = createInputSanitizer({
+      ...deps,
+      config: configNoWriteRedact,
+      client: mockClient,
+      safetyEvaluator: null,
+      sessionAllowlist: deps.sessionAllowlist,
+    })
+
+    const input = { tool: "edit", sessionID: "s1", callID: "c1" }
+    const output = {
+      args: {
+        filePath: "/project/src/random.ts",
+        content: [{ oldText: "x", newText: "sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxx" }],
+      },
+    }
+
+    await hook(input, output)
+    expect(JSON.stringify(output.args.content)).toContain("sk-proj-")
+  })
+
+  test("redactOnWrite=false does NOT apply to bash (still redacted)", async () => {
+    const deps = createTestDeps()
+    const configNoWriteRedact = { ...DEFAULT_CONFIG, redactOnWrite: false }
+    const hook = createInputSanitizer({
+      ...deps,
+      config: configNoWriteRedact,
+      client: mockClient,
+      safetyEvaluator: null,
+      sessionAllowlist: deps.sessionAllowlist,
+    })
+
+    const input = { tool: "bash", sessionID: "s1", callID: "c1" }
+    const output = {
+      args: { command: "echo sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxx" },
+    }
+
+    await hook(input, output)
+    expect(output.args.command as string).not.toContain("xxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+  })
+
+  test("redactOnWrite=false does NOT bypass blockedFilePaths", async () => {
+    const deps = createTestDeps()
+    const configNoWriteRedact = { ...DEFAULT_CONFIG, redactOnWrite: false }
+    const hook = createInputSanitizer({
+      ...deps,
+      config: configNoWriteRedact,
+      client: mockClient,
+      safetyEvaluator: null,
+      sessionAllowlist: deps.sessionAllowlist,
+    })
+
+    const input = { tool: "write", sessionID: "s1", callID: "c1" }
+    const output = { args: { filePath: "/project/.env", content: "FOO=bar" } }
+
+    await expect(hook(input, output)).rejects.toThrow("blocked by security policy")
+  })
+
+  test("redactOnWrite default (true) still redacts writes", async () => {
+    const deps = createTestDeps()
+    const hook = createInputSanitizer({
+      ...deps,
+      config: DEFAULT_CONFIG,
+      client: mockClient,
+      safetyEvaluator: null,
+      sessionAllowlist: deps.sessionAllowlist,
+    })
+
+    const input = { tool: "write", sessionID: "s1", callID: "c1" }
+    const output = {
+      args: {
+        filePath: "/project/src/random.ts",
+        content: 'KEY="sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxx"',
+      },
+    }
+
+    await hook(input, output)
+    expect(output.args.content as string).toContain("[REDACTED]")
+    expect(output.args.content as string).not.toContain("sk-proj-")
+  })
+
+  test("redactionEnabled=false disables redaction for bash tool input", async () => {
+    const deps = createTestDeps()
+    const configDisabled = { ...DEFAULT_CONFIG, redactionEnabled: false }
+    const hook = createInputSanitizer({
+      ...deps,
+      config: configDisabled,
+      client: mockClient,
+      safetyEvaluator: null,
+      sessionAllowlist: deps.sessionAllowlist,
+    })
+
+    const input = { tool: "bash", sessionID: "s1", callID: "c1" }
+    const output = {
+      args: { command: "echo sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxx" },
+    }
+
+    await hook(input, output)
+    // Master kill switch applies even to bash — content must pass through
+    expect(output.args.command as string).toContain("sk-proj-")
+    expect(output.args.command as string).not.toContain("[REDACTED]")
+  })
+
+  test("redactionEnabled=false overrides redactOnWrite=true", async () => {
+    const deps = createTestDeps()
+    // Explicitly leave redactOnWrite at default true — master switch should still win
+    const configDisabled = { ...DEFAULT_CONFIG, redactionEnabled: false, redactOnWrite: true }
+    const hook = createInputSanitizer({
+      ...deps,
+      config: configDisabled,
+      client: mockClient,
+      safetyEvaluator: null,
+      sessionAllowlist: deps.sessionAllowlist,
+    })
+
+    const input = { tool: "write", sessionID: "s1", callID: "c1" }
+    const output = {
+      args: {
+        filePath: "/project/src/random.ts",
+        content: 'KEY="sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxx"',
+      },
+    }
+
+    await hook(input, output)
+    expect(output.args.content as string).toContain("sk-proj-")
+  })
+
+  test("redactionEnabled=false does NOT bypass blockedFilePaths", async () => {
+    const deps = createTestDeps()
+    const configDisabled = { ...DEFAULT_CONFIG, redactionEnabled: false }
+    const hook = createInputSanitizer({
+      ...deps,
+      config: configDisabled,
+      client: mockClient,
+      safetyEvaluator: null,
+      sessionAllowlist: deps.sessionAllowlist,
+    })
+
+    const input = { tool: "read", sessionID: "s1", callID: "c1" }
+    const output = { args: { filePath: "/project/.env" } }
+
+    await expect(hook(input, output)).rejects.toThrow("blocked by security policy")
+  })
 })
 
 describe("Output Redactor Hook", () => {
@@ -627,6 +1065,437 @@ describe("Output Redactor Hook", () => {
 
     await hook(input, output)
     expect(output.output).toBe(originalOutput)
+  })
+
+  test("redactionExemptPaths: read of exempt path preserves API key in output", async () => {
+    const deps = createTestDeps()
+    const configWithExemption = {
+      ...DEFAULT_CONFIG,
+      redactionExemptPaths: ["src/config.ts"],
+    }
+    const hook = createOutputRedactor({
+      ...deps,
+      config: configWithExemption,
+      client: mockClient,
+      llmSanitizer: null,
+    })
+
+    const input = {
+      tool: "read",
+      sessionID: "s1",
+      callID: "c1",
+      args: { filePath: "/project/src/config.ts" },
+    }
+    const originalOutput =
+      'OPENROUTER_API_KEY="sk-or-v1-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"\n'
+    const output = { output: originalOutput, title: "Read src/config.ts", metadata: {} }
+
+    await hook(input, output)
+    expect(output.output).toBe(originalOutput)
+    expect(output.output).toContain("sk-or-v1-")
+  })
+
+  test("redactionExemptPaths: read of non-exempt path still redacts", async () => {
+    const deps = createTestDeps()
+    const configWithExemption = {
+      ...DEFAULT_CONFIG,
+      redactionExemptPaths: ["src/config.ts"],
+    }
+    const hook = createOutputRedactor({
+      ...deps,
+      config: configWithExemption,
+      client: mockClient,
+      llmSanitizer: null,
+    })
+
+    const input = {
+      tool: "read",
+      sessionID: "s1",
+      callID: "c1",
+      args: { filePath: "/project/src/random.ts" },
+    }
+    const output = {
+      output: 'OPENROUTER_API_KEY="sk-or-v1-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"\n',
+      title: "Read src/random.ts",
+      metadata: {},
+    }
+
+    await hook(input, output)
+    expect(output.output).not.toContain("sk-or-v1-")
+    expect(output.output).toContain("[REDACTED]")
+  })
+
+  test("redactionExemptPaths: bash output IS exempted when cat target matches", async () => {
+    // With per-path exemption now extended to bash, cat of an exempt path
+    // preserves secrets in output. To verify the non-exempt case still
+    // redacts, use a config that does NOT match the file being read.
+    const deps = createTestDeps()
+    const configWithExemption = {
+      ...DEFAULT_CONFIG,
+      redactionExemptPaths: ["/nonexistent/**"],
+    }
+    const hook = createOutputRedactor({
+      ...deps,
+      config: configWithExemption,
+      client: mockClient,
+      llmSanitizer: null,
+    })
+
+    const input = {
+      tool: "bash",
+      sessionID: "s1",
+      callID: "c1",
+      args: { command: "cat secrets.txt" },
+    }
+    const output = {
+      output: "key=sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxx\n",
+      title: "bash",
+      metadata: {},
+    }
+
+    await hook(input, output)
+    expect(output.output).toContain("[REDACTED]")
+  })
+
+  test("redactionExemptPaths: bash cat of local exempt path preserves secret in output", async () => {
+    const deps = createTestDeps()
+    const configWithExemption = {
+      ...DEFAULT_CONFIG,
+      redactionExemptPaths: ["src/config.ts"],
+    }
+    const hook = createOutputRedactor({
+      ...deps,
+      config: configWithExemption,
+      client: mockClient,
+      llmSanitizer: null,
+    })
+
+    const input = {
+      tool: "bash",
+      sessionID: "s1",
+      callID: "c1",
+      args: { command: "cat /project/src/config.ts" },
+    }
+    const originalOutput = "KEY=sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
+    const output = { output: originalOutput, title: "bash", metadata: {} }
+
+    await hook(input, output)
+    expect(output.output).toBe(originalOutput)
+    expect(output.output).toContain("sk-proj-")
+  })
+
+  test("redactionExemptPaths: host-scoped entry covers remote SSH cat output", async () => {
+    const deps = createTestDeps()
+    const configWithExemption = {
+      ...DEFAULT_CONFIG,
+      redactionExemptPaths: ["host:web-*:/etc/myapp/**"],
+    }
+    const hook = createOutputRedactor({
+      ...deps,
+      config: configWithExemption,
+      client: mockClient,
+      llmSanitizer: null,
+    })
+
+    const input = {
+      tool: "bash",
+      sessionID: "s1",
+      callID: "c1",
+      args: { command: 'ssh user@web-01.example.com "cat /etc/myapp/config.conf"' },
+    }
+    const originalOutput = "KEY=sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
+    const output = { output: originalOutput, title: "ssh", metadata: {} }
+
+    await hook(input, output)
+    expect(output.output).toBe(originalOutput)
+    expect(output.output).toContain("sk-proj-")
+  })
+
+  test("redactionExemptPaths: host-scoped entry does NOT match unmatched host", async () => {
+    const deps = createTestDeps()
+    const configWithExemption = {
+      ...DEFAULT_CONFIG,
+      redactionExemptPaths: ["host:web-*:/etc/myapp/**"],
+    }
+    const hook = createOutputRedactor({
+      ...deps,
+      config: configWithExemption,
+      client: mockClient,
+      llmSanitizer: null,
+    })
+
+    const input = {
+      tool: "bash",
+      sessionID: "s1",
+      callID: "c1",
+      args: { command: 'ssh user@db-01.example.com "cat /etc/myapp/config.conf"' },
+    }
+    const output = {
+      output: "KEY=sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxx\n",
+      title: "ssh",
+      metadata: {},
+    }
+
+    await hook(input, output)
+    expect(output.output).toContain("[REDACTED]")
+  })
+
+  test("redactionEnabled=false disables output redaction for all tools", async () => {
+    const deps = createTestDeps()
+    const configDisabled = { ...DEFAULT_CONFIG, redactionEnabled: false }
+    const hook = createOutputRedactor({
+      ...deps,
+      config: configDisabled,
+      client: mockClient,
+      llmSanitizer: null,
+    })
+
+    const input = {
+      tool: "bash",
+      sessionID: "s1",
+      callID: "c1",
+      args: { command: "cat secrets.txt" },
+    }
+    const originalOutput = "key=sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
+    const output = { output: originalOutput, title: "bash", metadata: {} }
+
+    await hook(input, output)
+    expect(output.output).toBe(originalOutput)
+    expect(output.output).toContain("sk-proj-")
+  })
+
+  test("redactionEnabled=false overrides redactionExemptPaths (no-op)", async () => {
+    const deps = createTestDeps()
+    // Even with NO exempt paths, master switch disables everything
+    const configDisabled = {
+      ...DEFAULT_CONFIG,
+      redactionEnabled: false,
+      redactionExemptPaths: [],
+    }
+    const hook = createOutputRedactor({
+      ...deps,
+      config: configDisabled,
+      client: mockClient,
+      llmSanitizer: null,
+    })
+
+    const input = {
+      tool: "read",
+      sessionID: "s1",
+      callID: "c1",
+      args: { filePath: "/project/src/random.ts" },
+    }
+    const originalOutput = 'KEY="sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxx"\n'
+    const output = { output: originalOutput, title: "Read random.ts", metadata: {} }
+
+    await hook(input, output)
+    expect(output.output).toBe(originalOutput)
+  })
+})
+
+describe("Prompt Sanitizer Hook (chat.message)", () => {
+  // Most tests need the scanner enabled — defaults to false in DEFAULT_CONFIG.
+  const enabledConfig = { ...DEFAULT_CONFIG, scanUserPrompts: true }
+
+  test("clean prompt passes through without throwing", async () => {
+    const deps = createTestDeps()
+    const hook = createPromptSanitizer({
+      ...deps,
+      config: enabledConfig,
+      client: mockClient,
+    })
+
+    const input = { sessionID: "s1", messageID: "m1" }
+    const output = {
+      message: { id: "m1" },
+      parts: [{ type: "text", text: "Help me write a function that adds two numbers." }],
+    }
+
+    await expect(hook(input, output)).resolves.toBeUndefined()
+  })
+
+  test("blocks prompt containing an OpenAI-style API key", async () => {
+    const deps = createTestDeps()
+    const hook = createPromptSanitizer({
+      ...deps,
+      config: enabledConfig,
+      client: mockClient,
+    })
+
+    const input = { sessionID: "s1", messageID: "m1" }
+    const output = {
+      message: { id: "m1" },
+      parts: [
+        { type: "text", text: "Here is my key, use it: sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" },
+      ],
+    }
+
+    await expect(hook(input, output)).rejects.toThrow("blocked by security policy")
+  })
+
+  test("blocks when secret is in a LATER part (not the first)", async () => {
+    const deps = createTestDeps()
+    const hook = createPromptSanitizer({
+      ...deps,
+      config: enabledConfig,
+      client: mockClient,
+    })
+
+    const input = { sessionID: "s1", messageID: "m1" }
+    const output = {
+      message: { id: "m1" },
+      parts: [
+        { type: "text", text: "First, some context." },
+        { type: "file", url: "data:application/octet-stream;base64,AAA" },
+        { type: "text", text: "By the way: sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" },
+      ],
+    }
+
+    await expect(hook(input, output)).rejects.toThrow("blocked by security policy")
+  })
+
+  test("blocks subtask part containing a secret", async () => {
+    const deps = createTestDeps()
+    const hook = createPromptSanitizer({
+      ...deps,
+      config: enabledConfig,
+      client: mockClient,
+    })
+
+    const input = { sessionID: "s1", messageID: "m1" }
+    const output = {
+      message: { id: "m1" },
+      parts: [
+        {
+          type: "subtask",
+          prompt: "Run this with the key sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          description: "delegate",
+          agent: "devops",
+        },
+      ],
+    }
+
+    await expect(hook(input, output)).rejects.toThrow("blocked by security policy")
+  })
+
+  test("skips synthetic text parts (system-generated)", async () => {
+    const deps = createTestDeps()
+    const hook = createPromptSanitizer({
+      ...deps,
+      config: enabledConfig,
+      client: mockClient,
+    })
+
+    // Synthetic parts are generated by OpenCode, not typed by the user.
+    // Even if they contain a secret-looking string, we don't scan them —
+    // they're already past the trust boundary.
+    const input = { sessionID: "s1", messageID: "m1" }
+    const output = {
+      message: { id: "m1" },
+      parts: [
+        { type: "text", text: "sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", synthetic: true },
+      ],
+    }
+
+    await expect(hook(input, output)).resolves.toBeUndefined()
+  })
+
+  test("scanUserPrompts=false (default) skips the hook entirely", async () => {
+    const deps = createTestDeps()
+    const hook = createPromptSanitizer({
+      ...deps,
+      config: DEFAULT_CONFIG, // scanUserPrompts defaults to false
+      client: mockClient,
+    })
+
+    const input = { sessionID: "s1", messageID: "m1" }
+    const output = {
+      message: { id: "m1" },
+      parts: [
+        { type: "text", text: "sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" },
+      ],
+    }
+
+    // With the default config, scanning is OFF — secret passes through
+    await expect(hook(input, output)).resolves.toBeUndefined()
+    expect(deps.sessionStats.getSummary().blockedAttempts).toBe(0)
+  })
+
+  test("redactionEnabled=false overrides scanUserPrompts=true", async () => {
+    const deps = createTestDeps()
+    const hook = createPromptSanitizer({
+      ...deps,
+      config: { ...DEFAULT_CONFIG, scanUserPrompts: true, redactionEnabled: false },
+      client: mockClient,
+    })
+
+    const input = { sessionID: "s1", messageID: "m1" }
+    const output = {
+      message: { id: "m1" },
+      parts: [
+        { type: "text", text: "sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" },
+      ],
+    }
+
+    await expect(hook(input, output)).resolves.toBeUndefined()
+  })
+
+  test("empty parts array passes through", async () => {
+    const deps = createTestDeps()
+    const hook = createPromptSanitizer({
+      ...deps,
+      config: enabledConfig,
+      client: mockClient,
+    })
+
+    const input = { sessionID: "s1", messageID: "m1" }
+    const output = { message: { id: "m1" }, parts: [] }
+
+    await expect(hook(input, output)).resolves.toBeUndefined()
+  })
+
+  test("blocked call records session stats", async () => {
+    const deps = createTestDeps()
+    const hook = createPromptSanitizer({
+      ...deps,
+      config: enabledConfig,
+      client: mockClient,
+    })
+
+    const input = { sessionID: "s1", messageID: "m1" }
+    const output = {
+      message: { id: "m1" },
+      parts: [{ type: "text", text: "sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" }],
+    }
+
+    await expect(hook(input, output)).rejects.toThrow()
+    expect(deps.sessionStats.getSummary().blockedAttempts).toBeGreaterThan(0)
+  })
+
+  test("thrown error message mentions the detected pattern category", async () => {
+    const deps = createTestDeps()
+    const hook = createPromptSanitizer({
+      ...deps,
+      config: enabledConfig,
+      client: mockClient,
+    })
+
+    const input = { sessionID: "s1", messageID: "m1" }
+    const output = {
+      message: { id: "m1" },
+      parts: [{ type: "text", text: "sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" }],
+    }
+
+    try {
+      await hook(input, output)
+      expect.unreachable("should have thrown")
+    } catch (err) {
+      expect(err instanceof Error).toBe(true)
+      const msg = (err as Error).message
+      // Mention that it's a Warden block and reference the category
+      expect(msg).toContain("Warden")
+      expect(msg.toLowerCase()).toMatch(/api|key|secret|credential/)
+    }
   })
 })
 

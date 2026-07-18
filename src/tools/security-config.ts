@@ -116,6 +116,19 @@ export function createSecurityConfigTool(deps: ConfigViewDeps) {
         }
       }
 
+      // Redaction settings
+      lines.push("")
+      lines.push("--- Secret Redaction ---")
+      lines.push(`Master Switch: ${config.redactionEnabled ? "enabled" : "DISABLED"}`)
+      lines.push(`Redact on Write: ${config.redactOnWrite}`)
+      lines.push(`Scan User Prompts: ${config.scanUserPrompts ? "enabled" : "disabled (opt-in)"}`)
+      if (config.redactionExemptPaths.length > 0) {
+        lines.push(`Exempt Paths:`)
+        for (const p of config.redactionExemptPaths) {
+          lines.push(`  ${p}`)
+        }
+      }
+
       return lines.join("\n")
     },
   }

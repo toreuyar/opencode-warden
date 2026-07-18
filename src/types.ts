@@ -159,10 +159,34 @@ export interface SecurityGuardConfig {
   whitelistedPaths: string[]
   blockedFilePaths: string[]
   writeProtectedPaths: string[]
+  // When false, secret redaction is skipped for write/edit/patch tool inputs
+  // (the file content is written as-is). Default true — only disable when the
+  // project legitimately embeds real API keys in source code and you accept
+  // the trade-off. File blocking, write-protection, and LLM safety evaluation
+  // still apply. For scoped exemptions, prefer redactionExemptPaths.
+  redactOnWrite: boolean
+  // Glob patterns of files where secret redaction is skipped entirely
+  // (both write-input deepScan and read-output regex/LLM redaction).
+  // Lets users keep legitimate API keys in source code. File blocking,
+  // write-protection, and LLM safety evaluation still apply.
+  redactionExemptPaths: string[]
   excludedTools: string[]
   blockedTools: string[]
   sshOnlyMode: boolean
   notifications: boolean
+  // Master kill switch for in-place secret redaction. When false, Warden
+  // skips deepScan on tool inputs AND regex+LLM redaction on tool outputs
+  // for ALL tools. File blocking, write-protection, LLM safety evaluation,
+  // env-var stripping, and audit logging remain enabled. Per-path/per-direction
+  // knobs (redactOnWrite, redactionExemptPaths) are ignored when this is false.
+  redactionEnabled: boolean
+  // When true, incoming user prompts (and subtask prompts) are scanned via
+  // the chat.message hook BEFORE they reach the LLM or session storage. If a
+  // detected secret is found, message creation is blocked by throwing.
+  // Default false (opt-in) because the OpenCode TUI surfaces a generic
+  // "Session error" toast on blocked prompts — enable only if you accept
+  // that UX trade-off in exchange for the extra defense layer.
+  scanUserPrompts: boolean
   audit: AuditConfig
   diagnosticLog: DiagnosticLogConfig
   env: EnvSanitizerConfig
@@ -221,7 +245,7 @@ export interface SecurityGuardConfig {
 export interface AuditEntry {
   timestamp: string
   tool: string
-  hook: "before" | "after" | "env" | "compaction" | "permission"
+  hook: "before" | "after" | "env" | "compaction" | "permission" | "chat.message"
   sessionId: string
   callId: string
   detections: Array<{

@@ -2,12 +2,12 @@ import { existsSync, realpathSync } from "fs"
 import { dirname, isAbsolute, join, normalize, resolve } from "path"
 import { parseSshCommand, extractRemoteFilePaths } from "./ssh.js"
 
-const RSYNC_REMOTE_PATH_RE = /^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9._-]+(?:\.[A-Za-z0-9._-]+)*:(.+)$/
+const RSYNC_REMOTE_PATH_RE = /^(?:[A-Za-z0-9._-]+@)?([A-Za-z0-9._-]+(?:\.[A-Za-z0-9._-]+)*):(.+)$/
 
-const RCLONE_REMOTE_PATH_RE = /^[A-Za-z][A-Za-z0-9_-]*:(.+)$/
+const RCLONE_REMOTE_PATH_RE = /^([A-Za-z][A-Za-z0-9_-]*):(.+)$/
 
-function extractRsyncRemotePaths(command: string): { path: string; mode: "read" | "write" }[] {
-  const out: { path: string; mode: "read" | "write" }[] = []
+function extractRsyncRemotePaths(command: string): { host: string; path: string; mode: "read" | "write" }[] {
+  const out: { host: string; path: string; mode: "read" | "write" }[] = []
   const tokens = tokenizeCommand(command)
 
   if (tokens.length === 0 || tokens[0] !== "rsync") return []
@@ -30,15 +30,15 @@ function extractRsyncRemotePaths(command: string): { path: string; mode: "read" 
   for (let k = 0; k < operands.length; k++) {
     const match = RSYNC_REMOTE_PATH_RE.exec(operands[k])
     if (match) {
-      out.push({ path: match[1], mode: k === lastIdx ? "write" : "read" })
+      out.push({ host: match[1], path: match[2], mode: k === lastIdx ? "write" : "read" })
     }
   }
 
   return out
 }
 
-function extractRcloneRemotePaths(command: string): { path: string; mode: "read" | "write" }[] {
-  const out: { path: string; mode: "read" | "write" }[] = []
+function extractRcloneRemotePaths(command: string): { host: string; path: string; mode: "read" | "write" }[] {
+  const out: { host: string; path: string; mode: "read" | "write" }[] = []
   const tokens = tokenizeCommand(command)
 
   if (tokens.length === 0 || tokens[0] !== "rclone") return []
@@ -65,7 +65,7 @@ function extractRcloneRemotePaths(command: string): { path: string; mode: "read"
     const match = RCLONE_REMOTE_PATH_RE.exec(operands[k])
     if (match) {
       const mode = operands.length >= 2 && k === lastIdx ? "write" : "read"
-      out.push({ path: match[1], mode })
+      out.push({ host: match[1], path: match[2], mode })
     }
   }
 
@@ -289,6 +289,103 @@ export function isPathBlockedForMode(
 }
 
 /**
+ * Parse a redactionExemptPaths entry into its host glob (if any) and path pattern.
+ *
+ * Entry forms (see tests/paths.test.ts for canonical examples):
+ *   - Plain path or glob (no prefix) → LOCAL operations only
+ *   - `host:` prefixed                              → REMOTE operations only
+ *
+ * `host:` syntax: `host:<host-glob>:<path-pattern>`. Use `*` as host-glob to
+ * match any host, or a glob like `web-*` to match a subset. Path-pattern
+ * follows the same glob rules as the rest of the config.
+ *
+ * The `host:` prefix is the only way to scope an entry to remote operations;
+ * without it, the entry applies to LOCAL filesystem operations only. This
+ * avoids ambiguity where a full path like `/etc/foo` could exist on both
+ * local and remote machines.
+ */
+export function parseExemptEntry(entry: string): { hostGlob: string | null; pathPattern: string } {
+  if (entry.startsWith("host:")) {
+    const rest = entry.slice(5)
+    const colonIdx = rest.indexOf(":")
+    if (colonIdx === -1) {
+      // Malformed (no second colon) — treat the remainder as a path with no host scope
+      return { hostGlob: null, pathPattern: rest }
+    }
+    return { hostGlob: rest.slice(0, colonIdx), pathPattern: rest.slice(colonIdx + 1) }
+  }
+  return { hostGlob: null, pathPattern: entry }
+}
+
+/**
+ * Check if a host name matches a host glob from a `host:`-prefixed entry.
+ * `*` matches any host; otherwise standard glob matching applies.
+ */
+function matchHost(host: string, hostGlob: string): boolean {
+  if (hostGlob === "*") return true
+  return matchGlob(host, hostGlob)
+}
+
+/**
+ * Check if a file path is in the redaction exemption list.
+ *
+ * Exempt paths skip secret redaction in tool inputs (write/edit content)
+ * and tool outputs (read results), so users can keep legitimate API keys
+ * in source code without Warden rewriting them to `[REDACTED]`.
+ *
+ * IMPORTANT — this does NOT bypass:
+ *   - File path blocking (blockedFilePaths / writeProtectedPaths)
+ *   - LLM safety evaluation
+ *   - Audit logging
+ * It only skips the in-place redaction of detected secrets.
+ *
+ * Host scoping (see parseExemptEntry):
+ *   - When `options.host` is provided (remote operation), only `host:`-prefixed
+ *     entries whose host glob matches are considered.
+ *   - When `options.host` is absent (local operation), only plain entries are
+ *     considered.
+ */
+export function isRedactionExempt(
+  filePath: string,
+  exemptPatterns: string[],
+  options?: { cwd?: string; host?: string },
+): boolean {
+  if (exemptPatterns.length === 0) return false
+
+  const cwd = options?.cwd
+  const host = options?.host
+
+  if (host) {
+    // Remote operation — only host-scoped entries apply
+    for (const entry of exemptPatterns) {
+      const { hostGlob, pathPattern } = parseExemptEntry(entry)
+      if (hostGlob === null) continue // local entry, skip
+      if (!matchHost(host, hostGlob)) continue
+      if (matchGlob(filePath, pathPattern)) return true
+    }
+    return false
+  }
+
+  // Local operation — only plain (non-host) entries apply
+  const candidates = new Set<string>([
+    ...getPathCandidates(filePath, "read", cwd),
+    ...getPathCandidates(filePath, "write", cwd),
+  ])
+
+  for (const entry of exemptPatterns) {
+    const { hostGlob, pathPattern } = parseExemptEntry(entry)
+    if (hostGlob !== null) continue // remote entry, skip
+    for (const candidate of candidates) {
+      if (matchGlob(candidate, pathPattern)) {
+        return true
+      }
+    }
+  }
+
+  return false
+}
+
+/**
  * Simple glob matching supporting *, **, and ? wildcards.
  */
 export function matchGlob(path: string, pattern: string): boolean {
@@ -413,11 +510,14 @@ export function extractFilePath(
  * - SCP/rsync/rclone upload (local→remote): remote destination is a WRITE.
  * - SCP/rsync/rclone download (remote→local): remote source is a READ.
  * - SSH inner-command file references: READS (inner writes are the LLM's job).
+ *
+ * `host` is included per entry so callers can match host-scoped exemption
+ * patterns (entries prefixed with `host:` in redactionExemptPaths).
  */
 export function extractRemoteFilePathsFromArgs(
   tool: string,
   args: Record<string, unknown>,
-): { path: string; mode: "read" | "write" }[] {
+): { host: string; path: string; mode: "read" | "write" }[] {
   if (tool !== "bash") return []
 
   const command = args.command as string | undefined
@@ -459,9 +559,10 @@ export function isDynamicPathTarget(p: string): boolean {
 
 /**
  * Extract file paths that a bash command reads or writes via shell redirection,
- * `tee`, `truncate`, or `dd of=`. Used to enforce the blockedFilePaths and
- * writeProtectedPaths lists against bash commands — not just read/write/edit
- * tool calls.
+ * `tee`, `truncate`, `dd of=`, or common read commands (`cat`/`head`/`tail`/
+ * `less`/`more`). Used to enforce the blockedFilePaths and writeProtectedPaths
+ * lists against bash commands — not just read/write/edit tool calls — and to
+ * apply per-path redaction exemptions to bash operations.
  *
  * Without this, an agent could bypass the file blocklist by writing via shell
  * redirection (e.g. `echo '...' >> ~/.ssh/authorized_keys`, `truncate -s 0 /var/log/syslog`).
@@ -474,10 +575,12 @@ export function isDynamicPathTarget(p: string): boolean {
  *
  * READ targets (checked against blockedFilePaths only):
  *  - Input redirect:          < file
+ *  - Read commands:           cat/head/tail/less/more file [file2 ...]
  *
  * Skips: fd-duplication (2>&1, <&3), fd-close (>&-), heredocs (<<), /dev/null,
  * and pure-numeric tokens. Quoting and glued redirection operators are handled
- * by the tokenizer.
+ * by the tokenizer. Read-command parsing inside SSH inner commands is handled
+ * separately by extractRemoteFilePathsFromArgs (which preserves host info).
  */
 export function extractBashFileTargets(command: string): {
   reads: string[]
@@ -602,6 +705,34 @@ export function extractBashFileTargets(command: string): {
     if (tok.startsWith("of=")) {
       const target = tok.slice(3)
       if (isRealRedirectTarget(target)) writes.push(target)
+      continue
+    }
+
+    // Common read commands: cat/head/tail/less/more <file>...
+    // The first non-flag operand(s) are file paths. We only grab the first
+    // one per command — for the purposes of redaction exemption we just need
+    // to know "is any read target exempt?". Multiple operands get checked
+    // individually as the loop visits each.
+    if (tok === "cat" || tok === "head" || tok === "tail" || tok === "less" || tok === "more") {
+      let j = i + 1
+      let optsEnded = false
+      while (j < tokens.length) {
+        const t = tokens[j]
+        if (t === "|" || t === ";" || t === "&&" || t === "||") break
+        if (!optsEnded && t === "--") {
+          optsEnded = true
+          j++
+          continue
+        }
+        if (!optsEnded && t.startsWith("-")) {
+          // Flags like -n, -A, -F may take a value (e.g., head -n 5 file).
+          // For simplicity we skip a single value-like token after numeric/string flags.
+          j++
+          continue
+        }
+        if (isRealRedirectTarget(t)) reads.push(t)
+        j++
+      }
       continue
     }
   }

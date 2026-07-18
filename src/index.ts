@@ -10,6 +10,7 @@ import { createOutputRedactor } from "./hooks/output-redactor.js"
 import { createPermissionHandler } from "./hooks/permission-handler.js"
 import { createEnvSanitizer } from "./hooks/env-sanitizer.js"
 import { createCompactionContext } from "./hooks/compaction-context.js"
+import { createPromptSanitizer } from "./hooks/prompt-sanitizer.js"
 import { buildSecurityPolicyContext } from "./hooks/security-policy.js"
 import { createSecurityDashboardTool } from "./tools/security-dashboard.js"
 import { createSecurityReportTool } from "./tools/security-report.js"
@@ -242,6 +243,15 @@ export const Warden: Plugin = async ({ client: sdkClient, directory }) => {
 
   const compactionContext = createCompactionContext({ config, diagnosticLogger })
 
+  const promptSanitizer = createPromptSanitizer({
+    engine,
+    config,
+    auditLogger,
+    client,
+    diagnosticLogger,
+    getSessionState,
+  })
+
   const permissionHandler = createPermissionHandler({
     config,
     client,
@@ -348,6 +358,7 @@ export const Warden: Plugin = async ({ client: sdkClient, directory }) => {
     "permission.ask": permissionHandler,
     "shell.env": envSanitizer,
     "experimental.session.compacting": compactionContext,
+    "chat.message": promptSanitizer,
 
     event: async ({ event }) => {
       if (event.type === "session.created") {

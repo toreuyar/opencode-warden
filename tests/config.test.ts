@@ -44,6 +44,70 @@ describe("Configuration", () => {
     expect(DEFAULT_CONFIG.writeProtectedPaths).toContain("**/var/log/**")
   })
 
+  test("default config has empty redactionExemptPaths", () => {
+    expect(Array.isArray(DEFAULT_CONFIG.redactionExemptPaths)).toBe(true)
+    expect(DEFAULT_CONFIG.redactionExemptPaths).toEqual([])
+  })
+
+  test("redactOnWrite defaults to true", () => {
+    expect(DEFAULT_CONFIG.redactOnWrite).toBe(true)
+  })
+
+  test("redactionEnabled defaults to true", () => {
+    expect(DEFAULT_CONFIG.redactionEnabled).toBe(true)
+  })
+
+  test("scanUserPrompts defaults to false (opt-in)", () => {
+    expect(DEFAULT_CONFIG.scanUserPrompts).toBe(false)
+  })
+
+  test("Zod schema accepts redactionExemptPaths", () => {
+    const result = securityGuardConfigSchema.safeParse({
+      redactionExemptPaths: ["src/config.ts", "**/secrets.json"],
+    })
+    expect(result.success).toBe(true)
+    if (result.success) {
+      expect(result.data.redactionExemptPaths).toEqual([
+        "src/config.ts",
+        "**/secrets.json",
+      ])
+    }
+  })
+
+  test("Zod schema rejects non-array redactionExemptPaths", () => {
+    const result = securityGuardConfigSchema.safeParse({
+      redactionExemptPaths: "src/config.ts",
+    })
+    expect(result.success).toBe(false)
+  })
+
+  test("Zod schema accepts redactOnWrite boolean", () => {
+    expect(securityGuardConfigSchema.safeParse({ redactOnWrite: false }).success).toBe(true)
+    expect(securityGuardConfigSchema.safeParse({ redactOnWrite: true }).success).toBe(true)
+  })
+
+  test("Zod schema rejects non-boolean redactOnWrite", () => {
+    expect(securityGuardConfigSchema.safeParse({ redactOnWrite: "yes" }).success).toBe(false)
+  })
+
+  test("Zod schema accepts redactionEnabled boolean", () => {
+    expect(securityGuardConfigSchema.safeParse({ redactionEnabled: false }).success).toBe(true)
+    expect(securityGuardConfigSchema.safeParse({ redactionEnabled: true }).success).toBe(true)
+  })
+
+  test("Zod schema rejects non-boolean redactionEnabled", () => {
+    expect(securityGuardConfigSchema.safeParse({ redactionEnabled: "off" }).success).toBe(false)
+  })
+
+  test("Zod schema accepts scanUserPrompts boolean", () => {
+    expect(securityGuardConfigSchema.safeParse({ scanUserPrompts: true }).success).toBe(true)
+    expect(securityGuardConfigSchema.safeParse({ scanUserPrompts: false }).success).toBe(true)
+  })
+
+  test("Zod schema rejects non-boolean scanUserPrompts", () => {
+    expect(securityGuardConfigSchema.safeParse({ scanUserPrompts: "yes" }).success).toBe(false)
+  })
+
   test("blockedFilePaths and writeProtectedPaths are separate lists", () => {
     // A path can be in writeProtected but NOT in blocked (readable, not writable)
     expect(DEFAULT_CONFIG.writeProtectedPaths).toContain("**/var/log/**")

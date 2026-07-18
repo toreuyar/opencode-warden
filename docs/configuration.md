@@ -31,8 +31,13 @@ Warden loads configuration from three layers, each deep-merging into the previou
 | `blockedFilePaths` | `string[]` | See [defaults](#default-blocked-file-paths) | Glob patterns of files to block **both read and write** (secrets, keys, credentials) |
 | `writeProtectedPaths` | `string[]` | `["**/var/log/**"]` | Glob patterns of files that may be **read but not written** (logs, state files). Closes the anti-forensics hole (log truncation) deterministically. Write attempts via `write`/`edit` tools and shell redirections (`>`, `>>`, `tee`, `truncate`, `dd of=`) are blocked. |
 | `excludedTools` | `string[]` | `["glob", "list"]` | Tools to skip entirely (no scanning, no blocking) |
+| `blockedTools` | `string[]` | `[]` | Tools to block entirely (always throws when called) |
 | `sshOnlyMode` | `boolean` | `false` | Only monitor remote commands (ssh, scp, sftp, rsync, rclone) — bypass all local operations |
 | `notifications` | `boolean` | `true` | Show toast notifications in the TUI |
+| `redactionEnabled` | `boolean` | `true` | **Master kill switch** for in-place secret redaction. When `false`, Warden skips deepScan on tool inputs AND regex+LLM redaction on tool outputs for **all** tools. File blocking, write-protection, LLM safety evaluation, env-var stripping, and audit logging remain enabled. Overrides `redactOnWrite` and `redactionExemptPaths` (both become no-ops). |
+| `redactOnWrite` | `boolean` | `true` | When `false`, secret redaction is skipped for `write`/`edit`/`patch` tool inputs only. The file content is written as-is. Useful for projects that embed real API keys in source code and accept the trade-off. Ignored when `redactionEnabled: false`. |
+| `scanUserPrompts` | `boolean` | `false` *(opt-in)* | When `true`, incoming user prompts (and subtask prompts) are scanned via OpenCode's `chat.message` hook before they reach the LLM. If a detected secret is found, message creation is **blocked** (the prompt never persists and never reaches the model). Default is `false` because the OpenCode TUI surfaces a generic `"Session error"` toast on blocked prompts — enable only if you accept that UX trade-off. See [User Prompt Scanning](#user-prompt-scanning). Ignored when `redactionEnabled: false`. |
+| `redactionExemptPaths` | `string[]` | `[]` | Glob patterns of files where secret redaction is skipped for tool inputs (`write`/`edit`/`patch`, bash redirections, SSH/SCP/rsync/rclone uploads) and tool outputs (`read`, bash `cat`/`head`/`tail`, remote downloads). Supports directory globs (e.g. `src/config/**`) and host-scoped entries (e.g. `host:web-*:/etc/myapp/**` for remote-only exemption). File blocking, write-protection, and LLM safety evaluation still apply. Each exemption is recorded in the audit log. Ignored when `redactionEnabled: false`. See [host-scoped syntax](#host-scoped-exempt-paths) below. |
 
 ### `audit` — Audit Logging
 
@@ -233,6 +238,27 @@ This example shows **every available option** with explanatory comments. In prac
     "**/var/log/**"
   ],
 
+  // Files where secret redaction is SKIPPED for write/edit/patch inputs
+  // and read outputs. Use this when your source code legitimately contains
+  // API keys (client libraries, config templates, test fixtures).
+  // File blocking, write-protection, and LLM safety evaluation still apply —
+  // only in-place secret redaction is skipped. Each exemption is logged.
+  "redactionExemptPaths": [
+    "src/config.ts",
+    "**/secrets.example.json"
+  ],
+
+  // ── Secret Redaction Switches ──
+  // Master kill switch. When false, ALL in-place secret redaction is skipped
+  // (input deepScan + output regex + LLM sanitizer for every tool).
+  // File blocking, write-protection, env stripping, and LLM safety eval
+  // remain enabled. Overrides the two knobs below.
+  "redactionEnabled": true,
+
+  // When false, skip redaction on write/edit/patch tool inputs only.
+  // Useful for projects that embed real API keys throughout source code.
+  "redactOnWrite": true,
+
   // ── Tool Control ──
   // Tools to skip entirely (no scanning, no blocking)
   "excludedTools": ["glob", "list"],
@@ -339,6 +365,68 @@ This example shows **every available option** with explanatory comments. In prac
 
 > **Note**: JSON does not support comments. The `jsonc` format above is for documentation purposes. Remove all comments before using in a real config file.
 
+## Host-Scoped Exempt Paths
+
+By default, entries in `redactionExemptPaths` apply only to **local** filesystem operations. To skip redaction on **remote** operations (SSH/SCP/rsync/rclone), prefix the entry with `host:`:
+
+| Entry form | Scope | Example |
+|---|---|---|
+| `path` or `glob` | LOCAL filesystem only | `src/config.ts`, `**/secrets.json` |
+| `host:*:path` | Any remote host | `host:*:/etc/myapp/config.conf` |
+| `host:<glob>:path` | Remote hosts matching the host glob | `host:web-*:/var/app/**` |
+| `host:<exact>:path` | One specific host | `host:prod-01.example.com:/etc/specific.conf` |
+
+```json
+{
+  "redactionExemptPaths": [
+    "src/config.ts",                                   // local only
+    "**/fixtures/*.json",                              // local only
+    "host:web-*:/etc/myapp/**",                        // any host matching web-*
+    "host:prod-01.example.com:/var/secrets.conf"       // one specific host
+  ]
+}
+```
+
+**Why scoping?** A full path like `/etc/myapp/config.conf` could exist on both your local machine and a remote server, with different contents. Without the `host:` prefix, the entry would silently fail to apply to remote operations (or worse, you'd think it did). The `host:` prefix makes the intent explicit and avoids ambiguity.
+
+**How Warden knows the host:** When you run `ssh user@web-01 "cat /etc/foo"`, the parser extracts `host: "web-01"`. The same applies to `scp`, `rsync`, `rclone`. The user portion (`user@`) is ignored for matching — only the host glob is checked.
+
+**Mixed configs:** You can freely mix local and `host:` entries in the same `redactionExemptPaths` array. Local entries apply to local ops; `host:` entries apply to remote ops. There is no overlap.
+
+## User Prompt Scanning
+
+**Opt-in feature** — set `scanUserPrompts: true` to enable. Disabled by default because of UX limitations explained below.
+
+When enabled, Warden scans every incoming user prompt (and subtask prompt) via OpenCode's `chat.message` hook before it reaches the LLM. If a detected secret is found:
+
+- The message is **blocked** — the prompt is never persisted to session storage and never sent to the model
+- A `Session.Event.Error` is published with Warden's reason (visible in audit logs)
+- The TUI shows a generic `"Session error"` toast (this is an OpenCode limitation — see [Blocking UX](#blocking-ux) below)
+- The session remains usable — subsequent prompts work normally
+
+This is the earliest interception point in the Warden pipeline. It runs **before** `tool.execute.before` because it fires before any tool call exists.
+
+The master switch `redactionEnabled` (default `true`) gates this feature too: when `false`, prompt scanning is skipped regardless of `scanUserPrompts`.
+
+```json
+{
+  "scanUserPrompts": true
+}
+```
+
+### Blocking UX
+
+When Warden blocks a prompt by throwing, the OpenCode TUI surfaces a generic `"Session error"` toast regardless of the error message. **The detailed reason (which secret pattern was detected, count, etc.) is preserved in the audit log but not in the toast.**
+
+This is an upstream UX limitation in OpenCode's `notifications.ts` plugin — it hardcodes `"Session error"` for unrecognized error types. To see why a prompt was blocked:
+
+1. Run the `security_report` tool (asks Warden for a session summary), or
+2. Inspect `.opencode/warden/audit.log` directly (look for entries with `hook: "chat.message"` and `blocked: true`)
+
+The audit entry's `blockReason` field contains the full pattern list and category breakdown.
+
+This UX limitation is why the feature ships **opt-in** — users who enable it accept the trade-off (stronger security, less friendly blocking feedback) in exchange for the extra defense layer.
+
 ## Minimal Configurations
 
 **Regex-only mode** (no LLM, zero setup):
@@ -404,6 +492,45 @@ When enabled, only commands involving remote machines are monitored:
 - All local file reads, edits, and other tool calls bypass security entirely
 - Environment variable sanitization is skipped
 - Only `ssh`, `scp`, `sftp`, `rsync`, and `rclone` command outputs are scanned and redacted
+
+**Keeping legitimate API keys in source code** (e.g., a client library, config template, or test fixture):
+
+```json
+{
+  "redactionExemptPaths": [
+    "src/openrouter-client.ts",
+    "**/fixtures/*.json"
+  ]
+}
+```
+
+Warden will not rewrite detected secrets to `[REDACTED]` when the agent writes to or reads from these paths. Coverage includes:
+- `write`/`edit`/`patch` tool inputs
+- `read` tool outputs
+- Bash redirections (`>`, `>>`, `tee`, `truncate`) and reads (`cat`, `head`, `tail`) on matching paths
+- SSH/SCP/rsync/rclone uploads and downloads on matching hosts (use `host:` prefix — see [Host-Scoped Exempt Paths](#host-scoped-exempt-paths))
+
+File blocking (`blockedFilePaths`), write-protection (`writeProtectedPaths`), and LLM safety evaluation still apply — only secret redaction is skipped. Every exemption is recorded in the audit log for transparency.
+
+**Embedding real API keys throughout source code** (e.g., a personal project where you accept the trade-off):
+
+```json
+{
+  "redactOnWrite": false
+}
+```
+
+Skips redaction on `write`/`edit`/`patch` inputs only — bash commands and read outputs are still redacted. Prefer `redactionExemptPaths` for scoped exemptions; this flag is the broader hammer.
+
+**Disable all secret redaction entirely** (debugging, or you've decided other layers are enough):
+
+```json
+{
+  "redactionEnabled": false
+}
+```
+
+Skips input deepScan AND output regex+LLM redaction for **every** tool. File blocking, write-protection, env-var stripping, LLM safety evaluation, and audit logging remain enabled. `redactOnWrite` and `redactionExemptPaths` become no-ops when this is `false`.
 
 **SSH-only mode with LLM safety** (monitor remote operations + LLM risk evaluation):
 

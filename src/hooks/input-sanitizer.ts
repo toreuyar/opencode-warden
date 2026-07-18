@@ -10,7 +10,7 @@ import type {
   PatternCategory,
   WrittenFileMetadata,
 } from "../types.js"
-import { isAllowlisted, isPathBlockedForMode, extractFilePath, extractRemoteFilePathsFromArgs, extractBashFileTargets, isDynamicPathTarget } from "../utils/paths.js"
+import { isAllowlisted, isPathBlockedForMode, isRedactionExempt, extractFilePath, extractRemoteFilePathsFromArgs, extractBashFileTargets, isDynamicPathTarget } from "../utils/paths.js"
 import { deepScan } from "../utils/deep-scan.js"
 import {
   extractExecutedFilePaths,
@@ -310,30 +310,78 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
       }
     }
 
-    // Step 2: Regex pass — deep-scan all args and redact in-place
-    const scanResult = deepScan(output.args, engine)
-    let totalDetections = scanResult.totalMatches
-    diagnosticLogger?.step("input-sanitizer", `Regex scan: ${totalDetections} detections`)
+    // Step 2: Regex pass — deep-scan all args and redact in-place.
+    // Skipped when ANY of these apply:
+    //   - redactionEnabled is false (global kill switch for ALL tools)
+    //   - redactOnWrite is false AND this is a write/edit/patch tool
+    //   - the write target matches redactionExemptPaths (write/edit/patch tool,
+    //     local bash redirection/tee/truncate/dd target, or remote upload via
+    //     SSH/SCP/rsync/rclone)
+    // File blocking and LLM safety eval still apply — only secret redaction is skipped.
+    const isWriteTool = input.tool === "write" || input.tool === "edit" || input.tool === "patch"
+    const allDisabled = !config.redactionEnabled
+    const writeDisabled = isWriteTool && !config.redactOnWrite
 
-    if (scanResult.totalMatches > 0) {
-      // Apply redacted args back
-      Object.assign(output.args, scanResult.value as Record<string, unknown>)
-
-      // Track detections by category
-      const categoryMap = new Map<PatternCategory, number>()
-      for (const match of scanResult.allMatches) {
-        categoryMap.set(
-          match.category,
-          (categoryMap.get(match.category) || 0) + 1,
-        )
+    // Collect all write targets this call touches (write tool, bash redirections,
+    // remote uploads). Used for per-path exemption check.
+    const writeTargets: Array<{ path: string; host?: string }> = []
+    if (isWriteTool && typeof filePath === "string") {
+      writeTargets.push({ path: filePath })
+    }
+    if (input.tool === "bash" && typeof output.args.command === "string") {
+      for (const w of extractBashFileTargets(output.args.command as string).writes) {
+        writeTargets.push({ path: w })
       }
-      for (const [cat, count] of categoryMap) {
-        sessionStats.recordDetection(
-          input.tool,
-          cat,
-          count,
-          `Redacted ${count} secret(s) in input args`,
-        )
+      for (const { host, path, mode } of extractRemoteFilePathsFromArgs(input.tool, output.args)) {
+        if (mode === "write") writeTargets.push({ path, host })
+      }
+    }
+
+    const exemptedTarget = writeTargets.find((t) =>
+      isRedactionExempt(t.path, config.redactionExemptPaths, { cwd: projectDir, host: t.host }),
+    )
+    const pathExempt = !!exemptedTarget
+    const redactionExempt = allDisabled || writeDisabled || pathExempt
+
+    let totalDetections = 0
+    let scanResult: { value: unknown; totalMatches: number; allMatches: import("../types.js").DetectionMatch[] }
+
+    if (redactionExempt) {
+      const reason = allDisabled
+        ? "Redaction disabled (redactionEnabled=false)"
+        : writeDisabled
+          ? "Redaction disabled (redactOnWrite=false)"
+          : exemptedTarget!.host
+            ? `Redaction exempt (path matches redactionExemptPaths): [${exemptedTarget!.host}]${exemptedTarget!.path}`
+            : `Redaction exempt (path matches redactionExemptPaths): ${exemptedTarget!.path}`
+      debugLog?.(`Input hook: tool=${input.tool} → ${reason}`)
+      diagnosticLogger?.decision("input-sanitizer", input.tool, reason)
+      scanResult = { value: output.args, totalMatches: 0, allMatches: [] }
+    } else {
+      scanResult = deepScan(output.args, engine)
+      totalDetections = scanResult.totalMatches
+      diagnosticLogger?.step("input-sanitizer", `Regex scan: ${totalDetections} detections`)
+
+      if (scanResult.totalMatches > 0) {
+        // Apply redacted args back
+        Object.assign(output.args, scanResult.value as Record<string, unknown>)
+
+        // Track detections by category
+        const categoryMap = new Map<PatternCategory, number>()
+        for (const match of scanResult.allMatches) {
+          categoryMap.set(
+            match.category,
+            (categoryMap.get(match.category) || 0) + 1,
+          )
+        }
+        for (const [cat, count] of categoryMap) {
+          sessionStats.recordDetection(
+            input.tool,
+            cat,
+            count,
+            `Redacted ${count} secret(s) in input args`,
+          )
+        }
       }
     }
 
@@ -679,6 +727,15 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
         confidence: m.confidence,
       })),
       blocked: false,
+      blockReason: redactionExempt
+        ? allDisabled
+          ? "Redaction disabled (redactionEnabled=false)"
+          : writeDisabled
+            ? "Redaction disabled (redactOnWrite=false)"
+            : exemptedTarget!.host
+              ? `Redaction exempt (path matches redactionExemptPaths): [${exemptedTarget!.host}]${exemptedTarget!.path}`
+              : `Redaction exempt (path matches redactionExemptPaths): ${exemptedTarget!.path}`
+        : undefined,
       redactedCount: totalDetections,
       safetyEvaluation: safetyResult ?? undefined,
     })

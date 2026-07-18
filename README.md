@@ -18,10 +18,13 @@
 ## Features
 
 - **74 built-in detection patterns** across 11 categories — API keys, credentials, private keys, PII, cloud provider secrets, Docker, Kubernetes, and more
+- **Optional user prompt scanning** — opt-in via `scanUserPrompts: true`. When enabled, incoming chat messages are scanned before they reach the LLM; prompts containing detected secrets are blocked and never persisted to the session history. Disabled by default due to upstream TUI limitations on how blocked prompts are surfaced.
 - **LLM-powered safety evaluation** across 10 risk dimensions (exfiltration, destruction, privilege escalation, and more)
 - **LLM-enhanced output sanitization** — catches context-dependent secrets that regex alone misses
 - **File path blocking** with glob patterns — prevents access to `.env`, `*.pem`, `*.key`, kubeconfig, tfstate, and other sensitive files
 - **Write-protection** for read-only-but-never-modified files (logs, state) — read allowed, writes blocked deterministically including via shell redirections (`>`, `>>`, `tee`, `truncate`)
+- **Per-path redaction exemptions** — keep legitimate API keys in source code (client libraries, config templates) without Warden rewriting them to `[REDACTED]`. Covers `write`/`edit`/`patch`, `read`, bash redirections/reads, and SSH/SCP/rsync/rclone operations. Supports host-scoped entries (e.g. `host:web-*:/etc/myapp/**`) for remote-only exemptions
+- **Configurable redaction scope** — disable write-time redaction (`redactOnWrite`), or kill all redaction globally (`redactionEnabled`), without losing file blocking or safety evaluation
 - **Environment variable sanitization** — strips secrets from the shell environment before they reach tool calls
 - **SSH-only mode** — monitor only remote commands (ssh, scp, sftp, rsync, rclone) while bypassing all local operations
 - **7 built-in tools** — dashboard, reports, audit queries, dry-run evaluation, config view, and rule management

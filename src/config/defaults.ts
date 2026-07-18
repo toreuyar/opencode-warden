@@ -45,6 +45,11 @@ export const DEFAULT_CONFIG: SecurityGuardConfig = {
     "**/.my.cnf",
     "**/authorized_keys",
     "**/known_hosts",
+    // Warden config files contain LLM API keys, custom patterns, and the
+    // security posture of the project. The agent must not read or modify
+    // them directly — use the `security_config` / `security_rules` tools,
+    // which provide controlled, read-only or session-scoped access.
+    "**/opencode-warden.json",
   ],
   writeProtectedPaths: [
     // Readable for diagnostics, but never writable by the agent.
@@ -52,10 +57,14 @@ export const DEFAULT_CONFIG: SecurityGuardConfig = {
     // instead of relying on the LLM safety evaluator.
     "**/var/log/**",
   ],
+  redactOnWrite: true,
+  redactionExemptPaths: [],
   excludedTools: ["list"],
   blockedTools: [],
   sshOnlyMode: false,
   notifications: true,
+  redactionEnabled: true,
+  scanUserPrompts: false,
   audit: {
     enabled: true,
     filePath: ".opencode/warden/audit.log",

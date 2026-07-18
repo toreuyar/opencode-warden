@@ -18,7 +18,7 @@ import {
   isPipedCommandSafe,
   matchesCommandPrefix,
 } from "../utils/command-patterns.js"
-import { isBlockedPath } from "../utils/paths.js"
+import { isBlockedPath, isRedactionExempt, extractBashFileTargets, extractRemoteFilePathsFromArgs } from "../utils/paths.js"
 import { isRemoteCommand } from "../utils/ssh.js"
 
 interface OutputRedactorDeps {
@@ -210,11 +210,62 @@ export function createOutputRedactor(deps: OutputRedactorDeps) {
       }
     }
 
+    // Redaction exemption: skip regex + LLM redaction when reading from an
+    // exempt path so users can read back source files that legitimately contain
+    // API keys. File blocking has already run in input-sanitizer; this only
+    // skips secret redaction.
+    //
+    // Covers:
+    //   - `read` tool reading a local exempt path
+    //   - bash reading a local exempt path via `cat`/`head`/`tail`/`<`
+    //   - bash downloading from a remote exempt path via SSH/SCP/rsync/rclone
+    //
+    // Also short-circuited when redactionEnabled is false (global kill switch).
+    const redactionGloballyDisabled = !config.redactionEnabled
+    const readFilePath =
+      input.tool === "read" && input.args && typeof input.args.filePath === "string"
+        ? (input.args.filePath as string)
+        : undefined
+
+    // Collect all read targets this call touches, then check exemption.
+    const readTargets: Array<{ path: string; host?: string }> = []
+    if (typeof readFilePath === "string") {
+      readTargets.push({ path: readFilePath })
+    }
+    if (input.tool === "bash" && input.args && typeof input.args.command === "string") {
+      for (const r of extractBashFileTargets(input.args.command as string).reads) {
+        readTargets.push({ path: r })
+      }
+      for (const { host, path, mode } of extractRemoteFilePathsFromArgs(input.tool, input.args)) {
+        if (mode === "read") readTargets.push({ path, host })
+      }
+    }
+
+    const exemptedTarget = readTargets.find((t) =>
+      isRedactionExempt(t.path, config.redactionExemptPaths, { cwd: projectDir, host: t.host }),
+    )
+    const pathExempt = !!exemptedTarget
+    const redactionExempt = redactionGloballyDisabled || pathExempt
+
+    if (redactionExempt) {
+      const reason = redactionGloballyDisabled
+        ? "Redaction disabled (redactionEnabled=false)"
+        : exemptedTarget!.host
+          ? `Redaction exempt (path matches redactionExemptPaths): [${exemptedTarget!.host}]${exemptedTarget!.path}`
+          : `Redaction exempt (path matches redactionExemptPaths): ${exemptedTarget!.path}`
+      debugLog?.(`Output hook: tool=${input.tool} → ${reason}`)
+      diagnosticLogger?.decision("output-redactor", input.tool, reason)
+    }
+
     let totalDetections = 0
     const allDetectionCategories: PatternCategory[] = []
 
-    // Pass 1: Regex detection (fast, deterministic)
-    if (typeof output.output === "string" && output.output.length > 0) {
+    // Pass 1: Regex detection (fast, deterministic) — skipped for exempt paths
+    if (
+      !redactionExempt &&
+      typeof output.output === "string" &&
+      output.output.length > 0
+    ) {
       const result = engine.scan(output.output)
       if (result.hasDetections) {
         // In "pass" mode, don't redact — just count detections
@@ -244,8 +295,9 @@ export function createOutputRedactor(deps: OutputRedactorDeps) {
       }
     }
 
-    // Scan title too
-    if (typeof output.title === "string" && output.title.length > 0) {
+    // Scan title too — skipped for exempt paths (titles can leak filenames, but
+    // the user has explicitly marked this path as exempt)
+    if (!redactionExempt && typeof output.title === "string" && output.title.length > 0) {
       const titleResult = engine.scan(output.title)
       if (titleResult.hasDetections) {
         if (outputActionMode !== "pass") {
@@ -258,10 +310,16 @@ export function createOutputRedactor(deps: OutputRedactorDeps) {
     diagnosticLogger?.step("output-redactor", `Regex scan: ${totalDetections} detections`)
 
     // Pass 2: LLM sanitization (context-aware, catches novel patterns)
-    // Skip LLM entirely in "pass" mode — no redaction should occur
+    // Skip LLM entirely in "pass" mode — no redaction should occur.
+    // Also skip when path is redaction-exempt.
     let llmDetections = 0
     let llmBlocked = false
-    if (outputActionMode !== "pass" && llmSanitizer && llmSanitizer.shouldSanitize(input.tool)) {
+    if (
+      !redactionExempt &&
+      outputActionMode !== "pass" &&
+      llmSanitizer &&
+      llmSanitizer.shouldSanitize(input.tool)
+    ) {
       // Deterministic bypass: skip LLM entirely for commands whose output is known safe
       // Check this FIRST — bypassed commands should not be subject to size limits
       let outputBypassed = false
@@ -521,7 +579,15 @@ export function createOutputRedactor(deps: OutputRedactorDeps) {
         confidence: "high" as const,
       })),
       blocked: llmBlocked,
-      blockReason: llmBlocked ? "LLM sanitizer unreachable or failed — output blocked for safety" : undefined,
+      blockReason: llmBlocked
+        ? "LLM sanitizer unreachable or failed — output blocked for safety"
+        : redactionExempt
+          ? redactionGloballyDisabled
+            ? "Redaction disabled (redactionEnabled=false)"
+            : exemptedTarget!.host
+              ? `Redaction exempt (path matches redactionExemptPaths): [${exemptedTarget!.host}]${exemptedTarget!.path}`
+              : `Redaction exempt (path matches redactionExemptPaths): ${exemptedTarget!.path}`
+          : undefined,
       redactedCount: outputActionMode === "pass" ? 0 : regexDetections,
       llmDetections: llmDetections > 0 ? llmDetections : undefined,
     })

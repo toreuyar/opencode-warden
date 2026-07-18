@@ -1,4 +1,5 @@
 import type { SecurityGuardConfig } from "../types.js"
+import { parseExemptEntry } from "../utils/paths.js"
 
 /**
  * Build the security policy context text that explains the monitoring system
@@ -23,6 +24,51 @@ export function buildSecurityPolicyContext(config: SecurityGuardConfig): string 
     "`[REDACTED]` values are permanent. Do not reconstruct, guess, or ask the user to paste redacted content.",
   )
   lines.push("")
+
+  // Dynamic redaction switches + exempt paths — the agent can't read the config
+  // file directly (it's blocked), so we inline the values it needs to act on.
+  if (!config.redactionEnabled) {
+    lines.push("All secret redaction is currently **DISABLED** (`redactionEnabled: false`).")
+    lines.push("Tool inputs and outputs pass through unmodified — secrets are preserved everywhere.")
+    lines.push("")
+  } else {
+    if (!config.redactOnWrite) {
+      lines.push(
+        "Redaction on `write`/`edit`/`patch` inputs is **DISABLED** (`redactOnWrite: false`). Files written via these tools will preserve embedded secrets. Bash command redaction is still active.",
+      )
+      lines.push("")
+    }
+
+    // Split exempt entries into local vs host-scoped for clearer presentation
+    const localEntries: string[] = []
+    const hostEntries: Array<{ hostGlob: string; pathPattern: string }> = []
+    for (const entry of config.redactionExemptPaths) {
+      const parsed = parseExemptEntry(entry)
+      if (parsed.hostGlob === null) {
+        localEntries.push(parsed.pathPattern)
+      } else {
+        hostEntries.push({ hostGlob: parsed.hostGlob, pathPattern: parsed.pathPattern })
+      }
+    }
+
+    if (localEntries.length > 0 || hostEntries.length > 0) {
+      lines.push("#### Exempt Paths (redaction skipped)")
+      lines.push(
+        "Secrets pass through unredacted when writing to or reading from these paths — useful for source files that legitimately embed API keys (client libraries, config templates, test fixtures).",
+      )
+      lines.push("")
+      if (localEntries.length > 0) {
+        lines.push("Local (any tool, including bash redirections):")
+        for (const e of localEntries) lines.push(`- \`${e}\``)
+        lines.push("")
+      }
+      if (hostEntries.length > 0) {
+        lines.push("Remote (SSH/SCP/rsync/rclone on matching hosts):")
+        for (const e of hostEntries) lines.push(`- On host \`${e.hostGlob}\`: \`${e.pathPattern}\``)
+        lines.push("")
+      }
+    }
+  }
 
   // Blocked file patterns (only if non-empty)
   if (config.blockedFilePaths.length > 0) {

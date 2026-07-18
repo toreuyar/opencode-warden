@@ -51,6 +51,14 @@
     "**/var/log/**"
   ],
 
+  "redactionExemptPaths": [],
+
+  "redactionEnabled": true,
+
+  "redactOnWrite": true,
+
+  "scanUserPrompts": false,
+
   "excludedTools": ["glob", "list"],
 
   "notifications": true,

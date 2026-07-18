@@ -166,6 +166,21 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
 
 **When adding or modifying hooks**, follow this pattern exactly. Do not use classes for hooks.
 
+### Hook inventory
+
+Warden registers these OpenCode plugin hooks (see `src/index.ts`):
+
+| Hook | Source | Purpose |
+|---|---|---|
+| `tool.execute.before` | `input-sanitizer.ts` | File path blocking, deep-scan args, LLM safety eval |
+| `tool.execute.after` | `output-redactor.ts` | Regex + LLM redaction of tool outputs |
+| `permission.ask` | `permission-handler.ts` | LLM safety eval integrated with OpenCode permission prompts |
+| `shell.env` | `env-sanitizer.ts` | Strip sensitive env vars before bash execution |
+| `experimental.session.compacting` | `compaction-context.ts` | Inject security context into compaction prompt |
+| `chat.message` | `prompt-sanitizer.ts` | Scan user-typed prompts; **throw to block creation** before they reach the LLM or session storage. **Opt-in** — only fires when `config.scanUserPrompts: true` (default `false`). Also gated by `redactionEnabled`. |
+
+`chat.message` is unique in that **throwing aborts message creation cleanly** — the OpenCode runtime saves the message and parts only AFTER the hook returns. A throw means the user's prompt never persists and never reaches the model. The trade-off (verified in OpenCode source): the TUI surfaces a generic `"Session error"` toast regardless of the error message, so the detailed reason is only available in the audit log. This UX limitation is why the feature ships opt-in. See `packages/opencode/src/session/prompt.ts:1000` for the upstream call site.
+
 ### Shared Mutable State
 
 These objects are shared by reference across multiple hooks and reset on `session.created`:
@@ -519,6 +534,21 @@ File protection has two tiers (see `isPathBlockedForMode` in `src/utils/paths.ts
 
 - **`blockedFilePaths`** — blocks BOTH read and write (secrets, keys, credentials). Checked for every access.
 - **`writeProtectedPaths`** — blocks WRITE only; reads are allowed (logs, state files). Checked only for write operations.
+- **`redactionExemptPaths`** — does NOT block access. Skips secret redaction on matching paths across all tools: `write`/`edit`/`patch` inputs, `read` outputs, bash redirections (`>`, `>>`, `tee`, `truncate`), bash reads (`cat`/`head`/`tail`), and SSH/SCP/rsync/rclone operations (see `isRedactionExempt` in `src/utils/paths.ts`). Use case: source files that legitimately contain API keys. File blocking, write-protection, and LLM safety evaluation still apply. Supports `host:` prefix for remote-only exemption (e.g. `host:web-*:/etc/myapp/**`).
+
+### Secret Redaction Switches
+
+Three nested knobs control in-place redaction (see `input-sanitizer.ts` Step 2 and `output-redactor.ts` Pass 1+2):
+
+- **`redactionEnabled`** (default `true`) — master kill switch. When `false`, deepScan is skipped on every tool's args, and output regex+LLM redaction is skipped for every tool. File blocking, write-protection, env stripping, LLM safety eval, and audit logging remain on. Overrides the two knobs below.
+- **`redactOnWrite`** (default `true`) — when `false`, deepScan is skipped for write/edit/patch tool inputs only. Other tools (bash, read, etc.) still redact.
+- **`redactionExemptPaths`** (default `[]`) — per-path override. When a write/edit/patch target or read source matches a glob, redaction is skipped for that call only.
+
+When multiple apply, the broadest wins (`redactionEnabled=false` overrides everything). Each skipped call is logged to the audit trail with a distinct reason: `"Redaction disabled (redactionEnabled=false)"`, `"Redaction disabled (redactOnWrite=false)"`, or `"Redaction exempt (path matches redactionExemptPaths): <path>"`.
+
+### Redaction Policy Injection
+
+The active values of `redactionEnabled`, `redactOnWrite`, and `redactionExemptPaths` are inlined into the LLM's security policy context at session start (see `buildSecurityPolicyContext` in `src/hooks/security-policy.ts`). This is deliberate: the Warden config file itself is in `blockedFilePaths` by default (`**/opencode-warden.json`), so the agent cannot read the config. Inlining the values the agent needs to act on (instead of letting it discover them) preserves the security boundary while keeping the agent informed.
 
 An access is classified as read or write by the hook based on the tool and operation:
 - **Write**: `write`/`edit`/`patch` tools; bash output-redirects (`>`, `>>`, `&>`), `tee`, `truncate`, `dd of=`; SCP/rsync/rclone **upload** (remote destination).
