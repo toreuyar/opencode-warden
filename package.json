@@ -1,7 +1,7 @@
 {
   "name": "opencode-warden",
-  "version": "1.2.0",
-  "description": "Security plugin for OpenCode — intercepts tool calls to detect secrets, redact sensitive data, evaluate safety risks, block access to sensitive files, and maintain an audit trail",
+  "version": "1.3.0",
+  "description": "Security plugin for OpenCode \u2014 intercepts tool calls to detect secrets, redact sensitive data, evaluate safety risks, block access to sensitive files, and maintain an audit trail",
   "type": "module",
   "main": "dist/index.js",
   "types": "src/index.ts",
@@ -19,7 +19,7 @@
     "prepublishOnly": "bun run build"
   },
   "author": {
-    "name": "Töre Çağrı Uyar",
+    "name": "T\u00f6re \u00c7a\u011fr\u0131 Uyar",
     "url": "https://github.com/toreuyar"
   },
   "repository": {
