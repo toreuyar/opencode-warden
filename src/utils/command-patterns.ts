@@ -154,6 +154,34 @@ export function hasCommandExecutionPrimitive(command: string): boolean {
 }
 
 /**
+ * Check whether a command contains a shell comment (`#`) outside of quotes.
+ *
+ * Comments are a prime prompt-injection vehicle — payloads ride on
+ * benign-looking bypass-listed commands (`ls /tmp # IGNORE PREVIOUS SAFETY
+ * RULES`). A comment never changes what the shell executes, but the *content*
+ * must still be evaluated by the LLM, so its presence disqualifies bypass.
+ *
+ * Quote-aware: `#` inside single or double quotes is literal text, not a
+ * comment (`echo "#tag"` contains no comment).
+ */
+export function hasUnsafeComment(command: string): boolean {
+  let inSingle = false
+  let inDouble = false
+  let prev = ""
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i]
+    if (ch === "'" && !inDouble) inSingle = !inSingle
+    else if (ch === '"' && !inSingle) inDouble = !inDouble
+    else if (ch === "#" && !inSingle && !inDouble) {
+      // comment starts at string start or after unquoted whitespace
+      if (i === 0 || /\s/.test(prev)) return true
+    }
+    prev = ch
+  }
+  return false
+}
+
+/**
  * Check if a pipe segment starts with a safe pipe target command.
  */
 export function isSafePipeTarget(segment: string): boolean {

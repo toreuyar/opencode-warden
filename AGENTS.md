@@ -42,7 +42,7 @@ The plugin is loaded by the OpenCode runtime and registers **hooks** that fire a
 
 ```bash
 bun install          # Install dependencies
-bun test             # Run all tests (157 tests)
+bun test             # Run all tests
 bun run typecheck    # TypeScript type checking (tsc --noEmit)
 bun run build        # Build for distribution
 ```
@@ -88,7 +88,10 @@ src/
 │   ├── client.ts                 # HTTP client for OpenAI-compatible APIs
 │   ├── context.ts                # ConversationContext — sliding window message history
 │   ├── prompts.ts                # System prompts, templates, renderTemplate()
-│   └── safety-evaluator.ts       # SafetyEvaluator class (10-dimension risk assessment)
+│   ├── safety-evaluator.ts       # SafetyEvaluator class (10-dimension risk assessment)
+│   ├── payload-decode.ts         # Deterministic pre-decoding of encoded payloads (prompt ground truth)
+│   ├── static-findings.ts        # Credential-surface + verdict-forgery detection (bypass disqualifier)
+│   └── command-annotations.ts    # Tool-semantics annotations for tar/dc/gdb
 │
 ├── audit/
 │   ├── index.ts                  # AuditLogger — orchestrates file + app logging
@@ -104,10 +107,19 @@ src/
     ├── paths.ts                  # Glob matching, file path extraction from tool args
     └── deep-scan.ts              # Recursive object scanning for secrets
 
+scripts/
+├── llm-harness.ts                # LLM evaluation test harness (standalone CLI, see LLM_HARNESS.md)
+├── llm-harness-tests.json        # 237-test suite (generated from WARDEN_LLM_TESTS.md)
+├── llm-harness.config.example.json # Example harness config (real config is gitignored)
+├── run-full-suite.sh             # Multi-model full-suite runner
+└── LLM_HARNESS.md                # Harness documentation
+
 tests/
 ├── config.test.ts                # Config defaults + Zod schema validation
 ├── hooks.test.ts                 # Hook behavior (input, output, env, compaction)
-└── detection-patterns.test.ts    # Pattern detection across all categories
+├── detection-patterns.test.ts    # Pattern detection across all categories
+├── payload-decode.test.ts        # Payload decoder + prompt integration
+└── warden-fixes.test.ts          # Bypass-gate + ground-truth injection regressions
 ```
 
 ## Architecture at a Glance
@@ -619,7 +631,7 @@ When making changes, ensure they are consistent with what these documents descri
 Before considering any change complete:
 
 1. `bun run typecheck` — zero errors
-2. `bun test` — all 157+ tests pass
+2. `bun test` — all tests pass
 3. New code follows existing patterns (factory hooks, kebab-case files, types in `types.ts`)
 4. New features have tests
 5. Config changes appear in defaults, schema, and types

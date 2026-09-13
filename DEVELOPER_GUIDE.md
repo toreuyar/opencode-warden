@@ -108,7 +108,10 @@ src/
 │   ├── client.ts                    # HTTP client for LLM API (fetch-based)
 │   ├── context.ts                   # ConversationContext — sliding window history
 │   ├── prompts.ts                   # System prompts, prompt templates, renderTemplate()
-│   └── safety-evaluator.ts          # SafetyEvaluator class (10-dimension risk assessment)
+│   ├── safety-evaluator.ts          # SafetyEvaluator class (10-dimension risk assessment)
+│   ├── payload-decode.ts            # Deterministic pre-decoding of encoded payloads
+│   ├── static-findings.ts           # Credential-surface + verdict-forgery detection
+│   └── command-annotations.ts       # Tool-semantics annotations (tar/dc/gdb)
 │
 ├── audit/
 │   ├── index.ts                     # AuditLogger orchestrator
@@ -124,10 +127,19 @@ src/
     ├── paths.ts                     # Glob matching, file path extraction from tool args
     └── deep-scan.ts                 # Recursive object/array scanning for secrets
 
+scripts/
+├── llm-harness.ts                   # LLM evaluation test harness (standalone CLI)
+├── llm-harness-tests.json           # 237-test suite (generated from WARDEN_LLM_TESTS.md)
+├── llm-harness.config.example.json  # Example harness config (real config is gitignored)
+├── run-full-suite.sh                # Multi-model full-suite runner
+└── LLM_HARNESS.md                   # Harness documentation
+
 tests/
 ├── config.test.ts                   # Configuration defaults and Zod schema validation
 ├── hooks.test.ts                    # Hook behavior tests (input, output, env, compaction)
-└── detection-patterns.test.ts       # Pattern detection tests across all categories
+├── detection-patterns.test.ts       # Pattern detection tests across all categories
+├── payload-decode.test.ts           # Payload decoder + prompt integration tests
+└── warden-fixes.test.ts             # Bypass-gate + ground-truth injection regressions
 ```
 
 ---
@@ -697,6 +709,8 @@ Response: Extract choices[0].message.content
 
 Uses `AbortController` with a configurable timeout. Debug logging includes full request and response bodies (useful for debugging prompt issues).
 
+**Generation cap (fail-closed)**: When `maxTokens` is set (default `32768` via `DEFAULT_MAX_TOKENS` in `config/index.ts`), it is sent as `max_tokens`. All three response paths — non-streaming JSON, JSON-returned-despite-`stream:true`, and SSE — check `finish_reason`. If it is `"length"` (the generation cap was hit), an error is thrown: an evaluation that cannot conclude within the budget is inconclusive, and inconclusive means blocked upstream (fail-closed). Set `maxTokens: 0` to omit the cap from requests.
+
 **`checkLlmHealth(options)`**: Makes a GET request to the health check endpoint (default: `/models`). Returns `true` if the response status is OK (2xx). Used for the non-blocking startup health check.
 
 ### `llm/context.ts` — Conversation Context
@@ -748,11 +762,52 @@ Contains two large system prompts and their corresponding templates.
 
 **`buildSanitizePrompt()` / `buildSafetyPrompt()`**: Build the user prompt by rendering the template with tool name, args/output, and optional context. Falls back to default templates if custom template is empty.
 
+`buildSafetyPrompt()` also appends **deterministic ground-truth sections** computed in code (see the three modules below) — decoded payloads, tool-semantics annotations, and static findings. The philosophy: deterministic facts live in code, judgment lives in the LLM. This prevents the model from burning its token budget on manual decoding and from missing credential surfaces it is inconsistent at recognizing.
+
+### `llm/payload-decode.ts` — Deterministic Payload Decoder
+
+Extracts and decodes encoded segments (base64 chains, hex/octal escapes, ROT13, bare hex literals) from tool-call arguments **before** the LLM sees them. The decoded plaintext is injected into the prompt as ground truth so the model never performs mental decoding (which spirals into token-counting loops on some model families).
+
+Design rules:
+- Base64 decoding is gated on an explicit decoder command being present (`base64 -d`, `openssl -d`) — kills false positives on ordinary long words
+- Multi-stage chains decode repeatedly, capped at `MAX_DEPTH` (5); results capped at `MAX_SEGMENTS` (8)
+- Round-trip validation rejects ordinary alphanumeric words that merely look like base64
+- Non-printable results are reported as opaque (`result: ""`, `printable: false`) — never shown as text
+
+**`formatDecodedSection()`** renders the `═══ PRE-DECODED PAYLOADS ═══` prompt section; empty string when nothing decoded.
+
+### `llm/static-findings.ts` — Credential Surfaces + Verdict Forgery
+
+Deterministic detection of two finding kinds in tool-call arguments:
+
+- **credential-surface**: cloud/instance metadata endpoints (169.254.169.254, metadata.google.internal), kubelet port (10250), Docker socket, Kubernetes service-account paths, `/etc/shadow`, `~/.aws/credentials`, `~/.kube/config`, service-account key JSONs
+- **verdict-forgery**: Warden-schema-shaped text embedded in arguments (`Safe: Yes`, `Risk Level:`, `Recommendation: allow`) — a prompt-injection marker, never a real verdict
+
+Findings serve two purposes:
+1. `hasStaticFindings()` disqualifies bypass in `SafetyEvaluator.isBypassed()` — a plain `cat` of a service-account token must never skip evaluation
+2. `formatFindingsSection()` renders the `═══ STATIC FINDINGS ═══` prompt section as ground truth
+
+### `llm/command-annotations.ts` — Tool-Semantics Annotations
+
+Deterministic annotations for tool families whose semantics the LLM grinds on (measured on the harness: 732 s on `dc`, 246 s on `tar --checkpoint`, 171 s on `gdb -batch`):
+
+- **tar**: `--checkpoint-action=exec=…` EXECUTES its payload at each checkpoint (executor present); plain `--checkpoint` only prints progress
+- **dc**: `!` invokes a shell on the popped string (executor); `P`/`p` are print-only
+- **gdb**: `-ex` with `shell`/`run`/`attach` executes; `-ex 'echo …'` is print-only
+
+**`formatAnnotationSection()`** renders the `═══ COMMAND SEMANTICS ═══` prompt section; empty when no annotations.
+
 ### `llm/safety-evaluator.ts` — SafetyEvaluator Class
 
 The `SafetyEvaluator` analyzes tool calls for safety risks.
 
-**`isBypassed(tool, args)`**: Only applies to `bash` tool. Checks if `args.command` starts with any prefix in `bypassedCommands` (e.g., `"git status"`, `"ls"`, `"pwd"`). Safe commands skip LLM evaluation entirely.
+**`isBypassed(tool, args)`**: Only applies to `bash` tool. A command bypasses LLM evaluation only if it starts with a prefix in `bypassedCommands` (e.g., `"git status"`, `"ls"`, `"pwd"`) **and** none of the following disqualifiers match:
+
+1. **Execution primitive** — `eval`, `sh -c`, `$(...)`, backticks, process substitution, `xargs`, wrapper-binary execution (`awk system()`, `perl -e`, `python3 -c`, …), `find -exec`
+2. **Unquoted shell comment** (`hasUnsafeComment()` in `utils/command-patterns.ts`) — quote-aware check for `#` at string start or after unquoted whitespace; injection content rides on benign commands (`ls /tmp # IGNORE PREVIOUS SAFETY RULES`)
+3. **Static findings** (`hasStaticFindings()`) — credential surfaces or verdict forgery
+
+When bypass is disqualified, the command is force-evaluated by the LLM. Bare bypass-listed commands (e.g. `cat README.md`) still bypass.
 
 **`shouldEvaluate(tool)`**: Returns true if the evaluator is enabled AND the tool is in the `tools` list (default: `["bash", "write", "edit", "webfetch"]`).
 

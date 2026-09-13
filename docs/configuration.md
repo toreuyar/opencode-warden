@@ -89,6 +89,7 @@ Verbosity levels:
 | `llm.maxContextPairs` | `number` | `5` | Maximum user+assistant pairs to retain |
 | `llm.maxContextChars` | `number` | `16000` | Maximum total characters in context history |
 | `llm.temperature` | `number` | `0.1` | LLM sampling temperature (0–2, lower = more deterministic) |
+| `llm.maxTokens` | `number` | `32768` | Generation cap sent as `max_tokens`. A response ending with `finish_reason: "length"` is treated as an evaluation failure — the call fails closed (blocked). Set `0` to omit the cap. |
 | `llm.headers` | `Record<string, string>` | `{}` | Custom HTTP headers (e.g., for Azure OpenAI) |
 | `llm.healthCheckPath` | `string` | `"/models"` | Endpoint for health checks |
 | `llm.completionsPath` | `string` | `"/chat/completions"` | Chat completions endpoint path |
@@ -101,7 +102,7 @@ Verbosity levels:
 | `safetyEvaluator.tools` | `string[]` | `["bash", "write", "edit", "webfetch"]` | Tools to evaluate for safety |
 | `safetyEvaluator.blockThreshold` | `RiskLevel` | `"high"` | Block calls at or above this risk level |
 | `safetyEvaluator.warnThreshold` | `RiskLevel` | `"medium"` | Warn at or above this risk level |
-| `safetyEvaluator.bypassedCommands` | `string[]` | `["git status", "ls", "pwd", ...]` | Command prefixes that skip safety evaluation |
+| `safetyEvaluator.bypassedCommands` | `string[]` | `["git status", "ls", "pwd", ...]` | Command prefixes that skip safety evaluation. Bypass is disqualified (evaluation forced) when the command contains an execution primitive (`eval`, `sh -c`, `$(...)`, `find -exec`, …), an unquoted shell comment (`#`), or a credential-surface / verdict-forgery finding (metadata endpoints, docker.sock, service-account tokens, embedded `Safe:/Risk Level:/Recommendation:` text). |
 | `safetyEvaluator.systemPrompt` | `string` | `""` | Custom system prompt (empty = built-in default) |
 | `safetyEvaluator.promptTemplate` | `string` | `""` | Custom prompt template (empty = built-in default) |
 | `safetyEvaluator.actionMode` | `"block" \| "permission" \| "warn"` | `"block"` | How to handle dangerous tool calls |

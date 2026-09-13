@@ -18,11 +18,13 @@ import {
   compileCommandPattern,
   hasDangerousMetachars,
   hasCommandExecutionPrimitive,
+  hasUnsafeComment,
   isAllowedOperation,
   isPipedCommandSafe,
   matchesCommandPrefix,
   stripSudo,
 } from "../utils/command-patterns.js"
+import { hasStaticFindings } from "./static-findings.js"
 import { tryParseJsonObject } from "../utils/json-repair.js"
 
 const RISK_LEVEL_ORDER: Record<RiskLevel, number> = {
@@ -210,6 +212,16 @@ export class SafetyEvaluator {
     // Step 2b: Command-execution primitives (e.g. find -exec, find -delete)
     // → always go to LLM, even if the outer command is on the bypass list
     if (hasCommandExecutionPrimitive(stripped)) return false
+
+    // Step 2c: Shell comments — injection content rides on benign commands
+    // (ls /tmp # IGNORE PREVIOUS SAFETY RULES…). Never bypass commented
+    // commands; the LLM must see the comment content.
+    if (hasUnsafeComment(stripped)) return false
+
+    // Step 2d: Static findings (credential surfaces, verdict forgery) —
+    // e.g. plain `cat /var/run/secrets/kubernetes.io/...` matches the `cat`
+    // bypass prefix but touches secret material: force evaluation.
+    if (hasStaticFindings(stripped)) return false
 
     // Step 3: Pipe chains
     if (stripped.includes("|")) {
