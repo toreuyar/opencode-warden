@@ -1,0 +1,132 @@
+{
+  "safetyEvaluator": {
+    "blockThreshold": "high",
+    "warnThreshold": "medium"
+  },
+  "input": "scripts/llm-harness-tests.json",
+  "output": "scripts/llm-harness-results",
+  "logLevel": "info",
+  "logFile": "scripts/llm-harness.log",
+
+  "providers": {
+    "ollama-cloud": {
+      "baseUrl": "https://ollama.com/v1",
+      "apiKey": "YOUR-API-KEY",
+      "temperature": 0,
+      "timeout": 120000,
+      "completionsPath": "/chat/completions",
+      "healthCheckPath": "/models",
+      "concurrencyLimit": 1,
+      "minRequestIntervalMs": 1000,
+      "models": {
+        "gemma4-31b": { "model": "gemma4:31b" },
+        "glm-5.2": { "model": "glm-5.2" }
+      }
+    }
+  },
+
+  "_documentation": {
+
+    "_structure": "Provider is the top-level entity (baseUrl, apiKey, concurrencyLimit). Models nest under it — only specify what differs from the provider defaults.",
+
+    "_concurrencyLimit": "Maximum simultaneous in-flight requests to this provider's API. Enforced via a per-provider semaphore. Default: 1.",
+    "_minRequestIntervalMs": "Minimum milliseconds between consecutive requests to this provider. Prevents rate-limit violations. 0 = no limit. Default: 0.",
+
+    "_model_overrides": "Each model entry can override: temperature, timeout, requestParams, headers. Everything else inherits from the provider.",
+
+    "_requestParams": "Deep-merged into every LLM request body alongside model, messages, temperature. Injected via fetch interceptor — no Warden source changes.",
+
+    "_sampling_parameters": {
+      "top_p": "1.0 — nucleus sampling (float 0-1)",
+      "max_tokens": "4096 — maximum output tokens",
+      "max_completion_tokens": "4096 — newer OpenAI name (o1/o3)",
+      "frequency_penalty": "0.0 — (-2.0 to 2.0)",
+      "presence_penalty": "0.0 — (-2.0 to 2.0)",
+      "seed": "42 — deterministic sampling",
+      "top_k": "40 — (Ollama) top-K token limit",
+      "min_p": "0.05 — (Ollama) minimum probability threshold"
+    },
+
+    "_provider_examples": {
+      "ollama_local_thinking": {
+        "_comment": "Local Ollama with Qwen3 thinking enabled. No rate limit needed (local).",
+        "providers": {
+          "local": {
+            "baseUrl": "http://127.0.0.1:11434/v1", "apiKey": "", "concurrencyLimit": 1, "minRequestIntervalMs": 0,
+            "models": {
+              "qwen3-32b": { "model": "qwen3:32b", "requestParams": { "chat_template_kwargs": { "enable_thinking": true } } },
+              "deepseek-r1": { "model": "deepseek-r1:14b" }
+            }
+          }
+        }
+      },
+      "openai": {
+        "_comment": "OpenAI with o3 reasoning + GPT-4o standard.",
+        "providers": {
+          "openai": {
+            "baseUrl": "https://api.openai.com/v1", "apiKey": "sk-...", "concurrencyLimit": 3, "minRequestIntervalMs": 500,
+            "models": {
+              "gpt-4o": { "model": "gpt-4o", "requestParams": { "max_tokens": 4096 } },
+              "o3-mini": { "model": "o3-mini", "timeout": 180000, "requestParams": { "reasoning_effort": "high", "max_completion_tokens": 16384 } }
+            }
+          }
+        }
+      },
+      "anthropic_proxy": {
+        "_comment": "Claude with extended thinking via OpenAI-compatible proxy",
+        "providers": {
+          "anthropic": {
+            "baseUrl": "https://your-proxy/v1", "apiKey": "sk-ant-...", "concurrencyLimit": 2, "minRequestIntervalMs": 1000,
+            "models": {
+              "claude-sonnet": { "model": "claude-sonnet-4-20250514", "requestParams": { "thinking": { "type": "enabled", "budget_tokens": 10000 }, "max_tokens": 16000 } }
+            }
+          }
+        }
+      },
+      "deepseek": {
+        "providers": {
+          "deepseek": {
+            "baseUrl": "https://api.deepseek.com/v1", "apiKey": "sk-...", "concurrencyLimit": 2, "minRequestIntervalMs": 500,
+            "models": {
+              "reasoner": { "model": "deepseek-reasoner" },
+              "chat": { "model": "deepseek-chat" }
+            }
+          }
+        }
+      },
+      "gemini": {
+        "providers": {
+          "google": {
+            "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai", "apiKey": "AIza...", "concurrencyLimit": 3, "minRequestIntervalMs": 500,
+            "models": {
+              "flash": { "model": "gemini-2.5-flash", "requestParams": { "extra_body": { "thinkingConfig": { "thinkingBudget": 8192, "includeThoughts": true } } } }
+            }
+          }
+        }
+      },
+      "multi_provider": {
+        "_comment": "Multiple providers — each with its own concurrency + rate limits. Side-by-side mode runs across all providers simultaneously, respecting each limit independently.",
+        "providers": {
+          "ollama-cloud": { "baseUrl": "https://ollama.com/v1", "apiKey": "...", "concurrencyLimit": 1, "minRequestIntervalMs": 200,
+            "models": { "gemma": { "model": "gemma4:31b" } } },
+          "openai": { "baseUrl": "https://api.openai.com/v1", "apiKey": "sk-...", "concurrencyLimit": 3, "minRequestIntervalMs": 500,
+            "models": { "gpt4o": { "model": "gpt-4o" } } }
+        }
+      },
+      "vllm": {
+        "_comment": "vLLM local — no rate limit needed",
+        "providers": {
+          "vllm": { "baseUrl": "http://localhost:8000/v1", "apiKey": "EMPTY", "concurrencyLimit": 4, "minRequestIntervalMs": 0,
+            "models": { "llama70b": { "model": "meta-llama/Llama-3.1-70B-Instruct", "requestParams": { "top_p": 0.95 } } } }
+        }
+      },
+      "groq": {
+        "_comment": "Groq Cloud — fast inference but strict rate limits",
+        "providers": {
+          "groq": { "baseUrl": "https://api.groq.com/openai/v1", "apiKey": "gsk_...", "concurrencyLimit": 5, "minRequestIntervalMs": 200,
+            "models": { "llama330b": { "model": "llama-3.3-70b-versatile" } } }
+        }
+      }
+    }
+  }
+}

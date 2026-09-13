@@ -7,3 +7,9 @@ dist/
 .opencode/
 .playwright-mcp/
 opencode-warden.json
+
+# LLM test harness — actual config (contains API keys) and results are local-only
+scripts/llm-harness.config.json
+scripts/llm-harness-results.json
+scripts/llm-harness-results.*.json
+scripts/llm-harness.log
