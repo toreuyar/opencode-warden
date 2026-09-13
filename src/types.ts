@@ -116,6 +116,8 @@ export interface LlmEndpointConfig {
   apiKey: string
   timeout: number
   temperature: number
+  /** Generation cap sent as max_tokens; binds runaways to a finite failure (fail-closed). */
+  maxTokens?: number
   headers: Record<string, string>
   healthCheckPath: string
   completionsPath: string

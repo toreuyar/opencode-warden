@@ -67,6 +67,7 @@ const llmEndpointSchema = z.object({
   apiKey: z.string().optional(),
   timeout: z.number().positive().optional(),
   temperature: z.number().min(0).max(2).optional(),
+  maxTokens: z.number().int().min(1).optional(),
   headers: z.record(z.string()).optional(),
   healthCheckPath: z.string().optional(),
   completionsPath: z.string().optional(),

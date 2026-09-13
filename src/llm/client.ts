@@ -39,6 +39,10 @@ export interface CallLlmOptions {
   model: string
   messages: LlmMessage[]
   temperature: number
+  /** Generation cap (sent as max_tokens). finish_reason "length" → thrown
+   * error → provider chain fails closed: a command whose evaluation cannot
+   * conclude within the cap is itself the risk signal. */
+  maxTokens?: number
   timeout: number
   headers: Record<string, string>
   debugLog?: (msg: string) => void
@@ -68,10 +72,13 @@ async function callLlmNonStreaming(options: CallLlmOptions): Promise<string> {
   const url = `${options.baseUrl}${options.completionsPath}`
   const log = options.debugLog
 
-  const requestBody = {
+  const requestBody: Record<string, unknown> = {
     model: options.model,
     messages: options.messages,
     temperature: options.temperature,
+  }
+  if (options.maxTokens && options.maxTokens > 0) {
+    requestBody.max_tokens = options.maxTokens
   }
 
   log?.(`POST ${url} model=${options.model}`)
@@ -102,10 +109,18 @@ async function callLlmNonStreaming(options: CallLlmOptions): Promise<string> {
     }
 
     const data = (await resp.json()) as {
-      choices: Array<{ message: { content: string } }>
+      choices: Array<{ message: { content: string }; finish_reason?: string }>
     }
 
     log?.(`RESPONSE BODY:\n${JSON.stringify(data, null, 2)}`)
+
+    // Generation-cap hit → treat as evaluation failure (fail-closed upstream)
+    if (data.choices?.[0]?.finish_reason === "length") {
+      log?.(`POST ${url} → GENERATION CAP HIT (finish_reason=length, max_tokens=${options.maxTokens})`)
+      throw new Error(
+        `LLM generation cap exceeded (max_tokens=${options.maxTokens}) — evaluation inconclusive, failing closed`,
+      )
+    }
 
     return data.choices?.[0]?.message?.content || ""
   } catch (err) {
@@ -143,11 +158,14 @@ async function callLlmStreaming(options: CallLlmOptions): Promise<string> {
   const chatLogger = options.chatLogger!
   const componentName = options.componentName || "unknown"
 
-  const requestBody = {
+  const requestBody: Record<string, unknown> = {
     model: options.model,
     messages: options.messages,
     temperature: options.temperature,
     stream: true,
+  }
+  if (options.maxTokens && options.maxTokens > 0) {
+    requestBody.max_tokens = options.maxTokens
   }
 
   log?.(`POST ${url} model=${options.model} stream=true`)
@@ -188,7 +206,13 @@ async function callLlmStreaming(options: CallLlmOptions): Promise<string> {
     if (contentType.includes("application/json")) {
       // Server returned non-streaming JSON despite stream:true request
       const data = (await resp.json()) as {
-        choices: Array<{ message: { content: string } }>
+        choices: Array<{ message: { content: string }; finish_reason?: string }>
+      }
+      if (data.choices?.[0]?.finish_reason === "length") {
+        chatLogger.endCall(Date.now() - start)
+        throw new Error(
+          `LLM generation cap exceeded (max_tokens=${options.maxTokens}) — evaluation inconclusive, failing closed`,
+        )
       }
       const content = data.choices?.[0]?.message?.content || ""
       chatLogger.writeChunk(content)
@@ -241,6 +265,7 @@ async function readSseStream(
   const decoder = new TextDecoder()
   let buffer = ""
   let content = ""
+  let finishReason: string | undefined
 
   const processSseLine = (line: string) => {
     const trimmed = line.trim()
@@ -257,7 +282,12 @@ async function readSseStream(
               reasoning_content?: string
               reasoning?: string
             }
+            finish_reason?: string | null
           }>
+        }
+
+        if (event.choices?.[0]?.finish_reason) {
+          finishReason = event.choices[0].finish_reason || undefined
         }
 
         const delta = event.choices?.[0]?.delta
@@ -303,6 +333,13 @@ async function readSseStream(
     }
   } finally {
     reader.releaseLock()
+  }
+
+  // Generation-cap hit → evaluation failure (fail-closed upstream)
+  if (finishReason === "length") {
+    throw new Error(
+      "LLM generation cap exceeded (finish_reason=length) — evaluation inconclusive, failing closed",
+    )
   }
 
   return content

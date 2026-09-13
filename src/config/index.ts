@@ -53,8 +53,14 @@ function loadConfigFile(
   }
 }
 
-const LLM_ENDPOINT_KEYS = ['baseUrl', 'model', 'apiKey', 'timeout', 'temperature', 'headers', 'healthCheckPath', 'completionsPath'] as const
+const LLM_ENDPOINT_KEYS = ['baseUrl', 'model', 'apiKey', 'timeout', 'temperature', 'maxTokens', 'headers', 'healthCheckPath', 'completionsPath'] as const
 const LLM_COMPONENT_KEYS = ['safetyEvaluator', 'outputTriage', 'outputTextTriage', 'outputSanitizer'] as const
+
+/** Default generation cap — high enough to admit any legitimate evaluation
+ * (~45 min of pure generation on CPU inference), finite enough to convert a
+ * true runaway into a bounded failure. A command whose evaluation cannot
+ * conclude within this budget is itself the risk signal (fail-closed). */
+export const DEFAULT_MAX_TOKENS = 32768
 
 /**
  * Ensure a provider object has all required fields with safe defaults.
@@ -70,6 +76,7 @@ function normalizeProviderObj(raw: Record<string, unknown>, index: number): Reco
     apiKey: raw.apiKey || "",
     timeout: raw.timeout || 0,
     temperature: raw.temperature ?? 0,
+    maxTokens: raw.maxTokens ?? DEFAULT_MAX_TOKENS,
     headers: raw.headers || {},
     healthCheckPath: raw.healthCheckPath || "",
     completionsPath: raw.completionsPath || "",

@@ -261,16 +261,27 @@ describe("Configuration", () => {
     expect(result.success).toBe(true)
   })
 
-  test("Zod schema ignores unknown fields like maxTokens (removed)", () => {
+  test("Zod schema ignores unknown fields (stripped, not rejected)", () => {
     const result = securityGuardConfigSchema.safeParse({
       llm: {
         outputSanitizer: {
-          maxTokens: -1,
+          someFutureField: -1,
         },
       },
     })
-    // maxTokens was removed — unknown fields are stripped, not rejected
+    // unknown fields are stripped, not rejected
     expect(result.success).toBe(true)
+  })
+
+  test("maxTokens is a known field: valid values pass, invalid rejected", () => {
+    const ok = securityGuardConfigSchema.safeParse({
+      llm: { outputSanitizer: { maxTokens: 32768 } },
+    })
+    expect(ok.success).toBe(true)
+    const bad = securityGuardConfigSchema.safeParse({
+      llm: { outputSanitizer: { maxTokens: -1 } },
+    })
+    expect(bad.success).toBe(false)
   })
 
   // ─── Action Mode fields ───
