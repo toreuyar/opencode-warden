@@ -2,28 +2,23 @@ import type { SafetyEvaluator } from "../llm/safety-evaluator.js"
 import type { AuditLogger } from "../audit/index.js"
 import type { DiagnosticLogger } from "../audit/diagnostic-logger.js"
 import type {
+  PermissionDecision,
+  PermissionInput,
+  SafetyEvaluationResult,
   SecurityGuardConfig,
   PluginClient,
 } from "../types.js"
 import { isRemoteCommand } from "../utils/ssh.js"
+import { isAbsolute, resolve } from "path"
 import {
   isAllowlisted,
   isPathBlockedForMode,
-  extractFilePath,
+  extractFileTargets,
   extractRemoteFilePathsFromArgs,
 } from "../utils/paths.js"
+import { canonicalToolName, isToolInList } from "../utils/tool-compat.js"
 
-interface PermissionInput {
-  id: string
-  type: string
-  pattern?: string | Array<string>
-  sessionID: string
-  messageID: string
-  callID?: string
-  title: string
-  metadata: Record<string, unknown>
-  time: { created: number }
-}
+export type { PermissionDecision, PermissionInput } from "../types.js"
 
 interface PermissionHandlerDeps {
   config: SecurityGuardConfig
@@ -39,6 +34,28 @@ interface PermissionHandlerDeps {
     evaluatedCalls: Set<string>
     sessionAllowlist: Set<string>
   }
+}
+
+function permissionAction(input: PermissionInput): string {
+  return input.action ?? input.type ?? input.permission ?? ""
+}
+
+function permissionResources(input: PermissionInput): string[] {
+  if (Array.isArray(input.resources)) return input.resources
+  if (Array.isArray(input.patterns)) return input.patterns
+  if (Array.isArray(input.pattern)) return input.pattern
+  if (typeof input.pattern === "string") return [input.pattern]
+  return []
+}
+
+function permissionCallID(input: PermissionInput): string | undefined {
+  return input.callID ?? input.tool?.callID ?? input.tool?.id
+}
+
+function permissionTitle(input: PermissionInput, metadata: Record<string, unknown>): string {
+  if (typeof input.title === "string" && input.title.length > 0) return input.title
+  if (typeof input.message === "string" && input.message.length > 0) return input.message
+  return typeof metadata.command === "string" ? metadata.command : ""
 }
 
 export function createPermissionHandler(deps: PermissionHandlerDeps) {
@@ -73,19 +90,25 @@ export function createPermissionHandler(deps: PermissionHandlerDeps) {
 
   return async (
     input: PermissionInput,
-    output: { status: "ask" | "deny" | "allow" },
+    output: PermissionDecision,
   ) => {
     const hookStart = Date.now()
     const { safetyEvaluator, evaluatedCalls, sessionAllowlist } = getState(input.sessionID)
+    const action = permissionAction(input)
+    const canonicalAction = canonicalToolName(action)
+    const metadata = input.metadata ?? {}
+    const resources = permissionResources(input)
+    const callID = permissionCallID(input)
+    const title = permissionTitle(input, metadata)
 
-    diagnosticLogger?.hookStart("permission-handler", input.type, input.callID ?? input.id, input.sessionID, {
-      title: input.title,
+    diagnosticLogger?.hookStart("permission-handler", action, callID ?? input.id, input.sessionID, {
+      title,
       status: output.status,
     })
 
     // Entry-point log — this fires for EVERY permission.ask invocation
     debugLog?.(
-      `Permission hook INVOKED: type=${input.type} id=${input.id} callID=${input.callID ?? "none"} sessionID=${input.sessionID} status=${output.status} pattern=${JSON.stringify(input.pattern)} title="${input.title}"`,
+      `Permission hook INVOKED: action=${action} id=${input.id} callID=${callID ?? "none"} sessionID=${input.sessionID} status=${output.status} resources=${JSON.stringify(resources)} title="${title}"`,
     )
 
     const safetyActionMode = config.llm.safetyEvaluator.actionMode
@@ -93,119 +116,81 @@ export function createPermissionHandler(deps: PermissionHandlerDeps) {
     // Only act in "permission" mode
     if (safetyActionMode !== "permission") {
       debugLog?.(`Permission hook: actionMode=${safetyActionMode} → SKIPPED (not permission mode)`)
-      diagnosticLogger?.hookEnd("permission-handler", input.type, input.callID ?? input.id, Date.now() - hookStart, { outcome: "skipped", reason: `actionMode=${safetyActionMode}` })
+      diagnosticLogger?.hookEnd("permission-handler", action, callID ?? input.id, Date.now() - hookStart, { outcome: "skipped", reason: `actionMode=${safetyActionMode}` })
       return
     }
 
-    // SSH-only mode: skip non-remote commands
+    // SSH-only mode: skip non-remote commands. Alias-aware: V2 `shell` and
+    // legacy `bash` are the same policy action.
     if (config.sshOnlyMode) {
-      const toolName = input.type
-      if (toolName === "bash") {
-        const args = { ...(input.metadata || {}) } as Record<string, unknown>
-        if (!args.command && input.title) {
-          args.command = input.title
+      if (canonicalAction === "shell") {
+        const args = { ...metadata } as Record<string, unknown>
+        if (!args.command) {
+          const resourceCommand = resources.find(
+            (resource): resource is string => typeof resource === "string" && resource.length > 0,
+          )
+          if (resourceCommand) args.command = resourceCommand
+        }
+        if (!args.command && title) {
+          args.command = title
         }
         const command = typeof args.command === "string" ? args.command : ""
         if (!isRemoteCommand(command)) {
-          debugLog?.(`Permission hook: tool=${toolName} → SKIPPED (sshOnlyMode: not a remote command)`)
-          diagnosticLogger?.hookEnd("permission-handler", toolName, input.callID ?? input.id, Date.now() - hookStart, { outcome: "skipped", reason: "sshOnlyMode: not a remote command" })
+          debugLog?.(`Permission hook: action=${action} → SKIPPED (sshOnlyMode: not a remote command)`)
+          diagnosticLogger?.hookEnd("permission-handler", action, callID ?? input.id, Date.now() - hookStart, { outcome: "skipped", reason: "sshOnlyMode: not a remote command" })
           return
         }
       } else {
-        debugLog?.(`Permission hook: tool=${input.type} → SKIPPED (sshOnlyMode: non-bash tool)`)
-        diagnosticLogger?.hookEnd("permission-handler", input.type, input.callID ?? input.id, Date.now() - hookStart, { outcome: "skipped", reason: "sshOnlyMode: non-bash tool" })
+        debugLog?.(`Permission hook: action=${action} → SKIPPED (sshOnlyMode: non-shell action)`)
+        diagnosticLogger?.hookEnd("permission-handler", action, callID ?? input.id, Date.now() - hookStart, { outcome: "skipped", reason: "sshOnlyMode: non-shell action" })
         return
       }
     }
 
-    if (!safetyEvaluator) {
-      // If LLM + safety evaluator is enabled in config but evaluator is null,
-      // something went wrong — fail closed by denying
-      if (config.llm.enabled && config.llm.safetyEvaluator.enabled) {
-        debugLog?.(`Permission hook: safety evaluator is null but LLM is enabled → DENY (fail-closed)`)
-        output.status = "deny"
-
-        await auditLogger.log({
-          timestamp: new Date().toISOString(),
-          tool: input.type,
-          hook: "permission",
-          sessionId: input.sessionID,
-          callId: input.callID ?? input.id,
-          detections: [],
-          blocked: true,
-          blockReason: "Safety evaluator unavailable — fail-closed deny",
-          redactedCount: 0,
-        })
-
-        if (config.notifications) {
-          try {
-            await client.tui.showToast({
-              body: {
-                message: `🛡 Denied: Safety evaluator unavailable — blocking for safety`,
-                variant: "error" as const,
-              },
-            })
-          } catch { /* toast failure is non-critical */ }
-        }
-        return
+    // Build args from metadata and V2 permission resources for safety
+    // evaluation. For `shell`, resources are the RAW COMMAND string, never
+    // paths. For file actions, resources are relative paths.
+    const args = { ...metadata } as Record<string, unknown>
+    const resourceCommands =
+      canonicalAction === "shell"
+        ? resources.filter((resource): resource is string => typeof resource === "string" && resource.length > 0)
+        : []
+    if (canonicalAction === "shell" && typeof args.command !== "string") {
+      if (resourceCommands.length > 0) {
+        args.command = resourceCommands[0]
+      } else if (title) {
+        args.command = title
       }
-
-      debugLog?.(`Permission hook: no safety evaluator available → SKIPPED`)
-      return
+    }
+    if (resources.length > 0 && args.resources === undefined) {
+      args.resources = resources
     }
 
-    // Extract tool name from permission type
-    const toolName = input.type
-    const callID = input.callID
-
-    // Skip if tool is not in the evaluator's tool list
-    if (!safetyEvaluator.shouldEvaluate(toolName)) {
-      debugLog?.(`Permission hook: tool=${toolName} → SKIPPED (not in safety tools list)`)
-
-      await auditLogger.log({
-        timestamp: new Date().toISOString(),
-        tool: toolName,
-        hook: "permission",
-        sessionId: input.sessionID,
-        callId: callID ?? input.id,
-        detections: [],
-        blocked: false,
-        blockReason: "Tool not in safety evaluator tool list — skipped",
-        redactedCount: 0,
-      })
-
-      return
-    }
-
-    // Build args from metadata for safety evaluation
-    // For bash tools, the command may be in metadata.command or derivable from title/pattern
-    const args = { ...(input.metadata || {}) } as Record<string, unknown>
-    if (toolName === "bash" && !args.command && input.title) {
-      args.command = input.title
-    }
-
-    // ─── Deterministic checks (before LLM evaluation) ───
+    // ─── Deterministic checks (before LLM evaluation and before any
+    // evaluator-eligibility gate) ───
     // These must run before LLM safety evaluation so that deterministic
-    // blocks produce accurate messages. Without this, a call that would be
-    // blocked by file path rules instead shows "LLM unreachable" when the
-    // LLM is down — because the LLM evaluation pre-empts the deterministic
-    // checks that live in the input sanitizer.
+    // blocks produce accurate messages. They must also run before
+    // `shouldEvaluate()`: a blocked tool or file must be denied even when it
+    // is not in the evaluator's tool list, and even when the LLM is disabled.
+    // Without this, a call that would be blocked by deterministic policy
+    // depends on LLM configuration/availability to be denied.
 
-    // Check blockedTools
-    if (config.blockedTools.includes(toolName)) {
-      debugLog?.(`Permission hook: tool=${toolName} → DENIED (blockedTools)`)
-      diagnosticLogger?.decision("permission-handler", toolName, `DENIED by blockedTools policy`)
+    // Check blockedTools (alias-aware: blocked `subagent` also blocks `task`)
+    if (isToolInList(action, config.blockedTools)) {
+      debugLog?.(`Permission hook: action=${action} → DENIED (blockedTools)`)
+      diagnosticLogger?.decision("permission-handler", action, `DENIED by blockedTools policy`)
       output.status = "deny"
+      output.message = `Warden: Tool "${action}" is blocked by security policy. This tool has been disabled by the administrator.`
 
       await auditLogger.log({
         timestamp: new Date().toISOString(),
-        tool: toolName,
+        tool: action,
         hook: "permission",
         sessionId: input.sessionID,
         callId: callID ?? input.id,
         detections: [],
         blocked: true,
-        blockReason: `Tool "${toolName}" is blocked by security policy`,
+        blockReason: `Tool "${action}" is blocked by security policy`,
         redactedCount: 0,
       })
 
@@ -213,7 +198,7 @@ export function createPermissionHandler(deps: PermissionHandlerDeps) {
         try {
           await client.tui.showToast({
             body: {
-              message: `🛡 Denied: tool "${toolName}" is not allowed`,
+              message: `🛡 Denied: tool "${action}" is not allowed`,
               variant: "error" as const,
             },
           })
@@ -227,83 +212,138 @@ export function createPermissionHandler(deps: PermissionHandlerDeps) {
             noReply: true,
             parts: [{
               type: "text",
-              text: `Warden: Tool "${toolName}" is blocked by security policy. This tool has been disabled by the administrator.`,
+              text: `Warden: Tool "${action}" is blocked by security policy. This tool has been disabled by the administrator.`,
             }],
           },
         })
       } catch { /* session prompt injection is non-critical */ }
 
-      diagnosticLogger?.hookEnd("permission-handler", toolName, input.callID ?? input.id, Date.now() - hookStart, { outcome: "deny", reason: "blockedTools" })
+      diagnosticLogger?.hookEnd("permission-handler", action, callID ?? input.id, Date.now() - hookStart, { outcome: "deny", reason: "blockedTools" })
       return
     }
 
-    // Check blocked file paths (mode-aware: writes also honor writeProtectedPaths)
-    const deterministicFilePath = extractFilePath(toolName, args)
-    if (deterministicFilePath) {
-      const accessMode: "read" | "write" = ["write", "edit", "patch"].includes(toolName) ? "write" : "read"
-      if (
-        !isAllowlisted(deterministicFilePath, sessionAllowlist, projectDir) &&
-        isPathBlockedForMode(deterministicFilePath, accessMode, config.blockedFilePaths, config.writeProtectedPaths, config.whitelistedPaths, projectDir)
-      ) {
-        debugLog?.(`Permission hook: tool=${toolName} → DENIED (blocked file path (${accessMode}): ${deterministicFilePath})`)
-        diagnosticLogger?.decision("permission-handler", toolName, `DENIED file path (${accessMode}): ${deterministicFilePath}`)
-        output.status = "deny"
+    // Check every local file target (mode-aware: writes also honor
+    // writeProtectedPaths). Uses the shared multi-target extractor so V2
+    // `path`, legacy `filePath`, all patch targets including moves, and shell
+    // redirection/read targets are covered. V2 permission `resources` are also
+    // treated as targets; the action decides their default mode.
+    const denyLocalTarget = async (targetPath: string, accessMode: "read" | "write"): Promise<boolean> => {
+      if (isAllowlisted(targetPath, sessionAllowlist, projectDir)) return false
+      if (!isPathBlockedForMode(targetPath, accessMode, config.blockedFilePaths, config.writeProtectedPaths, config.whitelistedPaths, projectDir)) return false
 
-        await auditLogger.log({
-          timestamp: new Date().toISOString(),
-          tool: toolName,
-          hook: "permission",
-          sessionId: input.sessionID,
-          callId: callID ?? input.id,
-          detections: [],
-          blocked: true,
-          blockReason: `Blocked file path: ${deterministicFilePath}`,
-          redactedCount: 0,
-        })
+      debugLog?.(`Permission hook: action=${action} → DENIED (blocked file path (${accessMode}): ${targetPath})`)
+      diagnosticLogger?.decision("permission-handler", action, `DENIED file path (${accessMode}): ${targetPath}`)
+      output.status = "deny"
+      output.message = `Warden: Access to "${targetPath}" is blocked by security policy. This file may contain sensitive data. If you need access, ask the user to temporarily allowlist it.`
 
-        if (config.notifications) {
-          try {
-            await client.tui.showToast({
-              body: {
-                message: `🛡 Denied: ${deterministicFilePath} access denied`,
-                variant: "error" as const,
-              },
-            })
-          } catch { /* toast failure is non-critical */ }
-        }
+      await auditLogger.log({
+        timestamp: new Date().toISOString(),
+        tool: action,
+        hook: "permission",
+        sessionId: input.sessionID,
+        callId: callID ?? input.id,
+        detections: [],
+        blocked: true,
+        blockReason: `Blocked file path (${accessMode}): ${targetPath}`,
+        redactedCount: 0,
+      })
 
+      if (config.notifications) {
         try {
-          await client.session.prompt({
-            path: { id: input.sessionID },
+          await client.tui.showToast({
             body: {
-              noReply: true,
-              parts: [{
-                type: "text",
-                text: `Warden: Access to "${deterministicFilePath}" is blocked by security policy. This file may contain sensitive data. If you need access, ask the user to temporarily allowlist it.`,
-              }],
+              message: `🛡 Denied: ${targetPath} access denied`,
+              variant: "error" as const,
             },
           })
-        } catch { /* session prompt injection is non-critical */ }
+        } catch { /* toast failure is non-critical */ }
+      }
 
-        diagnosticLogger?.hookEnd("permission-handler", toolName, input.callID ?? input.id, Date.now() - hookStart, { outcome: "deny", reason: "blocked file path" })
-        return
+      try {
+        await client.session.prompt({
+          path: { id: input.sessionID },
+          body: {
+            noReply: true,
+            parts: [{
+              type: "text",
+              text: output.message,
+            }],
+          },
+        })
+      } catch { /* session prompt injection is non-critical */ }
+
+      diagnosticLogger?.hookEnd("permission-handler", action, callID ?? input.id, Date.now() - hookStart, { outcome: "deny", reason: "blocked file path" })
+      return true
+    }
+
+    const resourceMode: "read" | "write" =
+      canonicalAction === "write" || canonicalAction === "edit" || canonicalAction === "patch"
+        ? "write"
+        : "read"
+
+    // V2 permission resources are relative paths for file actions. Resolve
+    // them against the session/workspace directory before glob matching so
+    // deterministic policy does not depend on the process cwd.
+    const resolveResourcePath = (resource: string): string => {
+      if (!projectDir || isAbsolute(resource) || resource.startsWith("~/")) return resource
+      return resolve(projectDir, resource)
+    }
+
+    const deterministicTargets = [...extractFileTargets(action, args)]
+    const resourceIsFilePath =
+      canonicalAction === "read" ||
+      canonicalAction === "write" ||
+      canonicalAction === "edit" ||
+      canonicalAction === "patch" ||
+      canonicalAction === "glob" ||
+      canonicalAction === "grep"
+    if (canonicalAction === "shell") {
+      // For `shell`, resources[0] is the RAW COMMAND string, not a path.
+      // Parse every command resource with the shell target helper.
+      for (const command of resourceCommands) {
+        deterministicTargets.push(...extractFileTargets("shell", { command }))
+      }
+    } else if (resourceIsFilePath) {
+      // File-action resources are relative paths. Non-file actions (e.g.
+      // `subagent` resources are agent IDs) must not be treated as paths.
+      for (const resource of resources) {
+        if (typeof resource !== "string" || resource.length === 0) continue
+        deterministicTargets.push({ path: resolveResourcePath(resource), mode: resourceMode })
       }
     }
 
+    const checkedTargets = new Set<string>()
+    for (const target of deterministicTargets) {
+      const key = `${target.mode}\u0000${target.path}`
+      if (checkedTargets.has(key)) continue
+      checkedTargets.add(key)
+      if (await denyLocalTarget(target.path, target.mode)) return
+    }
+
     // Check remote file paths (SSH/SCP/rsync/rclone) — mode-aware
-    const remotePaths = extractRemoteFilePathsFromArgs(toolName, args)
+    const remotePaths = extractRemoteFilePathsFromArgs(action, args)
+    if (canonicalAction === "shell") {
+      for (const command of resourceCommands) {
+        remotePaths.push(...extractRemoteFilePathsFromArgs("shell", { command }))
+      }
+    }
+    const checkedRemote = new Set<string>()
     for (const { path: remotePath, mode: remoteMode } of remotePaths) {
+      const remoteKey = `${remoteMode}\u0000${remotePath}`
+      if (checkedRemote.has(remoteKey)) continue
+      checkedRemote.add(remoteKey)
       if (
         !isAllowlisted(remotePath, sessionAllowlist) &&
         isPathBlockedForMode(remotePath, remoteMode, config.blockedFilePaths, config.writeProtectedPaths, config.whitelistedPaths)
       ) {
-        debugLog?.(`Permission hook: tool=${toolName} → DENIED (blocked remote file path (${remoteMode}): ${remotePath})`)
-        diagnosticLogger?.decision("permission-handler", toolName, `DENIED remote file path (${remoteMode}): ${remotePath}`)
+        debugLog?.(`Permission hook: action=${action} → DENIED (blocked remote file path (${remoteMode}): ${remotePath})`)
+        diagnosticLogger?.decision("permission-handler", action, `DENIED remote file path (${remoteMode}): ${remotePath}`)
         output.status = "deny"
+        output.message = `Warden: Remote access to "${remotePath}" is blocked by security policy. This file may contain sensitive data. If you need access, ask the user to temporarily allowlist it.`
 
         await auditLogger.log({
           timestamp: new Date().toISOString(),
-          tool: toolName,
+          tool: action,
           hook: "permission",
           sessionId: input.sessionID,
           callId: callID ?? input.id,
@@ -331,29 +371,94 @@ export function createPermissionHandler(deps: PermissionHandlerDeps) {
               noReply: true,
               parts: [{
                 type: "text",
-                text: `Warden: Remote access to "${remotePath}" is blocked by security policy. This file may contain sensitive data. If you need access, ask the user to temporarily allowlist it.`,
+                text: output.message,
               }],
             },
           })
         } catch { /* session prompt injection is non-critical */ }
 
-        diagnosticLogger?.hookEnd("permission-handler", toolName, input.callID ?? input.id, Date.now() - hookStart, { outcome: "deny", reason: "blocked remote file path" })
+        diagnosticLogger?.hookEnd("permission-handler", action, callID ?? input.id, Date.now() - hookStart, { outcome: "deny", reason: "blocked remote file path" })
         return
       }
     }
 
     // ─── End deterministic checks ───
 
+    // Evaluator availability gate. This runs after deterministic policy so a
+    // blocked tool/file is always denied for the deterministic reason, never
+    // because of LLM tool eligibility or availability.
+    if (!safetyEvaluator) {
+      // If the LLM + safety component are enabled but the evaluator is null,
+      // something went wrong — deny every permission action that reaches this
+      // point, regardless of tool list or action mode. Explicitly disabled
+      // components remain deterministic-only: no outage denial.
+      if (config.llm.enabled && config.llm.safetyEvaluator.enabled) {
+        debugLog?.(`Permission hook: safety evaluator is null but the safety component is enabled → DENY (fail-closed)`)
+        output.status = "deny"
+        output.message = "Warden: Permission denied — safety evaluator unavailable (fail-closed)."
+
+        await auditLogger.log({
+          timestamp: new Date().toISOString(),
+          tool: action,
+          hook: "permission",
+          sessionId: input.sessionID,
+          callId: callID ?? input.id,
+          detections: [],
+          blocked: true,
+          blockReason: "Safety evaluator unavailable — fail-closed deny",
+          redactedCount: 0,
+        })
+
+        if (config.notifications) {
+          try {
+            await client.tui.showToast({
+              body: {
+                message: `🛡 Denied: Safety evaluator unavailable — blocking for safety`,
+                variant: "error" as const,
+              },
+            })
+          } catch { /* toast failure is non-critical */ }
+        }
+
+        diagnosticLogger?.hookEnd("permission-handler", action, callID ?? input.id, Date.now() - hookStart, { outcome: "deny", reason: "safety evaluator unavailable" })
+        return
+      }
+
+      debugLog?.(`Permission hook: no safety evaluator available (component disabled or LLM disabled) → SKIPPED`)
+      diagnosticLogger?.hookEnd("permission-handler", action, callID ?? input.id, Date.now() - hookStart, { outcome: "skipped", reason: "safety component disabled" })
+      return
+    }
+
+    // Skip if tool is not in the evaluator's tool list (alias-aware)
+    if (!safetyEvaluator.shouldEvaluate(action)) {
+      debugLog?.(`Permission hook: action=${action} → SKIPPED (not in safety tools list)`)
+
+      await auditLogger.log({
+        timestamp: new Date().toISOString(),
+        tool: action,
+        hook: "permission",
+        sessionId: input.sessionID,
+        callId: callID ?? input.id,
+        detections: [],
+        blocked: false,
+        blockReason: "Tool not in safety evaluator tool list — skipped",
+        redactedCount: 0,
+      })
+
+      diagnosticLogger?.hookEnd("permission-handler", action, callID ?? input.id, Date.now() - hookStart, { outcome: "skipped", reason: "tool not in safety list" })
+      return
+    }
+
     // Check bypass list
-    if (safetyEvaluator.isBypassed(toolName, args)) {
-      debugLog?.(`Permission hook: tool=${toolName} → BYPASSED → auto-allow`)
-      diagnosticLogger?.decision("permission-handler", toolName, "BYPASSED → auto-allow")
+    if (safetyEvaluator.isBypassed(action, args)) {
+      debugLog?.(`Permission hook: action=${action} → BYPASSED → auto-allow`)
+      diagnosticLogger?.decision("permission-handler", action, "BYPASSED → auto-allow")
       output.status = "allow"
       if (callID) evaluatedCalls.add(callID)
 
       await auditLogger.log({
         timestamp: new Date().toISOString(),
-        tool: toolName,
+        tool: action,
         hook: "permission",
         sessionId: input.sessionID,
         callId: callID ?? input.id,
@@ -365,7 +470,7 @@ export function createPermissionHandler(deps: PermissionHandlerDeps) {
 
       if (config.notifications) {
         try {
-          const cmdPreview = (args.command as string || input.title || toolName).substring(0, 60)
+          const cmdPreview = (args.command as string || title || action).substring(0, 60)
           await client.tui.showToast({
             body: {
               message: `Approved by ruleset: ${cmdPreview}`,
@@ -375,15 +480,15 @@ export function createPermissionHandler(deps: PermissionHandlerDeps) {
         } catch { /* toast failure is non-critical */ }
       }
 
-      diagnosticLogger?.hookEnd("permission-handler", toolName, input.callID ?? input.id, Date.now() - hookStart, { outcome: "allow", reason: "bypassed" })
+      diagnosticLogger?.hookEnd("permission-handler", action, callID ?? input.id, Date.now() - hookStart, { outcome: "allow", reason: "bypassed" })
       return
     }
 
-    debugLog?.(`Permission hook: tool=${toolName} → evaluating safety...`)
+    debugLog?.(`Permission hook: action=${action} → evaluating safety...`)
 
     if (config.notifications) {
       try {
-        const cmdPreview = (args.command as string || input.title || toolName).substring(0, 60)
+        const cmdPreview = (args.command as string || title || action).substring(0, 60)
         await client.tui.showToast({
           body: {
             message: `Escalated to LLM: ${cmdPreview}`,
@@ -393,26 +498,73 @@ export function createPermissionHandler(deps: PermissionHandlerDeps) {
       } catch { /* toast failure is non-critical */ }
     }
 
-    const safetyResult = await safetyEvaluator.evaluate(toolName, args)
-    diagnosticLogger?.decision("permission-handler", toolName, `Safety eval: ${safetyResult.recommendation} (risk=${safetyResult.riskLevel})`, {
+    const safetyResult: SafetyEvaluationResult = await safetyEvaluator.evaluate(action, args)
+    diagnosticLogger?.decision("permission-handler", action, `Safety eval: ${safetyResult.recommendation} (risk=${safetyResult.riskLevel}${safetyResult.evaluationFailed ? ", evaluationFailed" : ""})`, {
       safe: safetyResult.safe,
       riskLevel: safetyResult.riskLevel,
       recommendation: safetyResult.recommendation,
       riskDimensions: safetyResult.riskDimensions,
+      evaluationFailed: safetyResult.evaluationFailed === true,
     })
 
-    // Mark this call as evaluated so input-sanitizer skips re-evaluation
-    if (callID) {
-      evaluatedCalls.add(callID)
+    // An evaluator outage, timeout, misconfiguration, or garbage response must
+    // deny regardless of actionMode. A genuine model "block" verdict is
+    // handled below; this branch is only for an untrustworthy verdict.
+    if (safetyResult.evaluationFailed) {
+      output.status = "deny"
+      output.message =
+        "Warden: Permission denied — safety evaluator unavailable (fail-closed). " +
+        "The evaluator is unreachable, misconfigured, timed out, or returned an unusable response."
+
+      await auditLogger.log({
+        timestamp: new Date().toISOString(),
+        tool: action,
+        hook: "permission",
+        sessionId: input.sessionID,
+        callId: callID ?? input.id,
+        detections: [],
+        blocked: true,
+        blockReason: "Safety evaluator unavailable — fail-closed deny",
+        redactedCount: 0,
+        safetyEvaluation: safetyResult,
+      })
+
+      if (config.notifications) {
+        try {
+          await client.tui.showToast({
+            body: {
+              message: `🛡 Denied: Safety evaluator unavailable — blocking for safety`,
+              variant: "error" as const,
+            },
+          })
+        } catch { /* toast failure is non-critical */ }
+      }
+
+      // Do NOT mark the call as evaluated: the call must remain blocked, and a
+      // failed evaluation must never let a later hook skip re-evaluation.
+      debugLog?.(`Permission hook: action=${action} → DENIED (evaluator unavailable)`)
+      diagnosticLogger?.hookEnd("permission-handler", action, callID ?? input.id, Date.now() - hookStart, { outcome: "deny", reason: "evaluationFailed" })
+      return
     }
 
     if (safetyResult.recommendation === "block") {
       // Critical risk: auto-deny, user doesn't get a choice
       output.status = "deny"
 
+      const suggestion = safetyResult.suggestedAlternative
+        ? `\nGuidance: ${safetyResult.suggestedAlternative}`
+        : ""
+      const denialText =
+        `Warden: Command denied (${safetyResult.riskLevel} risk).\n` +
+        `Reason: ${safetyResult.explanation}` +
+        suggestion
+      // V2 PermissionEvaluation supports a message field; v2-adapters.ts
+      // forwards it onto event.message.
+      output.message = denialText
+
       await auditLogger.log({
         timestamp: new Date().toISOString(),
-        tool: toolName,
+        tool: action,
         hook: "permission",
         sessionId: input.sessionID,
         callId: callID ?? input.id,
@@ -436,35 +588,33 @@ export function createPermissionHandler(deps: PermissionHandlerDeps) {
 
       // Inject guidance into the main LLM's session context
       try {
-        const suggestion = safetyResult.suggestedAlternative
-          ? `\nGuidance: ${safetyResult.suggestedAlternative}`
-          : ""
         await client.session.prompt({
           path: { id: input.sessionID },
           body: {
             noReply: true,
             parts: [{
               type: "text",
-              text: `Warden: Command denied (${safetyResult.riskLevel} risk).\n` +
-                    `Reason: ${safetyResult.explanation}` +
-                    suggestion,
+              text: denialText,
             }],
           },
         })
       } catch { /* session prompt injection is non-critical */ }
 
-      debugLog?.(`Permission hook: tool=${toolName} → DENIED (risk=${safetyResult.riskLevel})`)
-      diagnosticLogger?.hookEnd("permission-handler", toolName, input.callID ?? input.id, Date.now() - hookStart, { outcome: "deny", riskLevel: safetyResult.riskLevel })
+      // A denied call is not marked evaluated: if execution somehow reaches
+      // the input sanitizer anyway, it must evaluate rather than skip.
+      debugLog?.(`Permission hook: action=${action} → DENIED (risk=${safetyResult.riskLevel})`)
+      diagnosticLogger?.hookEnd("permission-handler", action, callID ?? input.id, Date.now() - hookStart, { outcome: "deny", riskLevel: safetyResult.riskLevel })
       return
     }
 
     if (safetyResult.recommendation === "warn") {
       // Medium/high risk: let user decide via OpenCode's permission prompt
       output.status = "ask"
+      if (callID) evaluatedCalls.add(callID)
 
       await auditLogger.log({
         timestamp: new Date().toISOString(),
-        tool: toolName,
+        tool: action,
         hook: "permission",
         sessionId: input.sessionID,
         callId: callID ?? input.id,
@@ -486,17 +636,18 @@ export function createPermissionHandler(deps: PermissionHandlerDeps) {
         } catch { /* toast failure is non-critical */ }
       }
 
-      debugLog?.(`Permission hook: tool=${toolName} → ASK user (risk=${safetyResult.riskLevel})`)
-      diagnosticLogger?.hookEnd("permission-handler", toolName, input.callID ?? input.id, Date.now() - hookStart, { outcome: "ask", riskLevel: safetyResult.riskLevel })
+      debugLog?.(`Permission hook: action=${action} → ASK user (risk=${safetyResult.riskLevel})`)
+      diagnosticLogger?.hookEnd("permission-handler", action, callID ?? input.id, Date.now() - hookStart, { outcome: "ask", riskLevel: safetyResult.riskLevel })
       return
     }
 
     // Safe: actively allow to bypass OpenCode's default "ask" behavior
     output.status = "allow"
-    debugLog?.(`Permission hook: tool=${toolName} → SAFE → auto-allow (risk=${safetyResult.riskLevel})`)
+    if (callID) evaluatedCalls.add(callID)
+    debugLog?.(`Permission hook: action=${action} → SAFE → auto-allow (risk=${safetyResult.riskLevel})`)
     await auditLogger.log({
       timestamp: new Date().toISOString(),
-      tool: toolName,
+      tool: action,
       hook: "permission",
       sessionId: input.sessionID,
       callId: callID ?? input.id,
@@ -508,7 +659,7 @@ export function createPermissionHandler(deps: PermissionHandlerDeps) {
 
     if (config.notifications) {
       try {
-        const cmdPreview = (args.command as string || input.title || toolName).substring(0, 60)
+        const cmdPreview = (args.command as string || title || action).substring(0, 60)
         await client.tui.showToast({
           body: {
             message: `Approved by LLM (risk: ${safetyResult.riskLevel}): ${cmdPreview}`,
@@ -518,6 +669,6 @@ export function createPermissionHandler(deps: PermissionHandlerDeps) {
       } catch { /* toast failure is non-critical */ }
     }
 
-    diagnosticLogger?.hookEnd("permission-handler", toolName, input.callID ?? input.id, Date.now() - hookStart, { outcome: "allow", riskLevel: safetyResult.riskLevel })
+    diagnosticLogger?.hookEnd("permission-handler", action, callID ?? input.id, Date.now() - hookStart, { outcome: "allow", riskLevel: safetyResult.riskLevel })
   }
 }

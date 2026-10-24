@@ -30,6 +30,7 @@ This document provides an in-depth walkthrough of the OpenCode Warden codebase f
 
 - **Bun** (v1.0+) — runtime and test runner
 - **TypeScript** (v5.5+) — strict mode enabled
+- **OpenCode** 2.0.18+ — supported host floor (below-floor 2.x runtimes warn but keep protections active; typed `Tool.Error` vetoes require 2.0.29+)
 
 ### Commands
 
@@ -63,7 +64,7 @@ Source lives in `src/`, tests in `tests/` (excluded from compilation), output go
 | Package | Type | Purpose |
 |---|---|---|
 | `zod` | Runtime | Configuration schema validation |
-| `@opencode-ai/plugin` | Peer/Dev | OpenCode plugin SDK (hook types, tool builder) |
+| `@opencode/plugin` | Peer/Dev | OpenCode V2 plugin SDK. The peer range is `^2.0.18` (the API floor Warden's used surface is verified against); the installed dev dependency stays `^2.1.4` for type-checking against the latest 2.x SDK. The SDK is not the host; the runtime version gate uses `ctx.app.version`. |
 | `@types/bun` | Dev | Bun runtime type definitions |
 | `typescript` | Dev | TypeScript compiler |
 
@@ -73,11 +74,14 @@ Source lives in `src/`, tests in `tests/` (excluded from compilation), output go
 
 ```
 src/
-├── index.ts                         # Plugin entry point, hook wiring, tool registration
-├── types.ts                         # All TypeScript type definitions
+├── index.ts                         # Plugin.define setup(ctx): config, state, hook wiring, tools
+├── types.ts                         # All shared TypeScript type definitions
+├── rpc.ts                           # Public notification RPC contract (event-only)
+├── tui.ts                           # TUI companion entrypoint (no enforcement)
+├── tui-notifications.ts             # Server-side notification bridge (wired in index.ts)
 │
 ├── config/
-│   ├── index.ts                     # Configuration loading and hierarchical merging
+│   ├── index.ts                     # Defaults → global → project, inline fallback, failure signal
 │   ├── defaults.ts                  # Hardcoded default configuration values
 │   └── schema.ts                    # Zod validation schemas
 │
@@ -85,29 +89,28 @@ src/
 │   ├── index.ts                     # Public API: createDetectionEngine()
 │   ├── engine.ts                    # Core DetectionEngine class (scan, overlap resolution)
 │   ├── redactor.ts                  # Redaction helper functions
-│   └── patterns/
-│       ├── index.ts                 # Pattern aggregation and filtering
-│       ├── api-keys.ts              # 20 API key patterns
-│       ├── credentials.ts           # 7 credential/connection string patterns
-│       ├── private-keys.ts          # 7 private key patterns (PEM blocks)
-│       ├── docker.ts                # 4 Docker secret patterns
-│       ├── kubernetes.ts            # 6 Kubernetes secret patterns
-│       ├── cloud.ts                 # 16 cloud provider patterns
-│       └── pii.ts                   # 7 PII patterns (with Luhn and IP validation)
+│   └── patterns/                    # Built-in pattern families (65 active by default)
 │
 ├── hooks/
 │   ├── input-sanitizer.ts           # tool.execute.before — input scanning and safety eval
 │   ├── output-redactor.ts           # tool.execute.after — output redaction
-│   ├── env-sanitizer.ts             # shell.env — environment variable sanitization
-│   ├── permission-handler.ts        # permission.ask — OpenCode permission integration
-│   ├── compaction-context.ts        # experimental.session.compacting — policy injection
-│   └── security-policy.ts           # Builds security policy text for LLM context
+│   ├── permission-handler.ts        # permission.evaluate — permission integration
+│   ├── env-sanitizer.ts             # shell.create.before — environment sanitization
+│   ├── shell-backstop.ts            # shell.create.before — global path backstop
+│   ├── outbound-sanitizer.ts        # session.context/generate/title — policy + outbound text scan
+│   ├── compaction-context.ts        # session.compaction — compaction request scan
+│   ├── prompt-sanitizer.ts          # session.prompt — opt-in prompt/attachment metadata scan
+│   ├── session-permissions.ts       # session deny-rule translation/sync
+│   ├── tool-surface.ts              # blockedTools removal from request/transform surfaces
+│   ├── session-context.ts           # Session TTL sweep helpers
+│   ├── v2-adapters.ts               # V2 event adapters + fail-closed lockdown
+│   └── security-policy.ts           # Builds security policy text for request context
 │
 ├── llm/
-│   ├── index.ts                     # LlmSanitizer class + module re-exports
+│   ├── index.ts                     # LlmSanitizer + module re-exports
 │   ├── client.ts                    # HTTP client for LLM API (fetch-based)
 │   ├── context.ts                   # ConversationContext — sliding window history
-│   ├── prompts.ts                   # System prompts, prompt templates, renderTemplate()
+│   ├── prompts.ts                   # System prompts, templates, renderTemplate()
 │   ├── safety-evaluator.ts          # SafetyEvaluator class (10-dimension risk assessment)
 │   ├── payload-decode.ts            # Deterministic pre-decoding of encoded payloads
 │   ├── static-findings.ts           # Credential-surface + verdict-forgery detection
@@ -118,13 +121,12 @@ src/
 │   ├── file-logger.ts               # File-based logging with buffering and rotation
 │   └── session-stats.ts             # In-memory session statistics and timeline
 │
-├── tools/
-│   ├── security-dashboard.ts        # security_dashboard tool implementation
-│   ├── security-report.ts           # security_report tool implementation
-│   └── rules-manage.ts             # security_rules tool implementation
+├── tools/                           # 7 custom tools (help, dashboard, report, audit,
+│                                    # evaluate, config, rules)
 │
 └── utils/
-    ├── paths.ts                     # Glob matching, file path extraction from tool args
+    ├── paths.ts                     # Glob matching, file-target extraction, exemptions
+    ├── tool-compat.ts               # V1/V2 tool-name + argument aliases
     └── deep-scan.ts                 # Recursive object/array scanning for secrets
 
 scripts/
@@ -136,9 +138,13 @@ scripts/
 
 tests/
 ├── config.test.ts                   # Configuration defaults and Zod schema validation
-├── hooks.test.ts                    # Hook behavior tests (input, output, env, compaction)
+├── config-source.test.ts            # Inline/file precedence + fail-closed failures
+├── hooks.test.ts                    # Internal handler behavior (input, output, env, compaction)
+├── fail-closed-evaluator.test.ts    # Evaluator outage/null-component regressions
 ├── detection-patterns.test.ts       # Pattern detection tests across all categories
 ├── payload-decode.test.ts           # Payload decoder + prompt integration tests
+├── v2-*.test.ts                     # V2 adapters, native hooks, session policy
+├── tui-notifications.test.ts        # RPC contract, bridge, TUI rendering
 └── warden-fixes.test.ts             # Bypass-gate + ground-truth injection regressions
 ```
 
@@ -146,147 +152,170 @@ tests/
 
 ## Architecture Overview
 
-Security Guard is structured as a layered interception system. Here is how the components relate:
+Warden is a layered interception system built on the V2 plugin API. All bridging from V2 events to the internal V1-shaped handlers lives in `src/index.ts` and `src/hooks/v2-adapters.ts`.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│                        OpenCode Runtime                             │
+│                        OpenCode V2 Runtime                          │
 │                                                                     │
 │  User prompt → AI agent → Tool call → [Plugin Hooks] → Tool exec   │
+│                    ↓                                                │
+│         Provider request built per turn                             │
 └──────────────┬───────────────────────────────────┬──────────────────┘
                │                                   │
                ▼                                   ▼
 ┌──────────────────────────┐    ┌──────────────────────────────────┐
-│     src/index.ts         │    │    Hook Pipeline (5 hooks)       │
-│  Plugin entry point      │    │                                  │
-│  - Config loading        │───▶│  permission.ask → input-sanitizer│
-│  - Component init        │    │  shell.env → output-redactor     │
-│  - Hook registration     │    │  session.compacting              │
-│  - Tool registration     │    └───────────┬──────────────────────┘
-│  - Session lifecycle     │                │
-└──────────────────────────┘                │
+│     src/index.ts         │    │    V2 domain hooks               │
+│  Plugin.define setup(ctx)│───▶│                                  │
+│  - Config loading        │    │ session.prompt                   │
+│  - Failure lockdown      │    │ session.context                  │
+│  - Component init        │    │ session.generate                 │
+│  - Hook registration     │    │ session.title                    │
+│  - Tool transform        │    │ tool.execute.before              │
+│  - Session lifecycle     │    │ shell.create.before              │
+└──────────────────────────┘    │ permission.evaluate              │
+                                │ tool.execute.after               │
+                                │ session.compaction               │
+                                └───────────┬──────────────────────┘
                                             ▼
         ┌───────────────────────────────────────────────────┐
         │              Shared Dependencies                   │
         │                                                    │
         │  DetectionEngine ◄─── Pattern Registry             │
-        │  SafetyEvaluator ◄─── LLM Client + Prompts        │
-        │  LlmSanitizer   ◄─── LLM Client + Context         │
+        │  SafetyEvaluator ◄─── ProviderChain + Prompts      │
+        │  LlmSanitizer   ◄─── ProviderChain + Context       │
         │  AuditLogger     ◄─── FileLogger                   │
         │  SessionStats    ◄─── Timeline tracking             │
-        │  ToastState      ◄─── Rate limiter                  │
+        │  ToastState      ◄─── Rate limiter (UX only)         │
         │  evaluatedCalls  ◄─── Set<string> (deduplication)   │
-        │  sessionAllowlist◄─── Set<string> (file overrides)  │
+        │  sessionAllowlist◄─── Set<string> (exact overrides) │
         └───────────────────────────────────────────────────┘
 ```
 
 ### Data Flow Summary
 
-1. **Configuration** loads from defaults → global file → project file (deep merge)
-2. **Detection engine** is built from enabled categories + disabled patterns + custom patterns
-3. **LLM components** are conditionally initialized if `llm.enabled` is true
-4. **Hooks** are created as closures that close over shared state
-5. **Each tool call** flows through: `permission.ask` (optional) → `shell.env` (if shell) → `tool.execute.before` → tool executes → `tool.execute.after`
-6. **Session events** reset all mutable state
+1. **Configuration** loads from defaults → global file → project file (deep merge). Inline `ctx.options` is used only when neither file exists. Any invalid/unreadable present source produces a `failure` and an active deny-all lockdown.
+2. **Detection engine** is built from enabled categories + disabled patterns + custom patterns.
+3. **LLM components** are conditionally initialized if `llm.enabled` is true. If enabled but unavailable, evaluation/sanitization fails closed regardless of action mode.
+4. **Hooks** are created as closures over per-session state and registered on V2 domains in `setup(ctx)`.
+5. **A tool call** flows through `tool.execute.before` (authoritative), optional `shell.create.before`, optional `permission.evaluate`, execution, then `tool.execute.after`.
+6. **Every primary provider dispatch** passes through `session.context` for policy injection, blocked-tool removal, and outbound redaction. `session.generate` receives the same treatment; the tool-less `session.title` request is redacted without policy injection; compaction has its own request hook.
+7. **Session events** reset mutable state and invalidate the session deny-rule cache.
+
+Cross-plugin hook order is registration order; there is no priority API. Warden cannot make its mutations final against a later plugin. Treat the host and all plugins as trusted, and load Warden last where possible.
+
+### V2 Capabilities Intentionally Not Used
+
+| Capability | Why Warden does not use it |
+|---|---|
+| `ctx.storage` | Audit files plus in-memory session state already cover persistence. Silent state migration and a second source of truth are not wanted. |
+| Tool namespacing (`editor.namespace`) | Stable names (`security_dashboard`, etc.) are documented and used by existing workflows; renaming is cosmetic and breaks compatibility. |
+| Tool progress/cancel | Marginal value for short policy checks; adds lifecycle surface without security benefit. |
+| `ctx.generate.text` for safety evaluation | Evaluation deliberately uses Warden's independent, fail-closed provider chain. Coupling safety to the host's model routing would make an outage or routing change a bypass. |
+| Plugin RPC methods | The notification RPC is event-only (`methods: {}`). Warden exposes no callable RPC that could influence enforcement. |
+| Renaming tool-call keys/ids or rewriting provider-signed/encrypted text outbound | Warden structurally redacts historical tool-call input string values in the request projection but preserves keys/ids and never rewrites provider-signed/encrypted text; a required rewrite aborts the request. |
+| Refusing to load on an old runtime | A failed setup drops every hook and leaves the host unprotected, so Warden warns and keeps enforcing. |
 
 ---
 
 ## Plugin Entry Point — `src/index.ts`
 
-**Lines**: ~298 | **Exports**: `SecurityGuard` (Plugin function), default export
+**Lines**: ~915 | **Exports**: default (`Plugin.define`), version-diagnostic helpers
 
-This is the main file that OpenCode loads. It exports an async function conforming to the `Plugin` type from `@opencode-ai/plugin`.
+This is the file OpenCode loads. It uses the V2 plugin shape:
+
+```typescript
+export default Plugin.define({
+  id: "opencode-warden",
+  async setup(ctx) {
+    // ...
+  },
+})
+```
+
+`ctx.location.directory` is the workspace/project directory. `ctx.options` is the plugin-options record. The security modules still use internal `(input, output)`-shaped handlers; V2 adaptation lives in `src/hooks/v2-adapters.ts` and thin closures in `setup`.
 
 ### Initialization Sequence
 
-```typescript
-export const SecurityGuard: Plugin = async ({ client: sdkClient, directory }) => {
-```
+1. **Construct a V1-shaped `PluginClient` shim** for the internal modules:
+   - `app.log` → console (V2 has no structured `app.log` API)
+   - `session.prompt` → `ctx.session.synthetic` (used only for permission-denial text)
+   - `tui.showToast` → `createWardenNotificationBridge(...).showToast` (sanitized RPC event; UX only)
+2. **Load configuration** via `loadConfig(directory, { inlineConfig: ctx.options })`.
+   - On a loader exception or non-null `failure`, call `registerFailClosedHooks(ctx, ...)` and return a no-op cleanup. Do **not** construct a detection engine, audit logger, provider chains, normal hooks, or custom tools on this path.
+3. **Create the detection engine**, resolve audit/diagnostic paths, and construct `AuditLogger`, `DiagnosticLogger`, and `LlmChatLogger`.
+4. **Initialize LLM components** if `config.llm.enabled`: provider chains, `LlmSanitizer`, `SafetyEvaluator`, optional triage evaluators. Health checks are non-blocking; failures do not delay setup.
+5. **Create shared per-session state** via `createSessionState()` / `getSessionState()`: stats, toast state, allowlist, evaluated calls, written-file registry, sanitizer, evaluator, last-access time.
+6. **Create hook handlers** with dependency injection (`inputSanitizer`, `outputRedactor`, `envSanitizer`, `promptSanitizer`, `permissionHandler`, `outboundSanitizer`, `compactionContext`, `shellBackstop`).
+7. **Create the session permission sync coordinator** (`createSessionPermissionSync`) using `ctx.session.get` / `ctx.session.update` when available.
+8. **Create the 7 custom tool definitions** and register startup diagnostics, runtime warning, and session state sweep.
+9. **Subscribe to events** (`session.created`, `session.deleted`, `session.permissions`) with an `AbortController`.
+10. **Register V2 hooks** (order matters within Warden):
+    - `session.context` → remove blocked request tools, append policy + outbound scan
+    - `session.generate` → same policy, blocked-tool removal, and outbound scan
+    - `session.title` → outbound redaction without policy injection
+    - `tool.execute.before` → lazy session deny sync, then input sanitizer
+    - `tool.execute.after` → execute-after adapter
+    - `permission.evaluate` → lazy deny sync, then permission adapter
+    - `shell.create.before` → shell backstop, then env sanitizer
+    - `session.compaction` → compaction adapter
+    - `session.prompt` → prompt sanitizer (text + attachment metadata)
+11. **Register tools** with `ctx.tool.transform`: `editor.add(...)` for each tool, then `removeBlockedTransformTools(editor, config)`.
 
-The plugin receives the OpenCode SDK client and the project directory. It then:
-
-1. **Casts the SDK client** to our `PluginClient` interface (we only use `app.log`, `session.prompt`, `tui.showToast`)
-
-2. **Loads configuration** via `loadConfig(directory)` — merges defaults → global → project configs
-
-3. **Creates the detection engine** via `createDetectionEngine(config)` — compiles all regex patterns
-
-4. **Resolves the audit log path** — converts relative paths to absolute using `directory`
-
-5. **Creates the audit logger** with the resolved config
-
-6. **Creates session stats** tracker
-
-7. **Initializes LLM components** (if `config.llm.enabled`):
-   - Creates `LlmSanitizer` instance
-   - Creates `SafetyEvaluator` instance
-   - Runs a non-blocking health check (doesn't delay plugin startup)
-   - Shows a toast if the LLM is unreachable
-
- 8. **Creates shared state objects**:
-    - `toastState: ToastState` — rate limiter (2000ms interval)
-    - `sessionAllowlist: Set<string>` — temporary file access overrides (config-based whitelistedPaths)
-    - `evaluatedCalls: Set<string>` — deduplication between `permission.ask` and `tool.execute.before`
-    - `policyInjected: boolean` — tracks if security policy was injected into session
-
- 9. **Creates all hook handlers** by calling factory functions with dependencies
-
- 10. **Creates custom tool definitions** for the 3 built-in tools
-
-11. **Logs startup information** (pattern count, active categories, LLM status)
-
-### Returned Hook Object
-
-The plugin returns an object with these hooks:
+### Hook Registration Shape
 
 ```typescript
-return {
-  "tool.execute.before": async (input, output) => {
-    // Inject security policy on first tool call (one-time)
-    if (!policyInjected && input.sessionID) {
-      policyInjected = true
-      await client.session.prompt({ ... }) // Inject policy text
-    }
-    return inputSanitizer(input, output)
-  },
-  "tool.execute.after": outputRedactor,
-  "permission.ask": permissionHandler,
-  "shell.env": envSanitizer,
-  "experimental.session.compacting": compactionContext,
+await ctx.session.hook("context", async (event) => {
+  removeBlockedRequestTools(event.tools, config)
+  await outboundSanitizer(event)
+})
 
-  event: async ({ event }) => {
-    if (event.type === "session.created") {
-      // Reset all mutable state
-      sessionStats.reset("")
-      sessionAllowlist.clear()
-      evaluatedCalls.clear()
-      policyInjected = false
-      llmSanitizer?.reset()
-      safetyEvaluator?.reset()
-    }
-  },
+await ctx.session.hook("generate", async (event) => {
+  removeBlockedRequestTools(event.tools, config)
+  await outboundSanitizer(event, { surface: "generate" })
+})
 
-  tool: {
-    security_dashboard: tool({ ... }),
-    security_report: tool({ ... }),
-    security_rules: tool({ ... }),
-  },
-}
+await ctx.session.hook("title", async (event) => {
+  await outboundSanitizer(event, { surface: "title", appendPolicy: false })
+})
+
+await ctx.tool.hook("execute.before", async (event) => {
+  await sessionPermissionSync.sync(event.sessionID)
+  await inputSanitizer(
+    { tool: event.tool, sessionID: event.sessionID, callID: event.id },
+    { args: asRecord(event.input) },
+  )
+})
+
+const permissionAdapter = createPermissionAdapter(permissionHandler)
+await ctx.permission.hook("evaluate", async (event) => {
+  await sessionPermissionSync.sync(event.sessionID)
+  return permissionAdapter(event)
+})
+
+await ctx.shell.hook("create.before", async (event) => {
+  await shellBackstop({ command: event.command, cwd: event.cwd })
+  await envSanitizer({ cwd: event.cwd }, { env: event.env })
+})
 ```
+
+There is no returned hook object in V2. `setup()` returns only an optional cleanup function.
 
 ### Design Decisions
 
-- **Security policy injection**: Done on the first tool call (not session creation) because we need a `sessionID` to call `session.prompt`. This ensures the AI knows about security constraints from the start.
-- **Non-blocking health check**: The LLM health check runs in the background to avoid delaying plugin startup. If it fails, we show a toast warning that all LLM-evaluated operations will be blocked until the LLM is available.
-- **Shared mutable state**: `evaluatedCalls`, `sessionAllowlist`, and `toastState` are shared by reference across hook closures. This is safe because all hooks run sequentially within the OpenCode event loop (no concurrent access).
+- **Policy injection is per request, not synthetic history.** `session.context` and `session.generate` append the policy to the request-local `event.system`; compaction does the same. `session.title` intentionally opts out because it is a narrow tool-less naming request. This avoids history pollution and marker-forgery dedup problems.
+- **Config failure is an active lockdown.** A failed `setup()` would drop every Warden hook, so config failures install deny/withhold hooks and return normally instead.
+- **Runtime version is a warning, not a gate.** Refusing activation on an old runtime would leave the host unprotected.
+- **Shared mutable state is sequential.** `evaluatedCalls`, `sessionAllowlist`, and `toastState` are shared by reference; OpenCode runs hooks sequentially, so there is no concurrent access. Session permission sync is the only in-flight async cache and is race-safe.
+- **Notifications never gate enforcement.** The server `showToast` shim routes through `src/tui-notifications.ts`, which emits a strict RPC event; registration or delivery failure is non-blocking. The TUI companion renders fixed copy and cannot influence decisions.
 
 ---
 
 ## Type System — `src/types.ts`
 
-**Lines**: ~265 | **Purpose**: Central type definitions for the entire application
+**Lines**: ~382 | **Purpose**: Central type definitions for the entire application
 
-All types are defined in one file for simplicity and import convenience. The key type hierarchies:
+All shared types are defined in one file for simplicity and import convenience. Local factory dependency interfaces and V2 event/adaptor structural types live next to their handlers. The key type hierarchies:
 
 ### Pattern System Types
 
@@ -368,10 +397,13 @@ securityGuardConfigSchema
 ├── categories: Record<patternCategorySchema, boolean>
 ├── customPatterns: array(customPatternSchema)
 ├── audit: auditConfigSchema
+├── diagnosticLog: diagnosticLogSchema
 ├── env: envSanitizerSchema
+├── indirectExecution: indirectExecutionSchema
 └── llm: llmConfigSchema
       ├── outputSanitizer: llmOutputSanitizerSchema
       │     └── actionMode: outputActionModeSchema  ← z.enum(["redact", "warn", "pass"])
+      ├── outputTriage/outputTextTriage: endpoint schemas
       └── safetyEvaluator: llmSafetyEvaluatorSchema
             └── actionMode: safetyActionModeSchema  ← z.enum(["block", "permission", "warn"])
 ```
@@ -379,8 +411,10 @@ securityGuardConfigSchema
 **Validation rules of note:**
 - `baseUrl` uses `z.string().url()` — requires valid URL format
 - `temperature` uses `z.number().min(0).max(2)` — LLM temperature range
-- `maxTokens` uses `z.number().int().positive()` — must be positive integer
+- `maxTokens` uses `z.number().int().min(1)` — must be a positive integer
 - Pattern categories use `z.enum([...])` — rejects unknown categories
+- The schema is intentionally non-strict: unknown keys are stripped (forward compatibility). Known keys with invalid types/values are hard failures
+- File and inline sources use the exact same schema
 
 The inferred type `SecurityGuardUserConfig` is what the schema produces. It has all fields as optional, unlike `SecurityGuardConfig` which has all fields as required (filled by defaults).
 
@@ -388,33 +422,36 @@ The inferred type `SecurityGuardUserConfig` is what the schema produces. It has 
 
 Contains `DEFAULT_CONFIG: SecurityGuardConfig` with every field filled in. Key defaults:
 
-- All categories enabled except `pii-ip-address` (disabled due to false positives)
-- 24 blocked file patterns (`.env`, `*.pem`, `*.key`, kubeconfig, tfstate, etc.)
+- All categories enabled except `pii-ip-address` (disabled due to false positives): 65 active patterns from 66 defined
+- 28 blocked file patterns (`.env`, `*.pem`, `*.key`, kubeconfig, tfstate, Warden config, etc.)
+- 1 write-protected pattern (`**/var/log/**`)
+- `excludedTools: []` (V2 has no obsolete `list` tool)
 - 24 env strip patterns (`*_SECRET`, `*_TOKEN`, `AWS_SECRET_ACCESS_KEY`, etc.)
 - LLM disabled by default, debug logging enabled
-- Safety evaluator: `actionMode: "block"`, `blockThreshold: "high"`, `warnThreshold: "medium"`
-- Output sanitizer: `actionMode: "redact"`
+- Safety evaluator tools: `["shell", "write", "edit", "patch", "read", "webfetch"]`, `actionMode: "block"`, `blockThreshold: "high"`, `warnThreshold: "medium"`
+- Output sanitizer tools: `["read", "shell", "grep"]`, `actionMode: "redact"`
 - Audit: enabled, 10MB max file, 5 rotated files, `"normal"` verbosity
 
-### `config/index.ts` — Loading and Merging
+### `config/index.ts` — Loading, Fallback, and Failure
 
-The `loadConfig()` function implements a three-layer configuration hierarchy:
+`loadConfig(projectDir, options?)` returns `{ config, warnings, failure }` — not just a config object.
 
 ```typescript
-function loadConfig(projectDir: string): SecurityGuardConfig {
-  let config = structuredClone(DEFAULT_CONFIG)  // Layer 0: defaults
-
-  // Layer 1: Global config
-  const globalConfig = loadConfigFile("~/.config/opencode/opencode-warden.json")
-  if (globalConfig) config = deepMerge(config, globalConfig)
-
-  // Layer 2: Project config
-  const projectConfig = loadConfigFile(".opencode/opencode-warden.json")
-  if (projectConfig) config = deepMerge(config, projectConfig)
-
-  return config
-}
+const { config, warnings, failure } = loadConfig(directory, {
+  inlineConfig: ctx.options,
+})
 ```
+
+Precedence:
+
+1. Defaults are always the base.
+2. If the global config exists, load it.
+3. If the project config exists, load it after global.
+4. **If either file exists, inline `ctx.options` is ignored entirely** — even if the file is invalid or unreadable. A global path excluded by the test-only `skipGlobalConfig` is not a source.
+5. Only when neither file path exists is inline config validated and merged over defaults.
+6. Any invalid/unreadable present source returns a `failure` (`WARDEN_CONFIG_INVALID` / `WARDEN_CONFIG_UNREADABLE`, `failClosed: true`) and a fail-closed shell config (LLM enabled, empty provider chains). It does not fall back to a lower layer, defaults, or inline options.
+
+`loadConfig` never throws for file/inline failures. The caller must inspect `failure` and install blocking hooks; the shell config alone is not sufficient. Failure diagnostics are sanitized: no configured values, and no JSON parser messages (they can echo document snippets containing secrets).
 
 **`deepMerge(target, source)`** is a recursive merge function:
 - Objects are merged recursively (key by key)
@@ -425,7 +462,7 @@ function loadConfig(projectDir: string): SecurityGuardConfig {
 
 This means if a user specifies `blockedFilePaths: [".env"]`, it completely replaces the default list rather than appending to it. This is intentional — users can fully control which paths are blocked.
 
-**`loadConfigFile(path)`** reads a JSON file, validates it with Zod, and returns the validated config or `undefined` on error. Validation errors are logged to console but don't crash the plugin.
+`normalizeConfiguredToolLists()` canonicalizes `bash`→`shell` and `task`→`subagent` in memory for `excludedTools`, `blockedTools`, and both LLM tool lists. It never rewrites the user's config files.
 
 ---
 
@@ -574,44 +611,60 @@ Each hook is implemented as a factory function that accepts a `deps` object and 
 
 **Purpose**: Inspect and sanitize tool inputs before execution. Can block calls by throwing.
 
-**Dependencies:**
+**Dependencies (production uses `getSessionState`; tests may pass individual state):**
 
 ```typescript
 interface InputSanitizerDeps {
   engine: DetectionEngine
   config: SecurityGuardConfig
   auditLogger: AuditLogger
-  sessionStats: SessionStats
+  projectDir?: string
   client: PluginClient
-  safetyEvaluator: SafetyEvaluator | null
-  toastState: ToastState
-  sessionAllowlist: Set<string>
-  evaluatedCalls: Set<string>
+  diagnosticLogger: DiagnosticLogger | null
+  getSessionState?: (sessionID: string) => {
+    sessionStats: SessionStats
+    safetyEvaluator: SafetyEvaluator | null
+    toastState: ToastState
+    sessionAllowlist: Set<string>
+    evaluatedCalls: Set<string>
+    writtenFileRegistry: Map<string, WrittenFileMetadata>
+  }
+  // Optional individual state for tests
+  sessionStats?: SessionStats
+  safetyEvaluator?: SafetyEvaluator | null
+  toastState?: ToastState
+  sessionAllowlist?: Set<string>
+  evaluatedCalls?: Set<string>
+  writtenFileRegistry?: Map<string, WrittenFileMetadata>
 }
 ```
 
-**Processing pipeline (5 steps):**
+**Processing pipeline:**
 
-**Step 1: Record tool call** — Increments the session-level tool call counter. This always runs, even for excluded tools (but we skip it for excluded tools — the counter is incremented before the exclusion check, which is intentional to track total tool activity).
+**Step 0: Gates** — `blockedTools` throws; `excludedTools` skips this tool's input/output processing (global outbound context/generate/title/compaction scanning still applies); `sshOnlyMode` skips non-remote/non-shell calls. Tool names are compared with alias awareness (`shell`↔`bash`, `subagent`↔`task`).
 
-**Step 2: Check file path blocking** — Extracts a file path from the tool args (via `extractFilePath()`), checks the session allowlist first (takes priority), then checks the blocked patterns. If blocked: audit log, toast, `throw Error`. The AI sees the error message and can inform the user.
+**Step 1: Record tool call** — Increments the per-session tool call counter.
 
-**Step 3: Regex deep scan** — Calls `deepScan(output.args, engine)` to recursively scan all string values in the args object. Detections are replaced in-place (mutating `output.args`). Category counts are recorded in session stats.
+**Step 2: Check every file target** — `extractFileTargets(tool, args)` returns `{ path, mode }` targets for V2 `path`/legacy `filePath`, every `patchText` add/update/delete/move target, and shell redirections/reads. Each target is checked:
+- session allowlist first (wins)
+- `blockedFilePaths` for read and write
+- `writeProtectedPaths` only for write
+- dynamic shell targets (`$VAR`, backticks) fail closed before path checks
 
-**Step 4: LLM safety evaluation** — Only runs if:
-- `safetyEvaluator` is not null (LLM enabled)
-- `safetyEvaluator.shouldEvaluate(tool)` returns true (tool is in the eval list)
-- `safetyEvaluator.isBypassed(tool, args)` returns false (command not bypassed)
-- `evaluatedCalls` does NOT contain this `callID` (not already evaluated by `permission.ask`)
+If blocked: audit log, notification attempt, `throw Error`. Without multi-target extraction, `echo >> authorized_keys` and patch moves would bypass the file blocker.
+
+**Step 3: Regex deep scan** — Calls `deepScan(output.args, engine)` to recursively scan string values in the args object. Detections are replaced in-place (mutating `output.args`), unless `redactionEnabled`/`redactOnWrite`/`redactionExemptPaths` skip it. Category counts are recorded in session stats. A path-scoped exemption is all-or-nothing across every write target (e.g., a patch that updates an exempt file and moves it to a non-exempt path is still redacted).
+
+**Step 4: LLM safety evaluation** — Runs if the tool is in `safetyEvaluator.tools`, is not bypassed, and the call id is not already in `evaluatedCalls`. If the LLM and component are enabled but the evaluator is `null`, the call fails closed. `evaluateFileExecution()` covers indirect script execution.
 
 **Action mode logic:**
-- `"block"` mode: `recommendation === "block"` → `throw Error`; `recommendation === "warn"` → show toast
-- `"permission"` mode: If already evaluated by `permission.ask` → skip. Otherwise falls back to `"block"` behavior (the permission hook didn't fire, so the tool is auto-allowed by OpenCode, but we still need to protect)
-- `"warn"` mode: `recommendation === "block"` → show toast (but don't throw); `recommendation === "warn"` → show toast
+- `"block"`: `recommendation === "block"` or `evaluationFailed` → `throw Error`; `warn` → notification
+- `"permission"`: falls back to `"block"` behavior if `permission.evaluate` did not fire (e.g., tool auto-allowed)
+- `"warn"`: a genuine model `block` verdict may only warn, but `evaluationFailed` (outage/garbage) throws regardless
 
-**Step 5: Audit log** — Records the scan results, safety evaluation, and detection counts.
+**Host veto mapping:** `@opencode/plugin` 2.0.29+ converts an `execute.before` rejection into a typed `Tool.Error`; on the supported 2.0.18–2.0.28 hosts the same throw aborts the call through the older untyped per-call rejection path exercised by the 2.0.18 runtime validation. Both prevent execution.
 
-**Toast rate limiting**: The `canToast()` helper function tracks the last toast time and enforces a minimum interval (2000ms by default). This prevents toast spam when many tool calls fire in quick succession.
+**Step 5: Audit log** — Records scan results, safety evaluation, and detection counts. Blocks are audited here because `tool.execute.after` does not run after a before-hook rejection.
 
 ### `hooks/output-redactor.ts` — `tool.execute.after`
 
@@ -619,70 +672,134 @@ interface InputSanitizerDeps {
 
 **Processing pipeline:**
 
-**Pass 1: Regex scan** — Scans both `output.output` and `output.title` through the detection engine. In `"pass"` mode, detections are counted but not redacted. In `"redact"` and `"warn"` modes, text is replaced.
+**Pass 1: Regex scan** — Scans `output.output`, `output.title`, and metadata through the detection engine. In `"pass"` mode, detections are counted but not redacted. In `"redact"` and `"warn"` modes, text is replaced.
 
-**Pass 2: LLM sanitization** — Second pass using the LLM for context-aware detection. Skipped in `"pass"` mode, when LLM is unavailable, or when `skipWhenRegexClean` is true and regex found nothing. The LLM receives tool context (name, args, title) to reason about whether values look like secrets.
+**Pass 2: LLM sanitization** — Second pass using the LLM for context-aware detection. Skipped in `"pass"` mode, when `skipWhenRegexClean` is true and regex found nothing, or for deterministic output bypasses. If the LLM is enabled and the tool is in the sanitizer list but the sanitizer is missing/unavailable, output is withheld (`[BLOCKED]`) — never released raw. The single availability gate is intentional; do not re-add mid-pipeline `isAvailable()` skips.
 
-**Toast behavior by action mode:**
-- `"redact"`: Rate-limited toast showing count and method (regex vs LLM)
-- `"warn"`: Always shows detailed toast (bypasses rate limiter) with categories found
-- `"pass"`: Rate-limited toast saying "NOT redacted — pass mode"
+**V2 adapter (`createExecuteAfterAdapter`)** — The adapter handles both `status: "completed"` and `status: "error"`:
+- Scans textual `content`; if absent but structured `output` exists, serializes it and sanitizes the fallback.
+- Writes sanitized text back to `content` and drops raw structured `output` when changed/blocked.
+- Recursively redacts metadata (bounded depth, cycle/prototype guards), including keys/values.
+- Resolves the model-visible error message (unwrap `.error` causes like OpenCode's `toSessionError`), scans it, then removes the cause so the raw nested value cannot surface later.
+- Converts redactor exceptions into a fixed `[BLOCKED]` result.
 
-### `hooks/env-sanitizer.ts` — `shell.env`
+**Notification behavior by action mode:**
+- `"redact"`: Rate-limited notification with count/method
+- `"warn"`: Always shows detailed notification (bypasses rate limiter)
+- `"pass"`: Rate-limited detection notice saying "NOT redacted — pass mode"
+
+### `hooks/env-sanitizer.ts` — `shell.create.before`
 
 **Purpose**: Sanitize environment variables before shell commands see them.
 
 **Two-strategy approach:**
 
 1. **Value scanning**: Runs every env var's value through the detection engine. Secrets in values are redacted in-place.
+2. **Name stripping**: Matches env var names against `stripPatterns` using glob patterns. Matching vars are replaced with `"[REDACTED]"` regardless of value. This catches vars like `MY_SECRET=anything` where the value might not match a regex.
 
-2. **Name stripping**: Matches env var names against `stripPatterns` using glob patterns. Matching vars are replaced with `"[REDACTED]"` regardless of their value. This catches vars like `MY_SECRET=anything` where the value might not match any regex pattern but the name indicates it's sensitive.
+**`matchEnvPattern()` helper**: Converts glob patterns to regex. Special characters are escaped, `*` becomes `.*`, and the pattern is anchored with `^...$`.
 
-**`matchEnvPattern()` helper**: Converts glob patterns to regex. Special characters are escaped, `*` becomes `.*`. The pattern is anchored with `^...$` for exact name matching.
+V2 runs this from `shell.create.before`, after `shell-backstop.ts`. It applies to every shell creation, not only agent tool calls.
 
-### `hooks/permission-handler.ts` — `permission.ask`
+### `hooks/shell-backstop.ts` — `shell.create.before`
 
-**Purpose**: Integrate with OpenCode's permission system to give users informed choices.
+**Purpose**: Deterministic global path backstop for every shell spawn.
 
-**When does `permission.ask` fire?** Only when OpenCode's built-in permission system would normally prompt the user about a tool call. Tools that are auto-allowed in OpenCode config do NOT trigger this hook.
+- Parses `command` with `extractFileTargets("shell", ...)` and checks `blockedFilePaths`/`writeProtectedPaths`; whitelist wins.
+- Resolves relative `cwd` against `ctx.location.directory`; absolute `cwd` is used as-is.
+- Also checks remote SSH/SCP/rsync/rclone read/write paths.
+- Makes no LLM calls and has no session identity (the event has none), so audit entries use empty session/call ids.
+- Dynamic targets (`$VAR`, backticks) are skipped here; the agent-facing input sanitizer already fails closed on them.
+- **User impact:** because the hook is process-wide, a configured blocked path also prevents the user's own terminals/background shells from reading or writing that path. This is deliberate and broader than agent-only policy.
+- Throwing aborts shell creation (untyped shell-hook failure channel), which is fail-closed but not a clean typed veto.
+
+### `hooks/permission-handler.ts` — `permission.evaluate`
+
+**Purpose**: Integrate with OpenCode's permission system and produce a deny/ask/allow decision.
+
+**When does it fire?** When the host asserts a permission evaluation for a tool action. It is skipped when a configured/session deny already applies, so `tool.execute.before` remains the universal gate.
 
 **Processing:**
 
-1. **Mode gate**: Only runs if `safetyActionMode === "permission"`. Otherwise returns immediately.
+1. **Alias-aware action/resources/call id resolution** via `v2-adapters.ts`: `action`, `resources`, `source.id`, `source.messageID`, `effect`, `message`.
+2. **Mode gate**: Only acts when `safetyActionMode === "permission"`. Other modes return immediately.
+3. **Deterministic checks first**: `blockedTools`, every local target from args/resources, and remote paths are denied **before** `shouldEvaluate()` and before the null-evaluator gate. V2 `resources` are relative file paths for file actions, resolved against `projectDir`; for `shell`, resources are raw command strings parsed as commands. `subagent` resources are agent IDs, not paths.
+4. **LLM evaluation**: failure denies immediately (does not fall through to `ask`).
+5. **Status mapping**:
+   - `block` / evaluator failure → `effect = "deny"` + denial `message`
+   - `warn` → `effect = "ask"`
+   - `allow` → no change
+6. **Deduplication**: Successful allow/ask/deterministic-bypass outcomes record the call id in `evaluatedCalls`. Denied/failed evaluations are not recorded.
+7. **Denial text**: The adapter writes `event.message`; the handler also sends a synthetic `session.prompt` message on deterministic denies.
 
-2. **Tool filtering**: Checks if the tool is in the safety evaluator's tool list and not bypassed.
+**Why fall back to "block" in the input sanitizer?** When `actionMode === "permission"` but the permission hook did not fire (auto-allowed tool), the input sanitizer still enforces safety by falling back to `"block"` semantics.
 
-3. **LLM evaluation**: Calls `safetyEvaluator.evaluate()` with the tool name and metadata as args.
+### `hooks/outbound-sanitizer.ts` — `session.context`, `session.generate`, `session.title`
 
-4. **Status mapping**:
-   - `recommendation === "block"` → `output.status = "deny"` (auto-denies, no user prompt)
-   - `recommendation === "warn"` → `output.status = "ask"` (shows permission prompt + risk toast)
-   - `recommendation === "allow"` → no status change (OpenCode's default behavior)
+**Purpose**: Deterministic pre-provider enforcement for primary, auxiliary, and title model requests. `session.compaction` delegates to the same sanitizer through its own adapter.
 
-5. **Deduplication**: Adds `callID` to `evaluatedCalls` set. When `tool.execute.before` fires next for this same call, it checks `evaluatedCalls` and skips re-evaluation.
+- `session.context` appends the security policy as a stable system part on every invocation. No marker-based dedup (forgery-resistant); OpenCode builds `event.system` fresh per request, so this never pollutes stored history.
+- `session.generate` reuses the full session context (agent, tools, system, messages). It gets the same policy append, blocked-tool removal, and deterministic scan as a primary request, with diagnostics attributed to `session.generate`.
+- `session.title` is a tool-less `SessionRequest` (`system` + `messages` + options). It gets deterministic redaction but deliberately **not** policy injection, because extra instructions can change title output. A bounded 2.0.18 local-mock replay confirmed the title request sent `[REDACTED]`, had no policy, persisted `Replay Title`, and exited 0.
+- Scans system text, message `text`/`reasoning`/`compaction`, and tool-result text/JSON string values. Reconstructs JSON values rather than mutating stored objects.
+- Historical tool-call input strings are structurally redacted in the request projection: call ids, tool names, argument keys, and object/array shape are preserved; only detected string leaves change. A changed projection is assigned to the per-request `part.input`; the original object is not mutated.
+- File/media identifiers are scanned read-only; a detection throws rather than rewriting a provider reference. Provider-signed/encrypted text or metadata-sensitive input is never rewritten; a required redaction aborts the request.
+- Honors `redactionEnabled` (skip scanning but still append policy where applicable), `redactOnWrite`, and `redactionExemptPaths` for attributable inputs/results. Attribution is history/window-dependent and all-or-nothing.
+- Any scanner exception, cyclic/excessive-depth input, argument-key detection, non-JSON string with a detection, or unsupported request shape throws out of the hook, aborting request preparation (fail-closed).
+- Successful redactions emit one audit entry tagged with the surface (`context`, `generate`, `title`, or `compaction`).
 
-**Why fall back to "block" in the input sanitizer?** When `actionMode === "permission"` but `permission.ask` didn't fire (because the tool is auto-allowed in OpenCode), the input sanitizer falls back to `"block"` behavior. This ensures that auto-allowed tools still get safety evaluation — we can't rely on the permission system for these.
+**Limitations:** the host persists the original pre-hook tool-call input before Warden sees it, and this hook shapes only the outbound request; it does not scrub the session DB or UI/event state. Provider-native metadata is preserved, but signed/encrypted text cannot be rewritten. The title/generate replay used an isolated OpenCode 2.0.18 local mock through the root-`index.js` load form; it did not use an external provider, a 2.1.4 binary, or a live rendered TUI, and it is not a certification of any host version.
 
-### `hooks/compaction-context.ts` — `experimental.session.compacting`
+### `hooks/compaction-context.ts` — `session.compaction`
 
-**Purpose**: Inject security policy context when the session is compacted.
+**Purpose**: Scan the outbound compaction request and append the security policy.
 
-This is a trivial hook — it just pushes the security policy text (generated by `buildSecurityPolicyContext()`) into the compaction context array. OpenCode appends these strings to the compaction prompt, ensuring the AI retains awareness of security constraints across context window compressions.
+- Native path delegates to the same deterministic outbound scanner over `system`/`messages`/`tools`; `redactionEnabled=false` still appends policy but skips scanning.
+- Preserves model options, message metadata, provider metadata, and tool-call identity.
+- Unsupported shapes and scanner failures throw, aborting request preparation.
+- The legacy `{ context: string[] }` sink is still accepted for V1-shaped tests/callers; it receives policy only.
+
+### `hooks/prompt-sanitizer.ts` — `session.prompt`
+
+**Purpose**: Opt-in scanning of user/subtask prompt text **and attachment metadata** before admission.
+
+- Gated by `scanUserPrompts` (default `false`) and `redactionEnabled`.
+- Scans text parts (skipping synthetic parts), subtask prompts, and attachment metadata: file `uri` (except inline `data:` content), `name`, `description`, `mention.text`; agent `name`/mention; skill `id`/`name`/mention.
+- **Never reads attachment file contents.** No decoding, no content scan.
+- On detection: records stats/audit, attempts a notification, then throws to abort admission. The prompt never persists and never reaches the model.
+- The runtime TUI surfaces a generic `"Session error"` rather than the detailed reason.
+
+### `hooks/session-permissions.ts` — Session Deny-Rule Sync
+
+**Purpose**: Defense-in-depth translation of exactly representable policy into session-scoped deny rules.
+
+- Literal `blockedTools` → deny rules for canonical and alias spellings.
+- Literal absolute `blockedFilePaths` → deny for read (`read`/`glob`/`grep`) and write (`write`/`edit`/`patch`) actions.
+- Literal absolute `writeProtectedPaths` → write actions only.
+- Omitted: permission wildcards, configured glob/relative/`~`/`host:` paths, shell path policy, and anything whitelisted. For an absolute path inside the project directory, both the absolute and host-relative resource are emitted; outside the project only the absolute resource is emitted.
+- `session.update({ permissions })` replaces the host ruleset, so the sync re-reads and appends. It re-reads once more immediately before writing and defers if the host ruleset changed; the API has no compare-and-set, so this narrows but does not eliminate the race. Read/update failures resolve `false`, log, and retry later; they never change an allow/deny decision.
+- Synced on `session.created` (best effort), lazily before `tool.execute.before`/`permission.evaluate`, invalidated on `session.permissions`, and forgotten on delete/TTL sweep.
+
+### `hooks/tool-surface.ts` — Blocked Tool Surface
+
+- `session.context` and `session.generate` delete blocked tools from the per-request `event.tools` map before dispatch (alias-aware, by advertised key). `session.title` has no tools.
+- `tool.transform` iterates `editor.list()` and removes blocked tools by their **effective id** (including namespaces), after Warden's custom tools are added, so a blocked custom tool is also removed.
+- `excludedTools` is never used here: it means "skip this tool's input/output processing", not "hide the tool". Global outbound context/generate/title/compaction scanning still covers all messages.
 
 ### `hooks/security-policy.ts` — Policy Text Builder
 
-**Purpose**: Build a markdown document that explains the security system to the AI.
+**Purpose**: Build a compact markdown document that explains the security system to the AI.
 
-The `buildSecurityPolicyContext()` function generates a structured markdown document with sections for:
-- Content redaction (explains `[REDACTED]` markers)
-- Blocked file paths (lists all patterns)
-- Monitored categories (lists enabled categories)
-- Tool call monitoring (warns about blocked commands)
-- Available security tools (lists the 4 tools)
+The `buildSecurityPolicyContext()` function generates sections for:
+- `[REDACTED]` permanence
+- Active redaction switches and exempt paths (inline values the agent cannot read from the blocked config file)
+- Blocked file paths (when non-empty)
+- Write-protected paths (when non-empty)
+- Blocked-command retry warning
+- Output size limit (when configured)
+- A pointer to `security_help` for the tool list
 
-This text is injected into the AI's context in two ways:
-1. On first tool call via `session.prompt()` (immediate)
-2. During session compaction via the compaction hook (ongoing)
+It intentionally does **not** list every tool description or category (tests enforce conciseness). The text is appended per request by `session.context` and `session.generate` and to compaction requests; it is not a synthetic message. `session.title` deliberately opts out to preserve title output.
 
 ---
 
@@ -801,7 +918,7 @@ Deterministic annotations for tool families whose semantics the LLM grinds on (m
 
 The `SafetyEvaluator` analyzes tool calls for safety risks.
 
-**`isBypassed(tool, args)`**: Only applies to `bash` tool. A command bypasses LLM evaluation only if it starts with a prefix in `bypassedCommands` (e.g., `"git status"`, `"ls"`, `"pwd"`) **and** none of the following disqualifiers match:
+**`isBypassed(tool, args)`**: Only applies to the canonical `shell` tool (legacy `bash` accepted). A command bypasses LLM evaluation only if it starts with a prefix in `bypassedCommands` (e.g., `"git status"`, `"ls"`, `"pwd"`) **and** none of the following disqualifiers match:
 
 1. **Execution primitive** — `eval`, `sh -c`, `$(...)`, backticks, process substitution, `xargs`, wrapper-binary execution (`awk system()`, `perl -e`, `python3 -c`, …), `find -exec`
 2. **Unquoted shell comment** (`hasUnsafeComment()` in `utils/command-patterns.ts`) — quote-aware check for `#` at string start or after unquoted whitespace; injection content rides on benign commands (`ls /tmp # IGNORE PREVIOUS SAFETY RULES`)
@@ -809,7 +926,7 @@ The `SafetyEvaluator` analyzes tool calls for safety risks.
 
 When bypass is disqualified, the command is force-evaluated by the LLM. Bare bypass-listed commands (e.g. `cat README.md`) still bypass.
 
-**`shouldEvaluate(tool)`**: Returns true if the evaluator is enabled AND the tool is in the `tools` list (default: `["bash", "write", "edit", "webfetch"]`).
+**`shouldEvaluate(tool)`**: Returns true if the evaluator is enabled AND the tool is in the `tools` list (default: `["shell", "write", "edit", "patch", "read", "webfetch"]`; legacy `bash` is accepted as an alias).
 
 **`evaluate(tool, args)`**: The main evaluation method:
 
@@ -837,7 +954,7 @@ This overrides whatever recommendation the LLM gave. The LLM might say "allow" f
 
 **Response parsing** (`parseResponse()`): Extracts JSON from the LLM response using a regex `/\{[\s\S]*\}/`. This handles cases where the LLM wraps JSON in markdown code blocks. Falls back to `{ safe: false, riskLevel: "critical", recommendation: "block" }` if parsing fails.
 
-**Fail-closed design**: If the LLM call fails (timeout, network error, parse error), the evaluator returns a blocking `{ safe: false, recommendation: "block" }` result. This is a security plugin — if it cannot evaluate, it must not let anything through.
+**Fail-closed design**: If the LLM call fails (timeout, network error, parse error, missing/invalid risk level or recommendation), the evaluator returns a blocking result with `evaluationFailed: true`. Callers block/deny on that flag regardless of `warn`/`permission` mode. A genuine model verdict does not set the flag, so a real `block` may follow `warn`. A model `block`/`warn` recommendation is a floor and cannot be downgraded by a contradictory lower `riskLevel`.
 
 ### `llm/index.ts` — LlmSanitizer Class
 
@@ -936,6 +1053,8 @@ In-memory statistics tracker for the current session.
 
 ## Custom Tools — `src/tools/`
 
+Warden registers 7 tools through `ctx.tool.transform(editor => editor.add(...))`: `security_help`, `security_dashboard`, `security_report`, `security_audit`, `security_evaluate`, `security_config`, and `security_rules`. The sections below detail the three original tools; the additional audit/evaluate/config/help tools follow the same factory + `execute(args): Promise<string>` shape.
+
 ### `tools/security-dashboard.ts`
 
 Returns a formatted text dashboard showing:
@@ -999,13 +1118,13 @@ function deepScan(value, engine, depth = 0): DeepScanResult
 
 **`isBlockedPath(filePath, blockedPatterns, whitelistedPatterns)`**:
 1. Normalize path (backslashes to forward slashes)
-2. Check whitelist first — if any whitelist pattern matches, return `false` (not blocked)
-3. Check blocklist — if any pattern matches, return `true` (blocked)
+2. Check whitelist first — if any whitelist entry matches a path candidate **exactly**, return `false` (not blocked)
+3. Check blocklist — if any glob pattern matches, return `true` (blocked)
 4. Return `false` (not blocked by default)
 
-**Whitelist takes priority over blocklist.** This allows patterns like:
-- Block `**/.env*`
-- Whitelist `**/.env.example`
+**Whitelist takes priority over blocklist.** `whitelistedPaths` entries are exact paths (absolute, `~`-prefixed, or cwd-relative), not globs. This allows:
+- Block `**/.env*` (glob)
+- Whitelist `/home/you/project/.env.example` (exact path)
 
 **`matchGlob(path, pattern)`**: Converts glob patterns to regex:
 
@@ -1022,13 +1141,29 @@ The generated regex is tested in two ways:
 1. `(?:^|/)pattern$` — matches the pattern at any depth
 2. `^pattern$` — matches the full path exactly
 
-**`extractFilePath(tool, args)`**: Maps tool names to their file path argument:
+**`extractFileTargets(tool, args)`**: Returns every `{ path, mode }` target a tool call names. This is the shared multi-target extractor used by the input, permission, output, outbound, and shell hooks.
 
-| Tool | Arg key |
+| Tool | Targets |
 |---|---|
-| `read`, `write`, `edit`, `patch` | `args.filePath` |
-| `bash` | Parse `cat <file>` or `less <file>` from `args.command` |
-| Other tools | `undefined` (no file path extraction) |
+| `read`/`write`/`edit`/`glob`/`grep` | V2 `args.path`, falling back to legacy `args.filePath`; mode depends on the tool/action |
+| `patch` | Every `*** Add File:`, `*** Delete File:`, `*** Update File:`, and `*** Move to:` path in `args.patchText` (move destinations are writes; update sources are checked too) |
+| `shell` (legacy `bash`) | Redirection/`tee`/`truncate`/`dd of=` writes, input-redirect and read-command reads, and `ssh -i` identity files |
+| Unsupported tools | Empty array |
+
+Dynamic shell targets (`$VAR`, backticks) are reported as dynamic so the agent-facing input sanitizer can fail closed.
+
+**`extractRemoteFilePathsFromArgs(tool, args)`** handles SSH/SCP/rsync/rclone read/write paths. **`isRedactionExempt()`** matches local or `host:`-scoped exemptions. **`isPathBlockedForMode()`** combines `blockedFilePaths` (all modes) and `writeProtectedPaths` (write only), with the whitelist winning.
+
+### `utils/tool-compat.ts`
+
+V1→V2 vocabulary helpers:
+
+- `bash` ↔ `shell`, `task` ↔ `subagent`
+- V2 `path` wins over legacy `filePath`
+- `isToolInList()` is alias-aware on both sides
+- `normalizeToolList()` canonicalizes and dedupes configured tool lists in memory without rewriting files
+
+`patch` is V2-only input shape (`patchText`); there is no legacy equivalent beyond `filePath` fallback for older callers/tests.
 
 ---
 
@@ -1072,7 +1207,12 @@ function createTestDeps() {
   const toastState: ToastState = { lastToastTime: 0, minInterval: 0 }
   const sessionAllowlist = new Set<string>()
   const evaluatedCalls = new Set<string>()
-  return { engine, auditLogger, sessionStats, toastState, sessionAllowlist, evaluatedCalls }
+  const writtenFileRegistry = new Map<string, WrittenFileMetadata>()
+  return {
+    engine, auditLogger, sessionStats, toastState, sessionAllowlist,
+    evaluatedCalls, writtenFileRegistry, diagnosticLogger: null,
+    outputTriage: null, outputTextTriage: null,
+  }
 }
 ```
 
@@ -1124,11 +1264,11 @@ describe("Feature Name", () => {
 
     // Act
     const input = { tool: "read", sessionID: "s1", callID: "c1" }
-    const output = { args: { filePath: "/project/test.ts" } }
+    const output = { args: { path: "/project/test.ts" } }
     await hook(input, output)
 
     // Assert
-    expect(output.args.filePath).toBe("/project/test.ts")
+    expect(output.args.path).toBe("/project/test.ts")
   })
 })
 ```
@@ -1187,7 +1327,7 @@ function canToast(state: ToastState): boolean {
 }
 ```
 
-This is a simple time-windowed rate limiter. The `ToastState` object is shared across all hooks, so a toast from the input sanitizer prevents a toast from the output redactor if they fire within the same 2-second window.
+This is a simple time-windowed rate limiter. The `ToastState` object is shared across all hooks, so a notification attempt from the input sanitizer prevents one from the output redactor if they fire within the same 2-second window. The entrypoint wires the shim to the RPC/TUI bridge, which keeps only a closed event kind and bounded metadata. Notifications are UX-only and never gate enforcement.
 
 ### 4. Configuration Deep Merge
 
@@ -1210,17 +1350,17 @@ Arrays are replaced entirely (not concatenated). This is intentional — if a us
 ### 5. Permission-to-InputSanitizer Deduplication
 
 ```
-permission.ask fires for tool X:
+permission.evaluate fires for tool X:
   → evaluates safety
-  → adds callID to evaluatedCalls
-  → sets permission status
+  → records the shared tool call id (event.source.id) in evaluatedCalls
+  → sets effect/message
 
 tool.execute.before fires for tool X:
   → checks evaluatedCalls.has(callID) → true
   → skips safety evaluation entirely
 ```
 
-Without this, the same tool call would be evaluated twice by the LLM (once in `permission.ask`, once in `tool.execute.before`), wasting time and potentially producing inconsistent results.
+Without this, the same tool call would be evaluated twice by the LLM, wasting time and potentially producing inconsistent results. In the observed V2 order (`execute.before` → `permission.evaluate`), the input sanitizer may evaluate first, so a duplicate is possible; the input sanitizer remains the authoritative pre-execution gate, so this is a performance issue, not a bypass. Denied/failed evaluations are deliberately not recorded.
 
 ### 6. Luhn Checksum Validation
 
@@ -1256,11 +1396,13 @@ The plugin follows a **fail-closed** philosophy for LLM-dependent security opera
 
 - **File path blocking**: Throws `Error` to prevent tool execution. The AI sees the error message.
 - **Safety evaluation blocking**: Throws `Error` with risk details. The AI sees why the command was blocked.
-- **LLM evaluation failures**: When the LLM is unreachable, the safety evaluator returns `{ recommendation: "block" }` and the output sanitizer withholds output entirely. This is fail-closed by design — a security plugin must block when it cannot evaluate.
+- **LLM evaluation failures**: When the LLM is unreachable/misconfigured/returns garbage, the safety evaluator marks `evaluationFailed` and the caller blocks/denies regardless of action mode; the output sanitizer withholds output. Explicitly disabled LLM/components are deterministic-only and do not trigger outage blocking. This is fail-closed by design — a security plugin must block when it cannot evaluate.
+- **Config failure**: The entrypoint installs deny-all/withhold-all hooks rather than throwing out of `setup()`. A failed setup would drop every hook and leave the host unprotected.
+- **Outbound scanner failure**: `session.context`/`generate`/`title`/compaction throws, aborting request preparation rather than sending unsanitized history. Session/shell hooks have no typed failure channel, so this is an abort/defect, not a clean typed veto.
 
 ### Non-Critical Operations (catch and continue)
 
-- **Toast notifications**: Wrapped in `try/catch` — toast failures never break tool execution
+- **Notifications**: Wrapped in `try/catch` — notification failures never break tool execution. The RPC/TUI bridge is non-blocking and reports at most a fixed diagnostic.
 - **Audit logging**: Caught silently — logging failures don't affect tool execution
 - **Health checks**: Non-blocking, caught and logged
 
@@ -1275,7 +1417,12 @@ Both the `SafetyEvaluator` and `LlmSanitizer` return blocking defaults when the 
 ```typescript
 // SafetyEvaluator.evaluate()
 catch (err) {
-  return { safe: false, riskLevel: "critical", ..., recommendation: "block" }
+  return {
+    safe: false,
+    riskLevel: "critical",
+    recommendation: "block",
+    evaluationFailed: true, // callers block regardless of actionMode
+  }
 }
 
 // LlmSanitizer.sanitize()
@@ -1284,7 +1431,7 @@ catch (err) {
 }
 ```
 
-A security plugin must never degrade to permissive behavior when its evaluator is down. If the LLM is unreachable, all LLM-evaluated operations are blocked and all sanitized output is withheld. This is the correct, intended behavior — fail-open on a security layer is like disabling the lock when the key doesn't fit.
+A security plugin must never degrade to permissive behavior when its evaluator is down. If the LLM is enabled but unreachable, all LLM-evaluated operations are blocked and all sanitized output is withheld — even in `warn`/`permission` mode. Explicit `llm.enabled: false` or an explicitly disabled component is the only deterministic-only path, and it attempts no LLM calls.
 
 ---
 
@@ -1351,9 +1498,9 @@ export function createMyHook(deps: MyHookDeps) {
 }
 ```
 
-2. Import and create in `src/index.ts`
-3. Register in the returned hooks object
-4. Add tests in `tests/hooks.test.ts`
+2. Import and create it in `src/index.ts`
+3. Register it with the appropriate V2 domain in `setup(ctx)` (`ctx.tool.hook(...)`, `ctx.permission.hook(...)`, `ctx.shell.hook(...)`, `ctx.session.hook(...)`). There is no returned hook object in V2.
+4. Add tests. Use `tests/v2-*.test.ts` for V2 event shapes; `tests/hooks.test.ts` covers the internal V1-shaped handlers.
 
 ### Adding a New Custom Tool
 
@@ -1375,8 +1522,8 @@ export function createMyTool(deps: MyToolDeps) {
 }
 ```
 
-2. Import and create in `src/index.ts`
-3. Register in the `tool` section using `tool()` from `@opencode-ai/plugin`
+2. Import and create it in `src/index.ts`
+3. Register it inside `ctx.tool.transform((editor) => { editor.add({ name, description, input, execute }) })`. Do not use the V1 `tool()` map. Keep `removeBlockedTransformTools(editor, config)` at the end of the transform so a blocked custom tool is also removed.
 
 ### Adding a New Action Mode
 
@@ -1454,8 +1601,10 @@ The `debugLog` is a nullable function created once per hook. When debug is disab
 
 ### Toast Messages
 
-Toast messages follow a consistent format:
+Toast/notification copy follows a consistent format:
 - Blocked: `🛡 Blocked: {reason}`
 - Redacted: `🔒 Redacted {count} secret(s) in {tool} output`
 - Warning: `⚠️ Warning: {explanation}`
 - Info: `⚠️ Detected {count} secret(s) (NOT redacted)`
+
+In the V2 entrypoint the copy above is routed to the TUI/RPC companion as a fixed, closed-class event; raw messages, paths, and explanations are discarded. The TUI renders fixed copy (server-plugin toasts do not exist). Audit and diagnostic logs remain the authoritative record, and notifications never affect enforcement.

@@ -1,5 +1,6 @@
 import type {
   SafetyEvaluation,
+  SafetyEvaluationResult,
   RiskLevel,
   RiskDimension,
   SecurityGuardConfig,
@@ -26,6 +27,9 @@ import {
 } from "../utils/command-patterns.js"
 import { hasStaticFindings } from "./static-findings.js"
 import { tryParseJsonObject } from "../utils/json-repair.js"
+import { canonicalToolName, isToolInList } from "../utils/tool-compat.js"
+
+export type { SafetyEvaluationResult } from "../types.js"
 
 const RISK_LEVEL_ORDER: Record<RiskLevel, number> = {
   none: 0,
@@ -34,6 +38,16 @@ const RISK_LEVEL_ORDER: Record<RiskLevel, number> = {
   high: 3,
   critical: 4,
 }
+
+/**
+ * `SafetyEvaluationResult` is defined in `src/types.ts`. It carries the
+ * `evaluationFailed` discriminator: `recommendation: "block"` is deliberately
+ * overloaded (genuine risk verdict vs. evaluator unavailable), and callers MUST
+ * use `evaluationFailed` to distinguish them. A genuine risk verdict may follow
+ * the configured `actionMode` (including `warn`); an evaluator outage or
+ * malformed response must block/deny regardless of mode. It is never set for a
+ * successfully parsed model verdict.
+ */
 
 /**
  * Canonical alias map for risk dimensions. Models emit the same concept in
@@ -173,7 +187,7 @@ export class SafetyEvaluator {
    *    (SCP/SFTP/interactive SSH never bypassed)
    */
   isBypassed(tool: string, args: Record<string, unknown>): boolean {
-    if (tool !== "bash") return false
+    if (canonicalToolName(tool) !== "shell") return false
 
     const command = (args.command as string | undefined) || ""
 
@@ -248,9 +262,10 @@ export class SafetyEvaluator {
 
   /**
    * Check if this tool should be evaluated.
+   * Alias-aware: configured `shell` matches runtime `bash` (and vice versa).
    */
   shouldEvaluate(tool: string): boolean {
-    return this.config.enabled && this.config.tools.includes(tool)
+    return this.config.enabled && isToolInList(tool, this.config.tools)
   }
 
   /**
@@ -259,7 +274,7 @@ export class SafetyEvaluator {
   async evaluate(
     tool: string,
     args: Record<string, unknown>,
-  ): Promise<SafetyEvaluation> {
+  ): Promise<SafetyEvaluationResult> {
     const log = this.debugLog
     const start = Date.now()
 
@@ -294,7 +309,9 @@ export class SafetyEvaluator {
       this.debugLog?.(
         `Safety evaluation failed: ${err instanceof Error ? err.message : err}`,
       )
-      // Fail closed: block if LLM is unreachable
+      // Fail closed: block if LLM is unreachable. The failure marker keeps this
+      // distinguishable from a genuine risk verdict so callers cannot downgrade
+      // an outage to a warning.
       return {
         safe: false,
         riskLevel: "critical",
@@ -302,6 +319,7 @@ export class SafetyEvaluator {
         explanation: "LLM unreachable — blocking for safety",
         suggestedAlternative: "",
         recommendation: "block",
+        evaluationFailed: true,
       }
     }
   }
@@ -313,7 +331,7 @@ export class SafetyEvaluator {
   async dryRun(
     tool: string,
     args: Record<string, unknown>,
-  ): Promise<SafetyEvaluation> {
+  ): Promise<SafetyEvaluationResult> {
     const log = this.debugLog
 
     // Fast-path: bypassed commands don't need LLM
@@ -367,6 +385,7 @@ export class SafetyEvaluator {
         explanation: "LLM unreachable — dry-run cannot evaluate",
         suggestedAlternative: "",
         recommendation: "block",
+        evaluationFailed: true,
       }
     }
   }
@@ -383,7 +402,7 @@ export class SafetyEvaluator {
     filePath: string,
     fileContent: string,
     writtenByAgent: boolean,
-  ): Promise<SafetyEvaluation> {
+  ): Promise<SafetyEvaluationResult> {
     const log = this.debugLog
     const start = Date.now()
 
@@ -429,6 +448,7 @@ export class SafetyEvaluator {
         explanation: "File content evaluation failed — blocking for safety",
         suggestedAlternative: "",
         recommendation: "block",
+        evaluationFailed: true,
       }
     }
   }
@@ -437,31 +457,60 @@ export class SafetyEvaluator {
     this.context.reset()
   }
 
-  private applyThresholds(evaluation: SafetyEvaluation): SafetyEvaluation {
+  private applyThresholds(evaluation: SafetyEvaluation): SafetyEvaluationResult {
     const riskOrder = RISK_LEVEL_ORDER[evaluation.riskLevel] || 0
     const blockOrder = RISK_LEVEL_ORDER[this.config.blockThreshold] || 3
     const warnOrder = RISK_LEVEL_ORDER[this.config.warnThreshold] || 2
 
-    if (riskOrder >= blockOrder) {
+    // The model may raise severity beyond the configured threshold, but it may
+    // not lower it: a genuine "block"/"warn" verdict must still follow the
+    // configured action mode. (A contradictory low riskLevel cannot turn the
+    // model's own block recommendation into `allow`.)
+    if (riskOrder >= blockOrder || evaluation.recommendation === "block") {
       return { ...evaluation, recommendation: "block", safe: false }
     }
-    if (riskOrder >= warnOrder) {
+    if (riskOrder >= warnOrder || evaluation.recommendation === "warn") {
       return { ...evaluation, recommendation: "warn", safe: true }
     }
     return { ...evaluation, recommendation: "allow", safe: true }
   }
 
-  private parseResponse(response: string): SafetyEvaluation {
+  private parseResponse(response: string): SafetyEvaluationResult {
     // Try parsing with JSON repair (handles unescaped quotes from small LLMs)
     const parsed = tryParseJsonObject(response)
     if (parsed) {
+      // A verdict without a valid riskLevel is garbage, not a safe command.
+      // `applyThresholds` would otherwise coerce an unknown level to "none"
+      // and fail open. Treat it the same as an unparseable response.
+      const rawRiskLevel = parsed.riskLevel
+      const rawRecommendation = parsed.recommendation
+      if (
+        typeof rawRiskLevel !== "string" ||
+        !Object.prototype.hasOwnProperty.call(RISK_LEVEL_ORDER, rawRiskLevel) ||
+        typeof rawRecommendation !== "string" ||
+        !["allow", "warn", "block"].includes(rawRecommendation)
+      ) {
+        this.debugLog?.(
+          `Safety eval: invalid riskLevel ${JSON.stringify(rawRiskLevel)} / recommendation ${JSON.stringify(rawRecommendation)} — treating response as evaluation failure`,
+        )
+        return {
+          safe: false,
+          riskLevel: "critical",
+          riskDimensions: [],
+          explanation: "Could not parse safety evaluation — missing or invalid riskLevel/recommendation",
+          suggestedAlternative: "",
+          recommendation: "block",
+          evaluationFailed: true,
+        }
+      }
+
       return {
         safe: Boolean(parsed.safe),
-        riskLevel: ((parsed.riskLevel as string) || "none") as RiskLevel,
+        riskLevel: rawRiskLevel as RiskLevel,
         riskDimensions: normalizeRiskDimensions(parsed.riskDimensions),
         explanation: (parsed.explanation as string) || "",
         suggestedAlternative: (parsed.suggestedAlternative as string) || "",
-        recommendation: ((parsed.recommendation as string) || "allow") as SafetyEvaluation["recommendation"],
+        recommendation: rawRecommendation as SafetyEvaluation["recommendation"],
       }
     }
 
@@ -477,6 +526,7 @@ export class SafetyEvaluator {
       explanation: "Could not parse safety evaluation — blocking for safety",
       suggestedAlternative: "",
       recommendation: "block",
+      evaluationFailed: true,
     }
   }
 }

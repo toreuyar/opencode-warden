@@ -2,7 +2,7 @@ import { describe, test, expect, afterEach } from "bun:test"
 import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "fs"
 import { join } from "path"
 import { tmpdir } from "os"
-import { isBlockedPath, isWriteProtectedPath, isPathBlockedForMode, isRedactionExempt, matchGlob, extractFilePath, extractRemoteFilePathsFromArgs, extractBashFileTargets, isDynamicPathTarget } from "../src/utils/paths.js"
+import { isBlockedPath, isWriteProtectedPath, isPathBlockedForMode, isRedactionExempt, matchGlob, extractFilePath, extractFileTargets, extractPatchFileTargets, extractRemoteFilePathsFromArgs, extractBashFileTargets, isDynamicPathTarget } from "../src/utils/paths.js"
 import { DEFAULT_CONFIG } from "../src/config/defaults.js"
 
 const tempDirs: string[] = []
@@ -570,5 +570,150 @@ describe("isRedactionExempt", () => {
     expect(
       isRedactionExempt("src/local.txt", patterns, { host: "any" }),
     ).toBe(false)
+  })
+})
+
+describe("V2 tool argument compatibility", () => {
+  test("extracts V2 path from read/write/edit", () => {
+    expect(extractFilePath("read", { path: "/project/.env" })).toBe("/project/.env")
+    expect(extractFilePath("write", { path: "/project/out.txt" })).toBe("/project/out.txt")
+    expect(extractFilePath("edit", { path: "/project/src/index.ts" })).toBe("/project/src/index.ts")
+  })
+
+  test("keeps legacy filePath support", () => {
+    expect(extractFilePath("read", { filePath: "/project/.env" })).toBe("/project/.env")
+    expect(extractFilePath("write", { filePath: "/project/out.txt" })).toBe("/project/out.txt")
+  })
+
+  test("extracts grep path as a read target", () => {
+    expect(extractFilePath("grep", { path: "src", pattern: "secret" })).toBe("src")
+    expect(extractFileTargets("grep", { path: "src", pattern: "secret" })).toEqual([
+      { path: "src", mode: "read" },
+    ])
+  })
+
+  test("treats legacy bash as canonical shell for remote extraction", () => {
+    expect(
+      extractRemoteFilePathsFromArgs("shell", { command: 'ssh user@host.com "cat /etc/passwd"' }),
+    ).toEqual([{ host: "host.com", path: "/etc/passwd", mode: "read" }])
+    expect(
+      extractRemoteFilePathsFromArgs("bash", { command: 'ssh user@host.com "cat /etc/passwd"' }),
+    ).toEqual([{ host: "host.com", path: "/etc/passwd", mode: "read" }])
+  })
+})
+
+describe("extractPatchFileTargets", () => {
+  const patchText = [
+    "*** Begin Patch",
+    "*** Add File: config/new.env",
+    "+SECRET=value",
+    "*** Update File: src/app.ts",
+    "@@",
+    "-old",
+    "+new",
+    "*** Move to: src/renamed.ts",
+    "*** Delete File: old.txt",
+    "*** Update File: src/other.ts",
+    "@@",
+    "-a",
+    "+b",
+    "*** End Patch",
+  ].join("\n")
+
+  test("extracts add, update, delete, and move targets", () => {
+    expect(extractPatchFileTargets(patchText)).toEqual([
+      { path: "config/new.env", mode: "write" },
+      { path: "src/app.ts", mode: "write" },
+      { path: "src/renamed.ts", mode: "write" },
+      { path: "old.txt", mode: "write" },
+      { path: "src/other.ts", mode: "write" },
+    ])
+  })
+
+  test("handles CRLF and deduplicates repeated targets", () => {
+    const crlf = [
+      "*** Begin Patch",
+      "*** Update File: src/app.ts",
+      "*** Move to: src/app.ts",
+      "*** Delete File: src/app.ts",
+      "*** End Patch",
+    ].join("\r\n")
+    expect(extractPatchFileTargets(crlf)).toEqual([
+      { path: "src/app.ts", mode: "write" },
+    ])
+  })
+
+  test("ignores add-file text embedded in patch content", () => {
+    const embedded = [
+      "*** Begin Patch",
+      "*** Add File: real.txt",
+      "+*** Add File: fake.txt",
+      "*** End Patch",
+    ].join("\n")
+    expect(extractPatchFileTargets(embedded)).toEqual([
+      { path: "real.txt", mode: "write" },
+    ])
+  })
+
+  test("extractFilePath returns the first patch target", () => {
+    expect(extractFilePath("patch", { patchText })).toBe("config/new.env")
+  })
+
+  test("extractFileTargets returns every patch target", () => {
+    expect(extractFileTargets("patch", { patchText })).toEqual(
+      extractPatchFileTargets(patchText),
+    )
+  })
+
+  test("supports legacy patch path fallback", () => {
+    expect(extractFilePath("patch", { filePath: "/project/legacy.txt" })).toBe(
+      "/project/legacy.txt",
+    )
+    expect(extractFileTargets("patch", { filePath: "/project/legacy.txt" })).toEqual([
+      { path: "/project/legacy.txt", mode: "write" },
+    ])
+  })
+
+  test("patch targets integrate with the default blocklist", () => {
+    const blocked = DEFAULT_CONFIG.blockedFilePaths
+    const targets = extractPatchFileTargets("*** Begin Patch\n*** Add File: app/.env\n+x=1\n*** End Patch")
+    expect(
+      targets.some(({ path, mode }) => isPathBlockedForMode(path, mode, blocked, [], [])),
+    ).toBe(true)
+  })
+})
+
+describe("extractFileTargets", () => {
+  test("returns V2 read/write targets", () => {
+    expect(extractFileTargets("read", { path: "/project/src/index.ts" })).toEqual([
+      { path: "/project/src/index.ts", mode: "read" },
+    ])
+    expect(extractFileTargets("write", { path: "/project/out.txt" })).toEqual([
+      { path: "/project/out.txt", mode: "write" },
+    ])
+  })
+
+  test("extracts shell redirection writes and reads", () => {
+    expect(
+      extractFileTargets("shell", { command: "echo x >> /var/log/syslog && cat /app/.env" }),
+    ).toEqual([
+      { path: "/var/log/syslog", mode: "write" },
+      { path: "/app/.env", mode: "read" },
+    ])
+    expect(
+      extractFileTargets("bash", { command: "echo x >> /var/log/syslog && cat /app/.env" }),
+    ).toEqual(extractFileTargets("shell", { command: "echo x >> /var/log/syslog && cat /app/.env" }))
+  })
+
+  test("includes SSH identity files as read targets without duplicates", () => {
+    // Inner remote paths are handled by extractRemoteFilePathsFromArgs; this
+    // helper reports local targets only.
+    expect(
+      extractFileTargets("shell", { command: 'ssh -i ~/.ssh/id_rsa user@host.com "cat /etc/passwd"' }),
+    ).toEqual([{ path: "~/.ssh/id_rsa", mode: "read" }])
+  })
+
+  test("returns empty for unsupported tools", () => {
+    expect(extractFileTargets("webfetch", { url: "https://example.com" })).toEqual([])
   })
 })

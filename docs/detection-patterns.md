@@ -2,7 +2,7 @@
 
 [← Back to README](../README.md)
 
-Warden ships with 74 built-in detection patterns across 7 major categories. All patterns are active by default except `pii-ip-address`.
+Warden ships with **66 defined built-in detection patterns**, of which **65 are active by default**. They are grouped into seven pattern families and eleven `categories` switches (API keys, credentials, private keys, Docker, Kubernetes, cloud, and five PII groups). Only the IP-address group (`pii-ip-address`) is disabled by default.
 
 You can disable individual patterns by ID using `disabledPatterns`, disable entire categories using `categories`, or add your own patterns using `customPatterns`. See [Configuration](configuration.md) for details.
 
@@ -47,7 +47,7 @@ You can disable individual patterns by ID using `disabledPatterns`, disable enti
 
 RSA, OpenSSH, DSA, EC, generic PEM, encrypted PEM, and PGP private key blocks.
 
-## Docker (4 patterns)
+## Docker (5 patterns)
 
 Swarm join tokens, registry auth, inline secrets in `docker run -e`, build arg secrets, and compose environment secrets.
 
@@ -55,7 +55,7 @@ Swarm join tokens, registry auth, inline secrets in `docker run -e`, build arg s
 
 Secret data values, kubeconfig tokens, client key/cert data, Helm `--set` secrets, and service account tokens.
 
-## Cloud Providers (14 patterns)
+## Cloud Providers (15 patterns)
 
 Azure connection strings, SAS tokens, AD client secrets, Terraform state secrets, variable secrets, HashiCorp Vault tokens, Pulumi config passphrase, Heroku, Vercel, Supabase, Cloudflare, and DigitalOcean tokens.
 
@@ -70,4 +70,4 @@ Azure connection strings, SAS tokens, AD client secrets, Terraform state secrets
 | Credit Card | Major card formats with Luhn checksum validation |
 | IP Address | IPv4 addresses (excludes common private ranges like 127.0.0.1, 192.168.*, 10.*) |
 
-> **Note**: `pii-ip-address` is disabled by default due to high false-positive rates. Enable it if your workflow requires IP detection.
+> **Note**: The `pii-ip-address` category (pattern id `pii-ipv4`) is disabled by default due to high false-positive rates. Enable the category if your workflow requires IP detection, or disable the individual pattern with `disabledPatterns: ["pii-ipv4"]`.

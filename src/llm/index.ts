@@ -6,6 +6,7 @@ import {
 } from "./prompts.js"
 import type { ProviderChain } from "./provider-chain.js"
 import { tryParseJsonObject } from "../utils/json-repair.js"
+import { isToolInList } from "../utils/tool-compat.js"
 
 export class LlmSanitizer {
   private context: ConversationContext
@@ -59,12 +60,14 @@ export class LlmSanitizer {
 
   /**
    * Check if this tool's output should be LLM-sanitized.
+   * Alias-aware: a configured `shell` also matches runtime `bash`, and
+   * configured legacy `bash` still matches runtime `shell`.
    */
   shouldSanitize(tool: string): boolean {
     return (
       this.llmEnabled &&
       this.endpointConfig.enabled &&
-      this.endpointConfig.tools.includes(tool)
+      isToolInList(tool, this.endpointConfig.tools)
     )
   }
 

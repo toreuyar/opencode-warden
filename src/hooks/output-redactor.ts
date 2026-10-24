@@ -18,7 +18,8 @@ import {
   isPipedCommandSafe,
   matchesCommandPrefix,
 } from "../utils/command-patterns.js"
-import { isBlockedPath, isRedactionExempt, extractBashFileTargets, extractRemoteFilePathsFromArgs } from "../utils/paths.js"
+import { isBlockedPath, isRedactionExempt, extractFileTargets, extractRemoteFilePathsFromArgs } from "../utils/paths.js"
+import { canonicalToolName, isToolInList } from "../utils/tool-compat.js"
 import { isRemoteCommand } from "../utils/ssh.js"
 
 interface OutputRedactorDeps {
@@ -124,13 +125,13 @@ export function createOutputRedactor(deps: OutputRedactorDeps) {
   const outputBypassPrefixes = config.llm.outputSanitizer.bypassedCommands
 
   /**
-   * Check if a bash command's output can bypass LLM sanitization.
-   * Only applies to "bash" tool. Uses the same sudo-stripping and
-   * pipe-chain logic as the safety evaluator, but with the output
-   * sanitizer's own bypass list.
+   * Check if a shell command's output can bypass LLM sanitization.
+   * Accepts both V2 `shell` and legacy `bash` names. Uses the same
+   * sudo-stripping and pipe-chain logic as the safety evaluator, but with the
+   * output sanitizer's own bypass list.
    */
   function isOutputBypassed(tool: string, args?: Record<string, unknown>): boolean {
-    if (tool !== "bash") return false
+    if (canonicalToolName(tool) !== "shell") return false
     const rawCommand = typeof args?.command === "string" ? args.command : ""
     if (!rawCommand) return false
 
@@ -167,9 +168,10 @@ export function createOutputRedactor(deps: OutputRedactorDeps) {
       : undefined
 
     const outputActionMode = config.llm.outputSanitizer.actionMode
+    const canonicalTool = canonicalToolName(input.tool)
 
-    // Skip excluded tools
-    if (config.excludedTools.includes(input.tool)) {
+    // Skip excluded tools (alias-aware: excluded "shell" also excludes legacy "bash")
+    if (isToolInList(input.tool, config.excludedTools)) {
       debugLog?.(`Output hook: tool=${input.tool} → SKIPPED (excluded)`)
       diagnosticLogger?.hookEnd("output-redactor", input.tool, input.callID, Date.now() - hookStart, { outcome: "skipped", reason: "excluded tool" })
       return
@@ -177,7 +179,7 @@ export function createOutputRedactor(deps: OutputRedactorDeps) {
 
     // SSH-only mode: skip all non-remote commands
     if (config.sshOnlyMode) {
-      if (input.tool === "bash") {
+      if (canonicalTool === "shell") {
         const command = typeof input.args?.command === "string" ? input.args.command : ""
         if (!isRemoteCommand(command)) {
           debugLog?.(`Output hook: tool=${input.tool} → SKIPPED (sshOnlyMode: not a remote command)`)
@@ -185,14 +187,14 @@ export function createOutputRedactor(deps: OutputRedactorDeps) {
           return
         }
       } else {
-        debugLog?.(`Output hook: tool=${input.tool} → SKIPPED (sshOnlyMode: non-bash tool)`)
-        diagnosticLogger?.hookEnd("output-redactor", input.tool, input.callID, Date.now() - hookStart, { outcome: "skipped", reason: "sshOnlyMode: non-bash tool" })
+        debugLog?.(`Output hook: tool=${input.tool} → SKIPPED (sshOnlyMode: non-shell tool)`)
+        diagnosticLogger?.hookEnd("output-redactor", input.tool, input.callID, Date.now() - hookStart, { outcome: "skipped", reason: "sshOnlyMode: non-shell tool" })
         return
       }
     }
 
     // Glob output filtering: strip blocked paths from glob results
-    if (input.tool === "glob" && typeof output.output === "string" && output.output.length > 0) {
+    if (canonicalTool === "glob" && typeof output.output === "string" && output.output.length > 0) {
       const lines = output.output.split("\n")
       const filtered: string[] = []
       let strippedCount = 0
@@ -216,28 +218,24 @@ export function createOutputRedactor(deps: OutputRedactorDeps) {
     // skips secret redaction.
     //
     // Covers:
-    //   - `read` tool reading a local exempt path
-    //   - bash reading a local exempt path via `cat`/`head`/`tail`/`<`
-    //   - bash downloading from a remote exempt path via SSH/SCP/rsync/rclone
+    //   - `read`/`glob`/`grep` reading a local exempt path (V2 `path` or legacy
+    //     `filePath`)
+    //   - shell reading local exempt paths via `cat`/`head`/`tail`/`<`
+    //   - shell downloading from a remote exempt path via SSH/SCP/rsync/rclone
     //
     // Also short-circuited when redactionEnabled is false (global kill switch).
     const redactionGloballyDisabled = !config.redactionEnabled
-    const readFilePath =
-      input.tool === "read" && input.args && typeof input.args.filePath === "string"
-        ? (input.args.filePath as string)
-        : undefined
 
     // Collect all read targets this call touches, then check exemption. A
     // path-based exemption is all-or-nothing for multi-target commands because
     // merged shell output cannot be attributed back to individual files.
-    const readTargets: Array<{ path: string; host?: string }> = []
-    if (typeof readFilePath === "string") {
-      readTargets.push({ path: readFilePath })
-    }
-    if (input.tool === "bash" && input.args && typeof input.args.command === "string") {
-      for (const r of extractBashFileTargets(input.args.command as string).reads) {
-        readTargets.push({ path: r })
-      }
+    const readTargets: Array<{ path: string; host?: string }> = extractFileTargets(
+      input.tool,
+      input.args ?? {},
+    )
+      .filter((target) => target.mode === "read")
+      .map((target) => ({ path: target.path }))
+    if (canonicalTool === "shell" && input.args && typeof input.args.command === "string") {
       for (const { host, path, mode } of extractRemoteFilePathsFromArgs(input.tool, input.args)) {
         if (mode === "read") readTargets.push({ path, host })
       }
@@ -318,6 +316,43 @@ export function createOutputRedactor(deps: OutputRedactorDeps) {
     // Also skip when path is redaction-exempt.
     let llmDetections = 0
     let llmBlocked = false
+
+    // The sanitizer component is enabled for this tool when the LLM and output
+    // sanitizer are enabled and this tool is in its configured list. If that is
+    // true but the sanitizer instance is null, the plugin is misconfigured:
+    // withhold the output (fail-closed). Explicitly disabled LLM/components are
+    // deterministic-only and must not trigger outage blocking.
+    const sanitizerComponentEnabled =
+      config.llm.enabled &&
+      config.llm.outputSanitizer.enabled &&
+      isToolInList(input.tool, config.llm.outputSanitizer.tools ?? [])
+
+    if (
+      !redactionExempt &&
+      outputActionMode !== "pass" &&
+      sanitizerComponentEnabled &&
+      !llmSanitizer
+    ) {
+      debugLog?.(
+        `Output hook: tool=${input.tool} → output sanitizer enabled but unavailable — BLOCKING output for safety`,
+      )
+      diagnosticLogger?.decision("output-redactor", input.tool, "BLOCKED: output sanitizer enabled but unavailable")
+      llmBlocked = true
+      output.output = "[BLOCKED] Output sanitizer unavailable — output withheld for safety"
+      output.title = "[BLOCKED] Output withheld"
+
+      if (config.notifications) {
+        try {
+          await client.tui.showToast({
+            body: {
+              message: `🛡 Output blocked: output sanitizer unavailable for ${input.tool}`,
+              variant: "error" as const,
+            },
+          })
+        } catch { /* toast failure is non-critical */ }
+      }
+    }
+
     if (
       !redactionExempt &&
       outputActionMode !== "pass" &&
@@ -400,7 +435,7 @@ export function createOutputRedactor(deps: OutputRedactorDeps) {
 
       // Layer 1: Command triage — ask lightweight LLM if this command's output needs sanitization
       let commandTriagedClean = false
-      if (!shouldSkip && !llmBlocked && !outputBypassed && llmSanitizer.isAvailable() && outputTriage && outputTriage.isEnabled()) {
+      if (!shouldSkip && !llmBlocked && !outputBypassed && outputTriage && outputTriage.isEnabled()) {
         try {
           const triageResult = await outputTriage.evaluate(input.tool, input.args || {})
           if (!triageResult.needsSanitization) {
@@ -439,7 +474,7 @@ export function createOutputRedactor(deps: OutputRedactorDeps) {
 
       // Layer 2: Text triage — scan actual output text for secrets (if command triage didn't clear it)
       let textTriagedClean = false
-      if (!shouldSkip && !llmBlocked && !outputBypassed && !commandTriagedClean && llmSanitizer.isAvailable() && outputTextTriage && outputTextTriage.isEnabled()) {
+      if (!shouldSkip && !llmBlocked && !outputBypassed && !commandTriagedClean && outputTextTriage && outputTextTriage.isEnabled()) {
         try {
           const textTriageResult = await outputTextTriage.evaluate(input.tool, input.args || {}, output.output)
           if (!textTriageResult.needsSanitization) {
@@ -478,7 +513,7 @@ export function createOutputRedactor(deps: OutputRedactorDeps) {
 
       // Layer 3: Sanitizer — detection-only LLM + plugin-side redaction
       const needsSanitizer = !shouldSkip && !llmBlocked && !outputBypassed && !commandTriagedClean && !textTriagedClean
-      if (needsSanitizer && llmSanitizer.isAvailable()) {
+      if (needsSanitizer) {
         try {
           // Build rich context from tool name, args, and title
           const contextParts: string[] = [`Tool: ${input.tool}`]

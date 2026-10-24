@@ -4,6 +4,25 @@
 
 Warden provides 7 built-in tools that the AI (or you) can invoke during a session. These tools give you and the AI real-time visibility into security state, session history, audit records, and rule management — without leaving your workflow.
 
+In Warden 2.0.0 the tools are registered through the OpenCode V2 `tool.transform`
+surface. Configured `blockedTools` removes matching tools from the request and
+registered list (alias-aware for `shell`/`bash` and `subagent`/`task`). Tool
+arguments and outputs are still subject to Warden's normal hook processing.
+
+**Invocation through Code Mode.** OpenCode places plugin tools in Code Mode by
+default, so these seven tools are **not** exposed in the native provider tool
+list. The AI calls them through the `execute` tool, for example:
+
+```js
+return await tools.security_help({})
+```
+
+This was verified on OpenCode 2.0.18: the native tool list contained `execute`
+but no `security_*` names, while `tools.security_help` returned the full tool
+list. Warden does not currently opt the tools out of Code Mode, so native direct
+visibility is not claimed. `blockedTools` still removes Code Mode tools because
+it filters the effective registry.
+
 ## `security_help`
 
 Parametric tool discovery — lists available Warden tools and their arguments.
@@ -53,7 +72,7 @@ Queries the audit log file with optional filters, returning matching entries.
 
 **Arguments:**
 - `limit`: Maximum number of entries to return (default: 50)
-- `tool`: Filter by tool name (e.g., `"bash"`, `"read"`)
+- `tool`: Filter by tool name (e.g., `"shell"`, `"read"`; legacy `"bash"` entries remain valid)
 - `blocked`: `true` to return only blocked calls, `false` for non-blocked, omit for all
 - `since`: ISO 8601 timestamp — only return entries after this time
 - `category`: Filter by detection category (e.g., `"api-keys"`, `"credentials"`)
@@ -65,7 +84,7 @@ Returns parsed JSON log entries from `.opencode/warden/audit.log`. Useful for th
 Dry-run safety evaluation — evaluates a hypothetical tool call without executing it.
 
 **Arguments:**
-- `toolName`: The tool to evaluate (e.g., `"bash"`, `"write"`)
+- `toolName`: The tool to evaluate (e.g., `"shell"`, `"write"`; legacy `"bash"` is accepted as an alias)
 - `args`: The arguments object as it would be passed to the tool
 
 Returns the LLM safety evaluation result: risk level, risk dimensions, explanation, and recommendation. Does not execute the tool or log to the audit trail.

@@ -1,7 +1,7 @@
 import type { DetectionEngine } from "../detection/engine.js"
 import type { AuditLogger } from "../audit/index.js"
 import type { SessionStats } from "../audit/session-stats.js"
-import type { SafetyEvaluator } from "../llm/safety-evaluator.js"
+import type { SafetyEvaluator, SafetyEvaluationResult } from "../llm/safety-evaluator.js"
 import type { DiagnosticLogger } from "../audit/diagnostic-logger.js"
 import type {
   SecurityGuardConfig,
@@ -10,7 +10,8 @@ import type {
   PatternCategory,
   WrittenFileMetadata,
 } from "../types.js"
-import { isAllowlisted, isPathBlockedForMode, isRedactionExempt, extractFilePath, extractRemoteFilePathsFromArgs, extractBashFileTargets, isDynamicPathTarget } from "../utils/paths.js"
+import { isAllowlisted, isPathBlockedForMode, isRedactionExempt, extractFileTargets, extractRemoteFilePathsFromArgs, isDynamicPathTarget } from "../utils/paths.js"
+import { canonicalToolName, isToolInList } from "../utils/tool-compat.js"
 import { deepScan } from "../utils/deep-scan.js"
 import {
   extractExecutedFilePaths,
@@ -101,6 +102,11 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
 
     sessionStats.recordToolCall()
 
+    // Policy vocabulary is V2-canonical (`shell`, `subagent`), but runtime
+    // callers may still supply legacy names (`bash`, `task`). Every policy
+    // check below is alias-aware.
+    const canonicalTool = canonicalToolName(input.tool)
+
     const debugLog = config.llm.debug
       ? (msg: string) => {
           client.app.log({
@@ -109,8 +115,9 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
         }
       : undefined
 
-    // Block tools on the blocklist (e.g., "task" to prevent subagent spawning)
-    if (config.blockedTools.includes(input.tool)) {
+    // Block tools on the blocklist (e.g., "subagent"/legacy "task" to prevent
+    // subagent spawning). Alias-aware on both sides.
+    if (isToolInList(input.tool, config.blockedTools)) {
       debugLog?.(`Input hook: tool=${input.tool} → BLOCKED (blockedTools)`)
       diagnosticLogger?.decision("input-sanitizer", input.tool, `BLOCKED by blockedTools policy`)
 
@@ -140,8 +147,8 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
       )
     }
 
-    // Skip excluded tools
-    if (config.excludedTools.includes(input.tool)) {
+    // Skip excluded tools (alias-aware: excluded "shell" also excludes legacy "bash")
+    if (isToolInList(input.tool, config.excludedTools)) {
       debugLog?.(`Input hook: tool=${input.tool} → SKIPPED (excluded)`)
       diagnosticLogger?.hookEnd("input-sanitizer", input.tool, input.callID, Date.now() - hookStart, { outcome: "skipped", reason: "excluded tool" })
       return
@@ -149,7 +156,7 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
 
     // SSH-only mode: skip all non-remote commands
     if (config.sshOnlyMode) {
-      if (input.tool === "bash") {
+      if (canonicalTool === "shell") {
         const command = typeof output.args.command === "string" ? output.args.command : ""
         if (!isRemoteCommand(command)) {
           debugLog?.(`Input hook: tool=${input.tool} → SKIPPED (sshOnlyMode: not a remote command)`)
@@ -157,25 +164,23 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
           return
         }
       } else {
-        debugLog?.(`Input hook: tool=${input.tool} → SKIPPED (sshOnlyMode: non-bash tool)`)
-        diagnosticLogger?.hookEnd("input-sanitizer", input.tool, input.callID, Date.now() - hookStart, { outcome: "skipped", reason: "sshOnlyMode: non-bash tool" })
+        debugLog?.(`Input hook: tool=${input.tool} → SKIPPED (sshOnlyMode: non-shell tool)`)
+        diagnosticLogger?.hookEnd("input-sanitizer", input.tool, input.callID, Date.now() - hookStart, { outcome: "skipped", reason: "sshOnlyMode: non-shell tool" })
         return
       }
     }
 
-    // Step 1: Check file path blocking (mode-aware: writes also honor writeProtectedPaths)
-    const filePath = extractFilePath(input.tool, output.args)
-    if (filePath) {
-      const isAllowlistedPath = isAllowlisted(filePath, sessionAllowlist, projectDir)
-      const accessMode: "read" | "write" = ["write", "edit", "patch"].includes(input.tool) ? "write" : "read"
+    // Step 1: Check every local file target (mode-aware). The shared
+    // multi-target extractor covers V2 `path`, legacy `filePath`, all patch
+    // add/delete/update/MOVE destinations, and shell redirection/read targets.
+    // Whitelist wins per target; write targets also honor writeProtectedPaths.
+    const fileTargets = extractFileTargets(input.tool, output.args)
 
-      if (
-        !isAllowlistedPath &&
-        isPathBlockedForMode(filePath, accessMode, config.blockedFilePaths, config.writeProtectedPaths, config.whitelistedPaths, projectDir)
-      ) {
-        diagnosticLogger?.decision("input-sanitizer", input.tool, `BLOCKED file path (${accessMode}): ${filePath}`)
-        sessionStats.recordBlock(input.tool, filePath, "Blocked file path")
-
+    const checkAndBlockLocalTarget = async (target: string, mode: "read" | "write") => {
+      // Dynamic shell paths cannot be verified deterministically. Keep the
+      // existing fail-closed behavior for every extracted shell target.
+      if (canonicalTool === "shell" && isDynamicPathTarget(target)) {
+        diagnosticLogger?.decision("input-sanitizer", input.tool, `BLOCKED dynamic shell ${mode} target: ${target}`)
         await auditLogger.log({
           timestamp: new Date().toISOString(),
           tool: input.tool,
@@ -184,24 +189,59 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
           callId: input.callID,
           detections: [],
           blocked: true,
-          blockReason: `Blocked file path: ${filePath}`,
+          blockReason: `Dynamic shell ${mode} target cannot be verified deterministically: ${target}`,
           redactedCount: 0,
         })
-
-        if (config.notifications && canToast(toastState)) {
-          try {
-            await client.tui.showToast({
-              body: { message: `🛡 Blocked: ${filePath} access denied`, variant: "error" as const },
-            })
-          } catch { /* toast failure is non-critical */ }
-        }
-
         throw new Error(
-          `Warden: Access to "${filePath}" is blocked by security policy. ` +
-          `This file may contain sensitive data (credentials, keys, secrets). ` +
-          `If you need access, ask the user to temporarily allowlist it.`,
+          `Warden: ${mode === "write" ? "Writing to" : "Reading"} dynamic shell target "${target}" is blocked by security policy. ` +
+          `Use an explicit path so Warden can verify the target deterministically.`,
         )
       }
+
+      if (isAllowlisted(target, sessionAllowlist, projectDir)) return
+      if (!isPathBlockedForMode(target, mode, config.blockedFilePaths, config.writeProtectedPaths, config.whitelistedPaths, projectDir)) return
+
+      diagnosticLogger?.decision("input-sanitizer", input.tool, `BLOCKED file path (${mode}): ${target}`)
+      sessionStats.recordBlock(input.tool, target, `Blocked file path (${mode})`)
+
+      await auditLogger.log({
+        timestamp: new Date().toISOString(),
+        tool: input.tool,
+        hook: "before",
+        sessionId: input.sessionID,
+        callId: input.callID,
+        detections: [],
+        blocked: true,
+        blockReason: `Blocked file path (${mode}): ${target}`,
+        redactedCount: 0,
+      })
+
+      if (config.notifications && canToast(toastState)) {
+        try {
+          await client.tui.showToast({
+            body: {
+              message: canonicalTool === "shell"
+                ? `🛡 Blocked: shell ${mode} of ${target} denied`
+                : `🛡 Blocked: ${target} access denied`,
+              variant: "error" as const,
+            },
+          })
+        } catch { /* toast failure is non-critical */ }
+      }
+
+      throw new Error(
+        canonicalTool === "shell"
+          ? `Warden: ${mode === "write" ? "Writing to" : "Reading"} "${target}" via shell is blocked by security policy. ` +
+            `This file is on the sensitive-file blocklist or write-protection list. ` +
+            `If you need to access it, ask the user to temporarily allowlist it.`
+          : `Warden: Access to "${target}" is blocked by security policy. ` +
+            `This file may contain sensitive data (credentials, keys, secrets). ` +
+            `If you need access, ask the user to temporarily allowlist it.`,
+      )
+    }
+
+    for (const target of fileTargets) {
+      await checkAndBlockLocalTarget(target.path, target.mode)
     }
 
     // Step 1b: Check remote file paths in SSH/SCP/rsync/rclone commands (mode-aware)
@@ -243,95 +283,25 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
       }
     }
 
-    // Step 1c: Check bash shell file targets (redirections / tee / truncate / dd) against blocklist.
-    // Write targets (>, >>, tee, truncate, dd of=) check blockedFilePaths + writeProtectedPaths.
-    // Read targets (<) check blockedFilePaths only.
-    // Without this, an agent could write to a blocked/protected file via shell redirection.
-    if (input.tool === "bash" && typeof output.args.command === "string") {
-      const { reads: bashReads, writes: bashWrites } = extractBashFileTargets(output.args.command as string)
-
-      const checkAndBlock = async (target: string, mode: "read" | "write") => {
-        if (isDynamicPathTarget(target)) {
-          diagnosticLogger?.decision("input-sanitizer", input.tool, `BLOCKED dynamic bash ${mode} target: ${target}`)
-          await auditLogger.log({
-            timestamp: new Date().toISOString(),
-            tool: input.tool,
-            hook: "before",
-            sessionId: input.sessionID,
-            callId: input.callID,
-            detections: [],
-            blocked: true,
-            blockReason: `Dynamic bash ${mode} target cannot be verified deterministically: ${target}`,
-            redactedCount: 0,
-          })
-          throw new Error(
-            `Warden: ${mode === "write" ? "Writing to" : "Reading"} dynamic shell target "${target}" is blocked by security policy. ` +
-            `Use an explicit path so Warden can verify the target deterministically.`,
-          )
-        }
-        if (isAllowlisted(target, sessionAllowlist, projectDir)) return
-        if (!isPathBlockedForMode(target, mode, config.blockedFilePaths, config.writeProtectedPaths, config.whitelistedPaths, projectDir)) return
-
-        diagnosticLogger?.decision("input-sanitizer", input.tool, `BLOCKED bash ${mode} target: ${target}`)
-        sessionStats.recordBlock(input.tool, target, `Blocked bash ${mode} target`)
-
-        await auditLogger.log({
-          timestamp: new Date().toISOString(),
-          tool: input.tool,
-          hook: "before",
-          sessionId: input.sessionID,
-          callId: input.callID,
-          detections: [],
-          blocked: true,
-          blockReason: `Blocked bash ${mode} target: ${target}`,
-          redactedCount: 0,
-        })
-
-        if (config.notifications && canToast(toastState)) {
-          try {
-            await client.tui.showToast({
-              body: { message: `🛡 Blocked: shell ${mode} of ${target} denied`, variant: "error" as const },
-            })
-          } catch { /* toast failure is non-critical */ }
-        }
-
-        throw new Error(
-          `Warden: ${mode === "write" ? "Writing to" : "Reading"} "${target}" via shell redirection is blocked by security policy. ` +
-          `This file is on the sensitive-file blocklist or write-protection list. ` +
-          `If you need to access it, ask the user to temporarily allowlist it.`,
-        )
-      }
-
-      for (const target of bashWrites) {
-        await checkAndBlock(target, "write")
-      }
-      for (const target of bashReads) {
-        await checkAndBlock(target, "read")
-      }
-    }
-
     // Step 2: Regex pass — deep-scan all args and redact in-place.
     // Skipped when ANY of these apply:
     //   - redactionEnabled is false (global kill switch for ALL tools)
     //   - redactOnWrite is false AND this is a write/edit/patch tool
-    //   - every write target matches redactionExemptPaths (write/edit/patch tool,
-    //     local bash redirection/tee/truncate/dd target, or remote upload via
-    //     SSH/SCP/rsync/rclone)
+    //   - every write target matches redactionExemptPaths (all write/edit/patch
+    //     targets including patch moves, local shell redirection/tee/truncate/dd
+    //     targets, or remote upload via SSH/SCP/rsync/rclone)
     // File blocking and LLM safety eval still apply — only secret redaction is skipped.
-    const isWriteTool = input.tool === "write" || input.tool === "edit" || input.tool === "patch"
+    const isWriteTool = canonicalTool === "write" || canonicalTool === "edit" || canonicalTool === "patch"
     const allDisabled = !config.redactionEnabled
     const writeDisabled = isWriteTool && !config.redactOnWrite
 
-    // Collect all write targets this call touches (write tool, bash redirections,
-    // remote uploads). Used for per-path exemption check.
-    const writeTargets: Array<{ path: string; host?: string }> = []
-    if (isWriteTool && typeof filePath === "string") {
-      writeTargets.push({ path: filePath })
-    }
-    if (input.tool === "bash" && typeof output.args.command === "string") {
-      for (const w of extractBashFileTargets(output.args.command as string).writes) {
-        writeTargets.push({ path: w })
-      }
+    // Collect every write target this call touches. Multi-target on purpose:
+    // a patch may update one file and move another, and a shell command may
+    // tee to several files. Exemption is all-or-nothing.
+    const writeTargets: Array<{ path: string; host?: string }> = fileTargets
+      .filter((target) => target.mode === "write")
+      .map((target) => ({ path: target.path }))
+    if (canonicalTool === "shell") {
       for (const { host, path, mode } of extractRemoteFilePathsFromArgs(input.tool, output.args)) {
         if (mode === "write") writeTargets.push({ path, host })
       }
@@ -387,13 +357,13 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
       }
     }
 
-    // Step 3: Indirect execution check (Layer 2) — bash only
+    // Step 3: Indirect execution check (Layer 2) — shell only
     const indirectConfig = config.indirectExecution
     if (
       indirectConfig.enabled &&
-      input.tool === "bash" &&
+      canonicalTool === "shell" &&
       safetyEvaluator &&
-      safetyEvaluator.shouldEvaluate("bash") &&
+      safetyEvaluator.shouldEvaluate(input.tool) &&
       typeof output.args.command === "string"
     ) {
       const command = output.args.command as string
@@ -485,7 +455,8 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
           writtenByAgent,
         })
 
-        if (fileEvalResult.recommendation === "block") {
+        if (fileEvalResult.recommendation === "block" || fileEvalResult.evaluationFailed) {
+          const evalFailed = fileEvalResult.evaluationFailed === true
           await auditLogger.log({
             timestamp: new Date().toISOString(),
             tool: input.tool,
@@ -494,7 +465,9 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
             callId: input.callID,
             detections: [],
             blocked: true,
-            blockReason: `Indirect execution: file content blocked: ${execPath} — ${fileEvalResult.explanation}`,
+            blockReason: evalFailed
+              ? `Indirect execution: file content evaluation unavailable: ${execPath} — blocking for safety`
+              : `Indirect execution: file content blocked: ${execPath} — ${fileEvalResult.explanation}`,
             redactedCount: totalDetections,
             safetyEvaluation: fileEvalResult,
           })
@@ -502,23 +475,33 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
           if (config.notifications && canToast(toastState)) {
             try {
               await client.tui.showToast({
-                body: { message: `🛡 Blocked: malicious content in ${execPath.substring(execPath.lastIndexOf("/") + 1)}`, variant: "error" as const },
+                body: {
+                  message: evalFailed
+                    ? `🛡 Blocked: file content evaluation unavailable for ${execPath.substring(execPath.lastIndexOf("/") + 1)}`
+                    : `🛡 Blocked: malicious content in ${execPath.substring(execPath.lastIndexOf("/") + 1)}`,
+                  variant: "error" as const,
+                },
               })
             } catch { /* toast failure is non-critical */ }
           }
 
-          const suggestion = fileEvalResult.suggestedAlternative
+          const suggestion = !evalFailed && fileEvalResult.suggestedAlternative
             ? `\nGuidance: ${fileEvalResult.suggestedAlternative}`
             : ""
 
           throw new Error(
-            `Warden: Execution blocked — file content flagged as dangerous.\n` +
-            `File: ${execPath}\n` +
-            `Risk: ${fileEvalResult.riskLevel} | Dimensions: ${fileEvalResult.riskDimensions.join(", ")}\n` +
-            `Reason: ${fileEvalResult.explanation}` +
-            suggestion +
-            `\nThe content of this file was analyzed and found to contain potentially harmful operations. ` +
-            `If this is intentional, ask the user to review the file and confirm.`,
+            evalFailed
+              ? `Warden: Execution blocked — file content could not be evaluated (fail-closed).\n` +
+                `File: ${execPath}\n` +
+                `The safety evaluator is unavailable, misconfigured, timed out, or returned an unusable response. ` +
+                `LLM-evaluated operations remain blocked until the evaluator is working.`
+              : `Warden: Execution blocked — file content flagged as dangerous.\n` +
+                `File: ${execPath}\n` +
+                `Risk: ${fileEvalResult.riskLevel} | Dimensions: ${fileEvalResult.riskDimensions.join(", ")}\n` +
+                `Reason: ${fileEvalResult.explanation}` +
+                suggestion +
+                `\nThe content of this file was analyzed and found to contain potentially harmful operations. ` +
+                `If this is intentional, ask the user to review the file and confirm.`,
           )
         }
 
@@ -539,12 +522,59 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
 
     // Step 4: LLM safety evaluation (for actionable tools)
     const safetyActionMode = config.llm.safetyEvaluator.actionMode
-    let safetyResult = null
+    let safetyResult: SafetyEvaluationResult | null = null
 
     // Skip safety eval if already evaluated by permission.ask handler
     const alreadyEvaluated = evaluatedCalls.has(input.callID)
     if (alreadyEvaluated) {
       debugLog?.(`Input hook: tool=${input.tool} callID=${input.callID} → SKIPPED (already evaluated by permission.ask)`)
+    }
+
+    // This mirrors SafetyEvaluator.shouldEvaluate without needing an evaluator
+    // instance. It lets the hook distinguish "this component is disabled"
+    // (deterministic-only mode, no block) from "this component is enabled but
+    // its evaluator is missing" (misconfiguration, must block).
+    const safetyComponentEvaluable =
+      config.llm.enabled &&
+      config.llm.safetyEvaluator.enabled &&
+      isToolInList(input.tool, config.llm.safetyEvaluator.tools ?? [])
+
+    const blockUnavailableEvaluator = async (detail: string): Promise<never> => {
+      const reason = `Safety evaluator unavailable — ${detail} (fail-closed)`
+      diagnosticLogger?.decision("input-sanitizer", input.tool, reason)
+
+      await auditLogger.log({
+        timestamp: new Date().toISOString(),
+        tool: input.tool,
+        hook: "before",
+        sessionId: input.sessionID,
+        callId: input.callID,
+        detections: [],
+        blocked: true,
+        blockReason: reason,
+        redactedCount: totalDetections,
+      })
+
+      if (config.notifications && canToast(toastState)) {
+        try {
+          await client.tui.showToast({
+            body: {
+              message: `🛡 Blocked: safety evaluator unavailable (fail-closed)`,
+              variant: "error" as const,
+            },
+          })
+        } catch { /* toast failure is non-critical */ }
+      }
+
+      throw new Error(
+        `Warden: Tool call blocked — safety evaluator unavailable (fail-closed).\n` +
+        `The LLM safety component is enabled, but no evaluator is available. ` +
+        `LLM-evaluated operations remain blocked until the evaluator is working.`,
+      )
+    }
+
+    if (!alreadyEvaluated && !safetyEvaluator && safetyComponentEvaluable) {
+      await blockUnavailableEvaluator("tool call cannot be evaluated")
     }
 
     // Log bypass for audit trail when safety evaluator would have evaluated
@@ -619,9 +649,12 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
       })
       sessionStats.recordSafetyEvaluation(input.tool, safetyResult)
 
-      if (safetyResult.recommendation === "block") {
-        if (effectiveMode === "warn") {
-          // "warn" mode: show toast but don't throw
+      if (safetyResult.recommendation === "block" || safetyResult.evaluationFailed) {
+        const evaluationFailed = safetyResult.evaluationFailed === true
+
+        if (effectiveMode === "warn" && !evaluationFailed) {
+          // "warn" mode: a genuine model risk verdict may be downgraded to a
+          // warning. An evaluator outage may NOT — it always throws below.
           if (config.notifications) {
             try {
               await client.tui.showToast({
@@ -633,7 +666,11 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
             } catch { /* toast failure is non-critical */ }
           }
         } else {
-          // "block" mode (default): throw to block the call
+          // "block" mode (default), or any evaluator failure regardless of mode
+          const blockReason = evaluationFailed
+            ? "Safety evaluator unavailable — blocking for safety (fail-closed)"
+            : `Safety evaluation: ${safetyResult.explanation}`
+
           await auditLogger.log({
             timestamp: new Date().toISOString(),
             tool: input.tool,
@@ -642,7 +679,7 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
             callId: input.callID,
             detections: [],
             blocked: true,
-            blockReason: `Safety evaluation: ${safetyResult.explanation}`,
+            blockReason,
             redactedCount: totalDetections,
             safetyEvaluation: safetyResult,
           })
@@ -651,23 +688,29 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
             try {
               await client.tui.showToast({
                 body: {
-                  message: `🛡 Blocked: ${safetyResult.explanation.substring(0, 80)}`,
+                  message: evaluationFailed
+                    ? `🛡 Blocked: safety evaluator unavailable (fail-closed)`
+                    : `🛡 Blocked: ${safetyResult.explanation.substring(0, 80)}`,
                   variant: "error" as const,
                 },
               })
             } catch { /* toast failure is non-critical */ }
           }
 
-          const suggestion = safetyResult.suggestedAlternative
+          const suggestion = !evaluationFailed && safetyResult.suggestedAlternative
             ? `\nGuidance: ${safetyResult.suggestedAlternative}`
             : ""
 
           throw new Error(
-            `Warden: Tool call blocked by safety evaluation.\n` +
-            `Risk: ${safetyResult.riskLevel} | Dimensions: ${safetyResult.riskDimensions.join(", ")}\n` +
-            `Reason: ${safetyResult.explanation}` +
-            suggestion +
-            `\nThis command was flagged as potentially dangerous. If this is intentional, ask the user to confirm.`,
+            evaluationFailed
+              ? `Warden: Tool call blocked — safety evaluator unavailable (fail-closed).\n` +
+                `The evaluator is unreachable, misconfigured, timed out, or returned an unusable response. ` +
+                `LLM-evaluated operations remain blocked until the evaluator is working.`
+              : `Warden: Tool call blocked by safety evaluation.\n` +
+                `Risk: ${safetyResult.riskLevel} | Dimensions: ${safetyResult.riskDimensions.join(", ")}\n` +
+                `Reason: ${safetyResult.explanation}` +
+                suggestion +
+                `\nThis command was flagged as potentially dangerous. If this is intentional, ask the user to confirm.`,
           )
         }
       }
@@ -700,10 +743,13 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
       }
     }
 
-    // Step 5: Write-time tracking (Layer 1) — record write/edit file paths
-    if ((input.tool === "write" || input.tool === "edit") && indirectConfig.enabled) {
-      const writtenPath = extractFilePath(input.tool, output.args)
-      if (writtenPath) {
+    // Step 5: Write-time tracking (Layer 1) — record every write target.
+    // Covers V2 write/edit `path`, legacy `filePath`, and all patch
+    // add/delete/update/move destinations so indirect execution can flag
+    // files the agent just created or modified.
+    if (indirectConfig.enabled && isWriteTool) {
+      const writtenTargets = fileTargets.filter((target) => target.mode === "write")
+      for (const { path: writtenPath } of writtenTargets) {
         const metadata: WrittenFileMetadata = {
           timestamp: new Date().toISOString(),
           tool: input.tool,

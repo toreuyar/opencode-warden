@@ -59,16 +59,25 @@
 
   "scanUserPrompts": false,
 
-  "excludedTools": ["glob", "list"],
+  "excludedTools": [],
+
+  "blockedTools": [],
 
   "notifications": true,
 
   "audit": {
     "enabled": true,
-    "filePath": ".opencode/security-guard/audit.log",
+    "filePath": ".opencode/warden/audit.log",
     "maxFileSize": 10485760,
     "maxFiles": 5,
     "verbosity": "normal"
+  },
+
+  "diagnosticLog": {
+    "enabled": false,
+    "filePath": ".opencode/warden/diagnostic.log",
+    "maxFileSize": 10485760,
+    "maxFiles": 3
   },
 
   "env": {
@@ -104,10 +113,10 @@
   "llm": {
     "enabled": true,
     "debug": true,
-    "baseUrl": "http://172.16.0.10:9292/v1",
-    "model": "08-Nemotron-3-Nano-30B-A3B",
+    "baseUrl": "http://localhost:11434/v1",
+    "model": "your-model-name",
     "apiKey": "",
-    "timeout": 300000,
+    "timeout": 60000,
     "contextAccumulation": false,
     "contextDetectionsOnly": true,
     "maxContextPairs": 5,
@@ -119,7 +128,7 @@
 
     "outputSanitizer": {
       "enabled": true,
-      "tools": ["read", "bash", "grep"],
+      "tools": ["read", "shell", "grep"],
       "skipWhenRegexClean": false,
       "maxTokens": 2048,
       "systemPrompt": "",
@@ -129,7 +138,7 @@
 
     "safetyEvaluator": {
       "enabled": true,
-      "tools": ["bash", "write", "edit", "webfetch"],
+      "tools": ["shell", "write", "edit", "patch", "read", "webfetch"],
       "blockThreshold": "high",
       "warnThreshold": "medium",
       "bypassedCommands": [

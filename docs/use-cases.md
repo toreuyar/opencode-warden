@@ -11,11 +11,12 @@ You're a solo developer who wants basic secret protection without running an LLM
 ```
 
 What happens:
-- 74 regex patterns scan every tool input and output
+- 65 active regex patterns scan every tool input and output
 - `.env`, `*.pem`, `*.key`, and 20+ other sensitive file patterns are blocked
+- The global shell backstop applies the same path policy to agent and user shells
 - Environment variables with secret-like names are stripped
 - Audit log captures all events
-- Toast notifications appear when secrets are detected
+- Sanitized TUI/RPC alerts appear when secrets are detected (UX-only; enforcement does not depend on delivery)
 
 ## 2. Team Project — Custom Patterns and Blocked Files
 
@@ -44,8 +45,8 @@ Your team has internal API key formats and additional sensitive files:
     "**/internal-config.yaml"
   ],
   "whitelistedPaths": [
-    "**/.env.example",
-    "**/secrets/README.md"
+    "/home/you/project/.env.example",
+    "/home/you/project/secrets/README.md"
   ]
 }
 ```
@@ -70,12 +71,14 @@ You want the AI to ask for permission before running risky commands, with a risk
 ```
 
 What happens:
-- When the AI tries to run `bash` with `rm -rf important_dir/`:
+- When the AI tries to run `shell` (legacy `bash`) with `rm -rf important_dir/`:
   - LLM evaluates it as `critical` risk → auto-denied, no prompt shown
-- When the AI tries to run `bash` with `npm install some-unknown-package`:
-  - LLM evaluates it as `medium` risk → OpenCode shows a permission prompt, and a toast shows the risk assessment so you understand WHY you're being asked
+- When the AI tries to run `shell` with `npm install some-unknown-package`:
+  - LLM evaluates it as `medium` risk → OpenCode asks for permission, and a sanitized alert accompanies the risk context
 - When the AI runs `git status`:
   - Bypassed command → no evaluation, proceeds normally
+- If the LLM is enabled but unreachable, the call is denied rather than
+  allowed through because the configured mode is `permission`
 
 ## 4. CI/CD Auditing Mode — Warn but Don't Block
 
@@ -101,8 +104,11 @@ In a CI/CD environment, you want full visibility without disrupting the pipeline
 ```
 
 What happens:
-- All tool calls are evaluated for safety risks, but none are blocked
-- All output secrets are redacted, with detailed category information in every toast
+- Genuine model risk verdicts are warnings rather than blocks
+- **An LLM outage is still fail-closed** when `llm.enabled` is true: the call is
+  blocked/denied regardless of `actionMode`
+- Output secrets are redacted, and `warn` mode bypasses the notification rate
+  limiter for detailed alerts
 - Verbose audit logging captures every event including clean passes
 - Review the audit log after the run to identify potential issues
 
@@ -124,7 +130,9 @@ You're testing your custom patterns and want to see what gets detected without a
 What happens:
 - Regex scans still run and detections are logged
 - No secrets are redacted in output — you see the raw text
-- Toast notifications tell you what was detected and where
+- Sanitized TUI/RPC alerts tell you that a detection occurred (they do not carry
+  the matched value or location)
+- `pass` is a detection-only debugging mode, not a secure production default
 - Useful for tuning `disabledPatterns` and `customPatterns`
 
 ## 6. Remote Server Administration — SSH-Only Mode
@@ -165,11 +173,11 @@ Corporate environment with Azure OpenAI, strict blocking, and comprehensive audi
       "actionMode": "block",
       "blockThreshold": "medium",
       "warnThreshold": "low",
-      "tools": ["bash", "write", "edit", "webfetch", "read"]
+      "tools": ["shell", "write", "edit", "patch", "webfetch", "read"]
     },
     "outputSanitizer": {
       "actionMode": "warn",
-      "tools": ["read", "bash", "grep", "write", "edit"]
+      "tools": ["read", "shell", "grep", "write", "edit"]
     }
   },
   "categories": {

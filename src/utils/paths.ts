@@ -1,6 +1,7 @@
 import { existsSync, realpathSync } from "fs"
 import { dirname, isAbsolute, join, normalize, resolve } from "path"
 import { parseSshCommand, extractRemoteFilePaths } from "./ssh.js"
+import { canonicalToolName, extractPathArgument } from "./tool-compat.js"
 
 const RSYNC_REMOTE_PATH_RE = /^(?:[A-Za-z0-9._-]+@)?([A-Za-z0-9._-]+(?:\.[A-Za-z0-9._-]+)*):(.+)$/
 
@@ -463,26 +464,77 @@ export function matchGlob(path: string, pattern: string): boolean {
   return fullRegex.test(normalizedPath) || new RegExp(`^${regex}$`).test(normalizedPath)
 }
 
+const PATCH_FILE_HEADER_RE = /^\*\*\* (?:Add|Delete|Update) File: (.+)$/
+const PATCH_MOVE_HEADER_RE = /^\*\*\* Move to: (.+)$/
+
 /**
- * Extract file path from tool arguments.
- * Different tools put the path in different arg keys.
+ * Extract every file target named by a V2 `patch` tool's `patchText`.
+ *
+ * Supports all four hunk directions:
+ *   - `*** Add File: <path>`       → write
+ *   - `*** Delete File: <path>`    → write (deletion mutates the path)
+ *   - `*** Update File: <path>`    → write
+ *   - `*** Move to: <path>`        → write (the move destination)
+ *
+ * The update source path is included even when a hunk also moves it, because
+ * deleting the source is itself a mutation. Results are deduplicated in order.
+ */
+export function extractPatchFileTargets(
+  patchText: string,
+): { path: string; mode: "read" | "write" }[] {
+  const targets: { path: string; mode: "read" | "write" }[] = []
+  if (!patchText) return targets
+
+  const seen = new Set<string>()
+  const add = (path: string) => {
+    const cleaned = path.trim()
+    if (cleaned.length === 0) return
+    const key = `write\u0000${cleaned}`
+    if (seen.has(key)) return
+    seen.add(key)
+    targets.push({ path: cleaned, mode: "write" })
+  }
+
+  for (const rawLine of patchText.split(/\r?\n/)) {
+    const line = rawLine.trim()
+    const fileHeader = PATCH_FILE_HEADER_RE.exec(line)
+    if (fileHeader) {
+      add(fileHeader[1])
+      continue
+    }
+    const moveHeader = PATCH_MOVE_HEADER_RE.exec(line)
+    if (moveHeader) add(moveHeader[1])
+  }
+
+  return targets
+}
+
+/**
+ * Extract the primary file path from tool arguments.
+ * Supports both the V2 `path` key and the legacy `filePath` key.
+ * For `patch`, this returns the first target parsed from `patchText`
+ * (use `extractFileTargets` when every patch target matters).
  */
 export function extractFilePath(
   tool: string,
   args: Record<string, unknown>,
 ): string | undefined {
-  switch (tool) {
+  switch (canonicalToolName(tool)) {
     case "read":
     case "write":
-      return args.filePath as string | undefined
     case "edit":
-      return args.filePath as string | undefined
-    case "patch":
-      return args.filePath as string | undefined
+      return extractPathArgument(args)
+    case "patch": {
+      const patchText = typeof args.patchText === "string" ? args.patchText : ""
+      const targets = extractPatchFileTargets(patchText)
+      if (targets.length > 0) return targets[0].path
+      return extractPathArgument(args)
+    }
     case "glob":
+    case "grep":
       return typeof args.path === "string" ? args.path : undefined
-    case "bash": {
-      // Try to extract file paths from bash commands
+    case "shell": {
+      // Try to extract file paths from shell commands
       const command = args.command as string | undefined
       if (!command) return undefined
 
@@ -503,8 +555,70 @@ export function extractFilePath(
 }
 
 /**
+ * Extract every local file target (with access mode) from a tool call.
+ *
+ * This is the multi-target companion to `extractFilePath`:
+ *   - read/glob/grep → their `path` as a read target
+ *   - write/edit     → their `path` as a write target
+ *   - patch          → every add/delete/update/move target from `patchText`
+ *                      (falls back to legacy `path`/`filePath`)
+ *   - shell/bash     → redirection/tee/truncate/dd writes, `<` reads, and
+ *                      `ssh -i` identity files
+ */
+export function extractFileTargets(
+  tool: string,
+  args: Record<string, unknown>,
+): { path: string; mode: "read" | "write" }[] {
+  const single = (mode: "read" | "write"): { path: string; mode: "read" | "write" }[] => {
+    const path = extractPathArgument(args)
+    return path ? [{ path, mode }] : []
+  }
+
+  switch (canonicalToolName(tool)) {
+    case "read":
+    case "glob":
+    case "grep":
+      return single("read")
+    case "write":
+    case "edit":
+      return single("write")
+    case "patch": {
+      const patchText = typeof args.patchText === "string" ? args.patchText : ""
+      const targets = extractPatchFileTargets(patchText)
+      return targets.length > 0 ? targets : single("write")
+    }
+    case "shell": {
+      const command = typeof args.command === "string" ? args.command : ""
+      if (!command) return []
+
+      const { reads, writes } = extractBashFileTargets(command)
+      const targets: { path: string; mode: "read" | "write" }[] = [
+        ...writes.map((path) => ({ path, mode: "write" as const })),
+        ...reads.map((path) => ({ path, mode: "read" as const })),
+      ]
+
+      const parsed = parseSshCommand(command)
+      if (parsed?.identityFile) {
+        targets.push({ path: parsed.identityFile, mode: "read" })
+      }
+
+      const seen = new Set<string>()
+      return targets.filter(({ path, mode }) => {
+        const key = `${mode}\u0000${path}`
+        if (seen.has(key)) return false
+        seen.add(key)
+        return true
+      })
+    }
+    default:
+      return []
+  }
+}
+
+/**
  * Extract remote file paths (with access mode) from SSH/SCP/rsync/rclone
- * commands in bash tool args. Returns empty array for non-remote commands.
+ * commands in shell/bash tool args. Returns empty array for non-remote
+ * commands or non-shell tools.
  *
  * Mode is derived from transfer direction:
  * - SCP/rsync/rclone upload (local→remote): remote destination is a WRITE.
@@ -518,7 +632,7 @@ export function extractRemoteFilePathsFromArgs(
   tool: string,
   args: Record<string, unknown>,
 ): { host: string; path: string; mode: "read" | "write" }[] {
-  if (tool !== "bash") return []
+  if (canonicalToolName(tool) !== "shell") return []
 
   const command = args.command as string | undefined
   if (!command) return []

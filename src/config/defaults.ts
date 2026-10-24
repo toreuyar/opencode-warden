@@ -59,7 +59,8 @@ export const DEFAULT_CONFIG: SecurityGuardConfig = {
   ],
   redactOnWrite: true,
   redactionExemptPaths: [],
-  excludedTools: ["list"],
+  // V2 has no `list` tool; scanning applies to every tool by default.
+  excludedTools: [],
   blockedTools: [],
   sshOnlyMode: false,
   notifications: true,
@@ -149,7 +150,9 @@ export const DEFAULT_CONFIG: SecurityGuardConfig = {
       headers: {},
       healthCheckPath: "",
       completionsPath: "",
-      tools: ["bash", "write", "edit", "read", "webfetch"],
+      // V2-canonical tool names. Legacy `bash`/`task` remain accepted at
+      // runtime and in user config via the alias-aware policy checks.
+      tools: ["shell", "write", "edit", "patch", "read", "webfetch"],
       blockThreshold: "high",
       warnThreshold: "medium",
       bypassedCommands: [
@@ -213,7 +216,8 @@ export const DEFAULT_CONFIG: SecurityGuardConfig = {
       headers: {},
       healthCheckPath: "",
       completionsPath: "",
-      tools: ["read", "bash", "grep"],
+      // V2-canonical tool names. Legacy `bash` remains accepted as an alias.
+      tools: ["read", "shell", "grep"],
       bypassedCommands: [
         // ── Container runtime (listings & metrics only — NOT logs/inspect/exec) ──
         "docker ps",

@@ -99,6 +99,122 @@ export type RiskLevel = "none" | "low" | "medium" | "high" | "critical"
 export type SafetyActionMode = "block" | "permission" | "warn"
 export type OutputActionMode = "redact" | "warn" | "pass"
 
+// ─── OpenCode Permission Rules ───
+
+/**
+ * Structural subset of OpenCode's `Permission.Rule` (2.0.18+). Warden writes
+ * session-scoped narrowing rules as defense-in-depth; it never treats a failed
+ * sync as enforcement.
+ */
+export type PermissionEffect = "allow" | "deny" | "ask"
+
+export interface PermissionRule {
+  action: string
+  resource: string
+  effect: PermissionEffect
+}
+
+/**
+ * Permission input accepts both the legacy V1 hook shape (`type`, `pattern`,
+ * `title`) and the V2 PermissionEvaluation shape (`action`, `resources`,
+ * `tool`, `message`). V2 fields win when both are present.
+ */
+export interface PermissionInput {
+  id: string
+  /** Legacy V1 permission type (usually the tool name). */
+  type?: string
+  /** V2 PermissionEvaluation action (canonical tool name). */
+  action?: string
+  /** V2 SDK PermissionRequest spelling for the same value. */
+  permission?: string
+  pattern?: string | Array<string>
+  /** V2 SDK PermissionRequest patterns. */
+  patterns?: string[]
+  /** V2 PermissionEvaluation resources (paths, command patterns, …). */
+  resources?: string[]
+  sessionID: string
+  messageID?: string
+  callID?: string
+  title?: string
+  metadata?: Record<string, unknown>
+  /** V2 PermissionEvaluation denial/explanation message. */
+  message?: string
+  /** V2 permission source identity. */
+  tool?: { messageID?: string; callID?: string; id?: string }
+  time?: { created: number }
+}
+
+/**
+ * Mutable decision object passed to the permission handler. `message` is the
+ * V2 PermissionEvaluation denial message; the caller adapter must forward it
+ * onto the event. Legacy callers may ignore it.
+ */
+export interface PermissionDecision {
+  status: "ask" | "deny" | "allow"
+  message?: string
+}
+
+// ─── Configuration Load Types ───
+
+export type ConfigSource = "inline" | "global" | "project"
+export type ConfigFailureKind = "invalid" | "unreadable"
+
+export interface ConfigValidationIssue {
+  /** Dot-separated field path; empty for the document root. */
+  path: string
+  code: string
+  /** Sanitized explanation — never contains a configured value. */
+  message: string
+}
+
+/**
+ * Explicit configuration failure signal. `failure` being non-null is a hard
+ * stop: the caller must not run with the returned config as if it were the
+ * user's configuration. A setup-time throw is NOT a sufficient fail-closed
+ * signal in OpenCode: a failed plugin setup deactivates this plugin and its
+ * hooks, leaving the runtime with no Warden protection at all.
+ */
+export interface ConfigLoadFailure {
+  code: "WARDEN_CONFIG_INVALID" | "WARDEN_CONFIG_UNREADABLE"
+  kind: ConfigFailureKind
+  source: ConfigSource
+  /** File path for file sources; absent for inline plugin options. */
+  path?: string
+  /** Sanitized summary — never contains a configured value. */
+  message: string
+  issues: ConfigValidationIssue[]
+  /** Callers MUST treat this as a hard stop and refuse to run unprotected. */
+  failClosed: true
+}
+
+export interface LoadConfigResult {
+  config: SecurityGuardConfig
+  warnings: string[]
+  /**
+   * null when configuration is valid. Non-null means the caller MUST treat the
+   * configuration as failed and wire fail-closed blocking hooks; the returned
+   * config is only a safe deterministic shell, not the user's configuration.
+   */
+  failure: ConfigLoadFailure | null
+}
+
+/**
+ * Sanitized failure shape accepted by the config-failure lockdown hooks.
+ * Loader issue values are intentionally excluded.
+ */
+export interface FailClosedFailure {
+  readonly source: string
+  readonly code?: string
+  readonly path?: string
+  readonly message?: string
+  /** Sanitized loader issues; values are never included by the loader. */
+  readonly issues?: ReadonlyArray<{
+    readonly path?: string
+    readonly code?: string
+    readonly message?: string
+  }>
+}
+
 // ─── Operational Profiles ───
 
 export interface OperationalProfileConfig {
@@ -247,7 +363,17 @@ export interface SecurityGuardConfig {
 export interface AuditEntry {
   timestamp: string
   tool: string
-  hook: "before" | "after" | "env" | "compaction" | "permission" | "chat.message"
+  hook:
+    | "before"
+    | "after"
+    | "env"
+    | "compaction"
+    | "permission"
+    | "chat.message"
+    | "context"
+    | "title"
+    | "generate"
+    | "shell"
   sessionId: string
   callId: string
   detections: Array<{
@@ -259,7 +385,7 @@ export interface AuditEntry {
   blockReason?: string
   redactedCount: number
   llmDetections?: number
-  safetyEvaluation?: SafetyEvaluation
+  safetyEvaluation?: SafetyEvaluationResult
 }
 
 // ─── LLM Types ───
@@ -301,6 +427,16 @@ export interface SafetyEvaluation {
   explanation: string
   suggestedAlternative: string
   recommendation: "allow" | "warn" | "block"
+}
+
+/**
+ * Safety verdict plus a failure marker. `evaluationFailed` is set only for
+ * infrastructure/parsing failures (provider outage, timeout, unparseable or
+ * structurally invalid response) — never for a successfully parsed model
+ * verdict. Callers must block/deny on it regardless of `actionMode`.
+ */
+export interface SafetyEvaluationResult extends SafetyEvaluation {
+  evaluationFailed?: boolean
 }
 
 // ─── Session Stats Types ───

@@ -9,13 +9,25 @@
 Audit logs are written as JSON lines (one JSON object per line), enabling easy parsing with standard tools:
 
 ```jsonl
-{"timestamp":"2026-02-22T14:30:00.000Z","tool":"bash","hook":"before","sessionId":"abc123","callId":"def456","detections":[],"blocked":true,"blockReason":"Safety evaluation: Command attempts to delete system files","redactedCount":0,"safetyEvaluation":{"safe":false,"riskLevel":"critical","riskDimensions":["destruction"],"explanation":"rm -rf / attempts to delete all files","recommendation":"block"}}
-{"timestamp":"2026-02-22T14:30:05.000Z","tool":"read","hook":"after","sessionId":"abc123","callId":"ghi789","detections":[{"patternId":"openai-api-key-project","category":"api-keys","confidence":"high"}],"blocked":false,"redactedCount":1}
+{"timestamp":"2026-02-22T14:30:00.000Z","tool":"shell","hook":"before","sessionId":"abc123","callId":"def456","detections":[],"blocked":true,"blockReason":"Safety evaluation: Command attempts to delete system files","redactedCount":0,"safetyEvaluation":{"safe":false,"riskLevel":"critical","riskDimensions":["destruction"],"explanation":"rm -rf / attempts to delete all files","recommendation":"block"}}
+{"timestamp":"2026-02-22T14:30:05.000Z","tool":"read","hook":"after","sessionId":"abc123","callId":"ghi789","detections":[{"patternId":"openai-api-key","category":"api-keys","confidence":"high"}],"blocked":false,"redactedCount":1}
 ```
+
+Audit entries use `hook` values for each interception point, including
+`before`, `after`, `permission`, `context`, `generate`, `title`, `shell`, `env`,
+`compaction`, and the retained `chat.message` label for prompt scanning. V2 tool
+names are canonical (`shell`, `subagent`); legacy entries remain readable by tool
+name.
 
 ### Log Location
 
 By default, logs are written to `.opencode/warden/audit.log` relative to the project root. This can be changed with `audit.filePath` in your config.
+
+Writes are buffered and flushed after 1 second or 10 entries. A short-lived
+`opencode run --standalone` process that exits immediately can therefore leave a
+0-byte audit file even though a block was enforced; a long-lived server flushes
+normally. This is a durability gap, not an enforcement bypass. When the audit
+record must be retained, use a server session rather than a one-shot CLI run.
 
 ### Log Rotation
 
@@ -53,9 +65,39 @@ grep '"safetyEvaluation"' .opencode/warden/audit.log | jq '.safetyEvaluation'
 
 You can also use the [`security_audit`](tools.md#security_audit) built-in tool to query the log from within your OpenCode session without leaving the AI workflow.
 
-## Environment Sanitization
+### Diagnostic Log
 
-The `shell.env` hook sanitizes environment variables before they reach shell commands. This is a critical defense layer because environment variables often contain secrets that could leak into command outputs or be exfiltrated.
+The audit log and diagnostic log are independent. Enable the diagnostic log in
+config (`diagnosticLog.enabled`) to record hook start/end, decisions, and LLM
+chat traffic. When enabled, a separate `*-llm.log` file in the same directory
+records model requests and responses. Diagnostics are sanitized and never
+include configured secret values. The audit log remains the primary durable
+security record.
+
+### Notifications Are Not Audit Records
+
+TUI/RPC notifications are UX-only. They contain a closed event kind and bounded
+metadata (an optional canonical tool id and count), never paths, arguments,
+output, explanations, or raw audit text. If the TUI/RPC bridge is unavailable,
+alerts are absent but enforcement and audit logging continue. Do not use
+notifications as an audit trail; query `.opencode/warden/audit.log`.
+
+## Environment Sanitization and the Shell Backstop
+
+The `shell.create.before` hook (the V2 replacement for `shell.env`) first runs a
+deterministic path backstop and then sanitizes environment variables before they
+reach shell commands. This is a critical defense layer because environment
+variables often contain secrets that could leak into command outputs or be
+exfiltrated.
+
+The backstop applies to **every shell creation**, including the user's own
+terminals and background shells, not only agent tool calls. Blocked and
+write-protected paths are therefore also unreachable through a user terminal.
+Relative `cwd` values are resolved against the workspace, and
+SSH/SCP/rsync/rclone remote paths are checked. Dynamic targets that require
+shell expansion (for example unexpanded `$VAR` or backticks) are skipped because
+resolving them would require executing the shell. This deterministic limitation
+is intentional.
 
 ### Two-Strategy Approach
 
