@@ -220,6 +220,23 @@ Total: 22 tests
 
 The `[block]` / `[allow]` / `[warn]` / `[observe]` tag shows the expected verdict for each test.
 
+### Provider scheduling probe (Warden 2.2.0)
+
+For transport scheduling rather than model accuracy, use the separate opt-in
+probe: `bun scripts/provider-concurrency-probe.ts BASE_URL MODEL`. It sends four
+short synthetic calls concurrently through two chains sharing concurrency one,
+checks exact marker routing, cancels a streamed generation after receiving a
+content/reasoning delta, and sends an immediate follow-up. It reads no Warden
+configuration. If authentication is required, it reads `WARDEN_PROBE_API_KEY`
+from the environment; credentials must not be embedded in the URL.
+
+The 2026-11-22 llama-swap / Nemotron-3.5-Bolt-E4B probe passed marker routing
+with peak active requests one. The follow-up succeeded after disconnecting an
+unfinished stream. This does not establish instantaneous GPU cancellation or
+certify OpenCode's cancellation event delivery. Local regression tests cover
+queue cancellation, total deadlines, Retry-After, recovery pauses, ownership
+reloads, per-attempt streaming logs, and simulated host idle events.
+
 ### Shell-gate result layers (Warden 2.1.0)
 
 The harness uses `SafetyEvaluator.dryRun()`, including the deterministic shell

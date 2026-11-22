@@ -5,6 +5,7 @@ import { DEFAULT_CONFIG } from "../src/config/defaults.js"
 import { ProviderChain } from "../src/llm/provider-chain.js"
 import { LlmSanitizer } from "../src/llm/index.js"
 import type { LlmProviderConfig, SecurityGuardConfig } from "../src/types.js"
+import { registerProviderQueues } from "../src/llm/request-queue.js"
 
 function makeProvider(overrides: Partial<LlmProviderConfig> = {}): LlmProviderConfig {
   return {
@@ -17,6 +18,36 @@ function makeProvider(overrides: Partial<LlmProviderConfig> = {}): LlmProviderCo
 }
 
 describe("security-dashboard tool", () => {
+  test("queue visibility reports capacity and retries without endpoint or credential values", async () => {
+    const provider = makeProvider({
+      name: "private-label", baseUrl: `http://private-host/${crypto.randomUUID()}`,
+      apiKey: "private-credential", requestPolicy: { concurrency: 1, maxQueueSize: 2 },
+    })
+    const registration = registerProviderQueues([provider])
+    const queue = registration.queues[0]
+    const release = await queue.acquire(1000)
+    const waiting = queue.acquire(1000)
+    queue.retry("generated-test-id", 2, 1000)
+    const config = structuredClone(DEFAULT_CONFIG)
+    config.llm.enabled = true
+    config.llm.safetyEvaluator.providers = [provider]
+    try {
+      const tool = createSecurityDashboardTool({ config, sessionStats: new SessionStats("test") })
+      const output = await tool.execute({})
+      expect(output).toContain("safetyEvaluator provider #1: queue")
+      expect(output).toContain("active 1/1, waiting 1/2")
+      expect(output).toContain("attempt 2")
+      expect(output).not.toContain("private-host")
+      expect(output).not.toContain("private-credential")
+      expect(output).not.toContain("private-label")
+    } finally {
+      queue.clearRetry("generated-test-id")
+      release()
+      ;(await waiting)()
+      registration.dispose()
+    }
+  })
+
   test("dashboard output contains header and footer", async () => {
     const stats = new SessionStats("test-session")
     const tool = createSecurityDashboardTool({

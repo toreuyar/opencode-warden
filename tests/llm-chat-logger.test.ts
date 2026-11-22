@@ -23,6 +23,28 @@ function makeConfig() {
 }
 
 describe("LlmChatLogger", () => {
+  test("interleaved attempts retain separate counters, IDs, and one footer each", () => {
+    const logger = new LlmChatLogger(makeConfig())
+    const a = logger.fork("request-a", "attempt-a")
+    const b = logger.fork("request-b", "attempt-b")
+    a.startCall("safety", "read", [])
+    b.startCall("sanitizer", "read", [])
+    a.writeThinkingChunk("thinking-a")
+    b.writeChunk("answer-b")
+    a.writeChunk("answer-a")
+    b.endCall(100)
+    a.endCall(200)
+    a.endCall(300)
+    const lines = readFileSync(LOG_PATH, "utf8").split("\n")
+    const aLines = lines.filter((line) => line.includes("attempt=attempt-a"))
+    const bLines = lines.filter((line) => line.includes("attempt=attempt-b"))
+    expect(aLines.some((line) => line.includes("answer-b"))).toBe(false)
+    expect(bLines.some((line) => line.includes("answer-a"))).toBe(false)
+    expect(aLines.filter((line) => line.includes("◼"))).toHaveLength(1)
+    expect(aLines.find((line) => line.includes("◼"))).toContain("2 tok")
+    expect(bLines.find((line) => line.includes("◼"))).toContain("1 tok")
+  })
+
   test("creates directory on construction", () => {
     cleanup()
     const _logger = new LlmChatLogger(makeConfig())

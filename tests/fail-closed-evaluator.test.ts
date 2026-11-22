@@ -7,6 +7,7 @@ import { createOutputRedactor } from "../src/hooks/output-redactor.js"
 import { createPermissionHandler } from "../src/hooks/permission-handler.js"
 import { SafetyEvaluator } from "../src/llm/safety-evaluator.js"
 import { ProviderChain } from "../src/llm/provider-chain.js"
+import { ProviderOverloadError } from "../src/llm/request-queue.js"
 import { SHELL_SEQUENCE_BLOCK_MESSAGE } from "../src/utils/shell-sequence.js"
 import { SHELL_PRECHECK_UNAVAILABLE_MESSAGE, SIMPLIFY_SHELL_MESSAGE } from "../src/llm/shell-complexity.js"
 import type {
@@ -404,6 +405,19 @@ describe("SafetyEvaluator failure signal", () => {
 })
 
 describe("input-sanitizer evaluator availability", () => {
+  test("queue overload blocks with actionable copy even in warn mode", async () => {
+    const config = makeConfig({ llm: { enabled: true,
+      safetyEvaluator: { enabled: true, actionMode: "warn", tools: ["read"] },
+    } })
+    const evaluator = makeEvaluator({ evaluate: mock(async () => ({
+      ...validSafeVerdict, safe: false, riskLevel: "critical", recommendation: "block",
+      evaluationFailed: true, providerOverloaded: true,
+    })) })
+    const hook = createInputSanitizer(makeInputDeps(config, { safetyEvaluator: evaluator }) as never)
+    await expect(hook({ tool: "read", sessionID: "s1", callID: "overload" },
+      { args: { path: "/workspace/src/app.ts" } })).rejects.toThrow("overloaded by concurrent requests")
+  })
+
   test("warn mode still blocks an evaluator outage", async () => {
     const config = makeConfig({
       llm: {
@@ -750,6 +764,25 @@ describe("permission-handler deterministic and failure paths", () => {
     expect(evaluator.evaluate).toHaveBeenCalled()
   })
 
+  test("queue overload denies permission with an explicit overload message", async () => {
+    const config = makeConfig({ llm: { enabled: true,
+      safetyEvaluator: { enabled: true, actionMode: "permission", tools: ["shell"] },
+    } })
+    const evaluator = makeEvaluator({ evaluate: mock(async () => ({
+      ...validSafeVerdict, safe: false, riskLevel: "critical", recommendation: "block",
+      evaluationFailed: true, providerOverloaded: true,
+    })) })
+    const handler = createPermissionHandler({
+      config, client: mockClient, projectDir: "/workspace", safetyEvaluator: evaluator as never,
+      evaluatedCalls: new Set<string>(), sessionAllowlist: new Set<string>(),
+      auditLogger: makeAuditLogger() as never, diagnosticLogger: null,
+    })
+    const output = { status: "ask" as "ask" | "deny" | "allow", message: "" }
+    await handler(makePermissionInput({ action: "shell", resources: ["echo hi"], metadata: {} }) as never, output)
+    expect(output.status).toBe("deny")
+    expect(output.message).toContain("overloaded by concurrent requests")
+  })
+
   test("evaluator failure denies instead of prompting the user", async () => {
     const config = makeConfig({
       llm: {
@@ -806,6 +839,21 @@ describe("output-redactor sanitizer availability", () => {
       ...overrides,
     }
   }
+
+  test("queue overload withholds output and reports overload instead of raw content", async () => {
+    const config = makeConfig({ llm: { enabled: true,
+      outputSanitizer: { enabled: true, tools: ["read"], actionMode: "warn" },
+    } })
+    const sanitizer = { shouldSanitize: () => true, isAvailable: () => true,
+      sanitize: async () => { throw new ProviderOverloadError() },
+    }
+    const hook = createOutputRedactor(makeOutputDeps(config, { llmSanitizer: sanitizer }) as never)
+    const output = { output: "original output", title: "", metadata: {} }
+    await hook({ tool: "read", sessionID: "s1", callID: "overload" }, output)
+    expect(output.output).toContain("[BLOCKED]")
+    expect(output.output).toContain("overloaded by concurrent requests")
+    expect(output.output).not.toContain("original output")
+  })
 
   test("enabled but null output sanitizer withholds output", async () => {
     const config = makeConfig({

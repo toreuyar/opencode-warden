@@ -2,7 +2,7 @@
 
 [← Back to README](../README.md)
 
-Warden **2.1.0** runs as an OpenCode V2 plugin through `@opencode/plugin`
+Warden **2.2.0** runs as an OpenCode V2 plugin through `@opencode/plugin`
 (`Plugin.define` + `setup(ctx)`). It registers domain hooks rather than the legacy
 single-hook API. The supported OpenCode **host** floor is **2.0.18**; that is a
 host requirement, not the Warden version. Typed per-call `Tool.Error` vetoes
@@ -11,16 +11,17 @@ require host **2.0.29+**.
 | OpenCode host | Warden plugin | Notes |
 |---|---|---|
 | OpenCode 1.x (V1 plugin API) | **1.3.0**, pinned | Warden 2.x is not compatible with a V1 host. Use `opencode-warden@1.3.0`. |
-| OpenCode 2.0.0–2.0.17 | **2.1.0** | Below the declared 2.0.18 floor; not verified. Loads with a warning and keeps protections installed. |
-| OpenCode 2.0.18–2.0.28 | **2.1.0** | Declared supported floor. Historical bounded 2.0.18 runtime validation used Warden 2.0.0. Blocks through the older untyped per-call rejection path; typed `Tool.Error` vetoes require 2.0.29+. |
-| OpenCode 2.0.29+ | **2.1.0** | Supported. Typed veto mapping is source/package-verified; not runtime-probed on a 2.0.29 or 2.1.4 binary. |
+| OpenCode 2.0.0–2.0.17 | **2.2.0** | Below the declared 2.0.18 floor; not verified. Loads with a warning and keeps protections installed. |
+| OpenCode 2.0.18–2.0.28 | **2.2.0** | Declared supported floor. Historical bounded 2.0.18 runtime validation used Warden 2.0.0. Blocks through the older untyped per-call rejection path; typed `Tool.Error` vetoes require 2.0.29+. |
+| OpenCode 2.0.29+ | **2.2.0** | Supported. Typed veto mapping is source/package-verified; not runtime-probed on a 2.0.29 or 2.1.4 binary. |
 
 OpenCode 2.x is the target line, but not every 2.x host is certified.
 
 ### Runtime verification
 
-The 2.1.0 changes have unit/mocked-test and build coverage, not a new host probe
-or live-provider accuracy evaluation. The following results belong to 2.0.0.
+The 2.2.0 changes have unit/mocked-test and build coverage plus a bounded live
+llama-swap queue/disconnect probe. There is no new host probe or live-provider
+accuracy evaluation. The following host results belong to 2.0.0.
 
 Bounded validation of the built 2.0.0 on **OpenCode 2.0.18** (the declared floor,
 using local mocks and loaded through a root `index.js`) passed config precedence and inline fallback, invalid-config
@@ -286,6 +287,16 @@ Warden uses any **OpenAI-compatible** chat completions API, including Ollama,
 llama.cpp, vLLM, LM Studio, OpenAI, Azure OpenAI, and compatible gateways.
 
 ### Safety Evaluator
+
+Before sending an LLM request, the provider chain acquires a slot in the shared
+endpoint queue. Queue wait has its own timeout; the overall evaluation deadline
+covers all model stages, waiting, retries, and fallback. Retry delays release
+capacity, and transient errors may trigger exponential backoff or server
+`Retry-After` pauses. Cancellation removes waiting requests and aborts HTTP;
+interrupted inference pauses admission to give the backend time to recover.
+Results and accumulated conversation exchanges remain bound to the original
+caller. See [provider scheduling configuration](configuration.md#provider-concurrency-queueing-and-retries)
+for defaults and the lifecycle-based hook cancellation limitation.
 
 The safety evaluator analyzes tool calls across **12 risk dimensions**:
 

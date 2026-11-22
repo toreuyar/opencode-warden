@@ -247,7 +247,7 @@ function createFailClosedConfig(): SecurityGuardConfig {
   return config
 }
 
-const LLM_ENDPOINT_KEYS = ['baseUrl', 'model', 'apiKey', 'timeout', 'temperature', 'maxTokens', 'headers', 'healthCheckPath', 'completionsPath'] as const
+const LLM_ENDPOINT_KEYS = ['baseUrl', 'model', 'apiKey', 'timeout', 'temperature', 'maxTokens', 'headers', 'healthCheckPath', 'completionsPath', 'requestPolicy'] as const
 const LLM_COMPONENT_KEYS = ['safetyEvaluator', 'outputTriage', 'outputTextTriage', 'outputSanitizer'] as const
 
 /** Default generation cap — high enough to admit any legitimate evaluation
@@ -265,6 +265,7 @@ function normalizeProviderObj(raw: Record<string, unknown>, index: number): Reco
   return {
     name: raw.name || `provider-${index + 1}`,
     cooldown: raw.cooldown ?? 0,
+    requestPolicy: raw.requestPolicy,
     baseUrl: raw.baseUrl || "",
     model: raw.model || "",
     apiKey: raw.apiKey || "",
@@ -295,7 +296,7 @@ function flatFieldsToProvider(obj: Record<string, unknown>): Record<string, unkn
   for (const key of LLM_ENDPOINT_KEYS) {
     if (obj[key] !== undefined) {
       provider[key] = obj[key]
-      hasAny = true
+      if (key !== "requestPolicy") hasAny = true
     }
   }
   if (!hasAny) return null
@@ -333,7 +334,10 @@ function resolveLlmInheritance(userConfig: SecurityGuardUserConfig): void {
       sharedProviders = undefined
     }
   } else {
-    sharedProviders = normalizeProviders(sharedProviders)
+    sharedProviders = normalizeProviders(sharedProviders.map((provider) => ({
+      ...(provider as Record<string, unknown>),
+      requestPolicy: (provider as Record<string, unknown>).requestPolicy ?? llm.requestPolicy,
+    })))
   }
 
   // ─── Propagate flat endpoint fields into components (backward compat) ───
@@ -371,7 +375,10 @@ function resolveLlmInheritance(userConfig: SecurityGuardUserConfig): void {
           compConfig.providers = sharedProviders // Already normalized above
         }
       } else {
-        compConfig.providers = normalizeProviders(compProviders)
+        compConfig.providers = normalizeProviders(compProviders.map((provider) => ({
+          ...(provider as Record<string, unknown>),
+          requestPolicy: (provider as Record<string, unknown>).requestPolicy ?? compConfig.requestPolicy,
+        })))
       }
     }
   }

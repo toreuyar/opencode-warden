@@ -1,4 +1,5 @@
 import type { SafetyEvaluator } from "../llm/safety-evaluator.js"
+import { requestFailureMessage } from "../llm/request-context.js"
 import type { AuditLogger } from "../audit/index.js"
 import type { DiagnosticLogger } from "../audit/diagnostic-logger.js"
 import type {
@@ -578,6 +579,10 @@ export function createPermissionHandler(deps: PermissionHandlerDeps) {
     if (safetyResult.evaluationFailed) {
       output.status = "deny"
       output.message =
+        safetyResult.requestFailure ? requestFailureMessage(safetyResult.requestFailure) :
+        safetyResult.providerOverloaded
+          ? "Warden: LLM provider overloaded by concurrent requests (queue full or wait timed out). Permission denied; retry later."
+          :
         "Warden: Permission denied — safety evaluator unavailable (fail-closed). " +
         "The evaluator is unreachable, misconfigured, timed out, or returned an unusable response."
 

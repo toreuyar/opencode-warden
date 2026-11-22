@@ -249,7 +249,33 @@ These objects are shared by reference across multiple hooks and reset on `sessio
 | `sessionAllowlist` | `Set<string>` | input-sanitizer, permission-handler | Temporary exact-path access overrides |
 | `evaluatedCalls` | `Set<string>` | permission-handler, input-sanitizer | Dedup between `permission.evaluate` and `tool.execute.before`, keyed by the shared tool call id |
 
-**All hooks run sequentially** within OpenCode's event loop. There is no concurrent access to shared state. Session permission sync is the one operation with an in-flight promise cache; it is keyed per session and race-safe on `forget()`.
+Hooks can interleave at `await`; single-threaded JavaScript does not protect
+shared session state. Session permission sync uses an in-flight promise cache,
+keyed per session and race-safe on `forget()`. LLM conversation exchanges bind
+their prompt and completion through `ConversationContext.beginExchange()`; do
+not use the legacy single pending message slot in concurrent production paths.
+
+Provider requests use the process-wide FIFO in `src/llm/request-queue.ts`.
+Capacity is keyed by normalized completion URL, not session/model/name.
+`requestPolicy.concurrency: 1` serializes every chain sharing that endpoint.
+Limits are opt-in; the strictest positive cap among live registrations wins.
+Stable per-project/component ownership replaces limits on reload, with tokens
+protecting the new registration from stale disposal/update. Queue admission
+precedes the HTTP timeout. Slots release in `finally`;
+retry backoff happens outside them. `maxAttempts` includes the first attempt
+and overrides legacy sanitizer retryCount. Overload and exhausted attempts
+remain fail-closed; admission never approves or deduplicates an evaluation.
+
+`request-context.ts` uses async-local evaluation scopes. The total deadline
+spans prechecks, evaluation, retries/fallback and queue wait; nested scopes can
+shorten but never extend it. Cancellation removes waiters and interrupts
+backoff/HTTP without retry. V2 Promise hooks do not expose a tool AbortSignal:
+use lifecycle cancellation on idle/deletion/reset/disposal, and the real
+execution signal for the custom evaluation tool. Do not claim exact per-tool
+cancellation for hooks. Interrupted inference pauses the endpoint before
+releasing capacity; Retry-After also pauses it. Per-attempt chat logger forks
+isolate counters and tag all fragments. Scheduling telemetry contains only
+generated IDs and bounded operational metadata, never prompt content.
 
 ### Session-Scoped Deny Rules (Defense in Depth)
 

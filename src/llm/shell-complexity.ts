@@ -1,6 +1,8 @@
 import { AndStmt, LangBash, OrStmt, parseSync, walk } from "sh-ast"
 import type { BinaryCmd, Node } from "sh-ast"
 import type { ProviderChain } from "./provider-chain.js"
+import { ProviderOverloadError } from "./request-queue.js"
+import { LlmRequestError } from "./request-context.js"
 
 const REASONS = ["group", "substitution", "conditional-chain", "sequence"] as const
 type Reason = (typeof REASONS)[number]
@@ -56,7 +58,7 @@ export const SHELL_PRECHECK_UNAVAILABLE_MESSAGE =
 export async function checkShellComplexity(
   command: string,
   providerChain: ProviderChain,
-): Promise<"continue" | "simplify" | "unavailable" | undefined> {
+): Promise<"continue" | "simplify" | "unavailable" | "overloaded" | "cancelled" | "deadline" | undefined> {
   const reasons = structuralReasons(command)
   if (reasons.size === 0) return undefined
   try {
@@ -73,7 +75,9 @@ export async function checkShellComplexity(
       }
       throw new Error("Invalid shell complexity precheck verdict")
     }, { componentName: "shell-complexity-precheck", temperature: 0 })
-  } catch {
+  } catch (err) {
+    if (err instanceof LlmRequestError) return err.reason
+    if (err instanceof ProviderOverloadError) return "overloaded"
     return "unavailable"
   }
 }

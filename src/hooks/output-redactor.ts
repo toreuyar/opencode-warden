@@ -1,4 +1,6 @@
 import type { DetectionEngine } from "../detection/engine.js"
+import { ProviderOverloadError } from "../llm/request-queue.js"
+import { LlmRequestError } from "../llm/request-context.js"
 import type { AuditLogger } from "../audit/index.js"
 import type { SessionStats } from "../audit/session-stats.js"
 import type { LlmSanitizer } from "../llm/index.js"
@@ -456,7 +458,9 @@ export function createOutputRedactor(deps: OutputRedactorDeps) {
             `Output hook: tool=${input.tool} → command triage FAILED — BLOCKING output: ${errMsg}`,
           )
           llmBlocked = true
-          output.output = "[BLOCKED] Command triage failed — output withheld for safety"
+          output.output = err instanceof LlmRequestError ? `[BLOCKED] Output withheld — ${err.message}` : err instanceof ProviderOverloadError
+            ? "[BLOCKED] LLM provider overloaded by concurrent requests — output withheld; retry later"
+            : "[BLOCKED] Command triage failed — output withheld for safety"
           output.title = "[BLOCKED] Output withheld"
 
           if (config.notifications) {
@@ -495,7 +499,9 @@ export function createOutputRedactor(deps: OutputRedactorDeps) {
             `Output hook: tool=${input.tool} → text triage FAILED — BLOCKING output: ${errMsg}`,
           )
           llmBlocked = true
-          output.output = "[BLOCKED] Text triage failed — output withheld for safety"
+          output.output = err instanceof LlmRequestError ? `[BLOCKED] Output withheld — ${err.message}` : err instanceof ProviderOverloadError
+            ? "[BLOCKED] LLM provider overloaded by concurrent requests — output withheld; retry later"
+            : "[BLOCKED] Text triage failed — output withheld for safety"
           output.title = "[BLOCKED] Output withheld"
 
           if (config.notifications) {
@@ -575,7 +581,9 @@ export function createOutputRedactor(deps: OutputRedactorDeps) {
             `Output hook: tool=${input.tool} → LLM sanitization ${isTimeout ? "TIMED OUT" : isParseError ? "PARSE ERROR" : isInconsistency ? "INCONSISTENCY" : "FAILED"} — BLOCKING output for safety: ${errMsg}`,
           )
           llmBlocked = true
-          output.output = isInconsistency
+          output.output = err instanceof LlmRequestError ? `[BLOCKED] Output withheld — ${err.message}` : err instanceof ProviderOverloadError
+            ? "[BLOCKED] LLM provider overloaded by concurrent requests — output withheld; retry later"
+            : isInconsistency
             ? "[BLOCKED] LLM reported secrets but provided no findings — output withheld for safety"
             : isParseError
               ? "[BLOCKED] LLM produced unparseable response — output withheld for safety (LLM is connected)"

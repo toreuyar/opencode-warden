@@ -1,14 +1,40 @@
 import type { LlmMessage } from "../types.js"
 import type { LlmChatLogger } from "../audit/llm-chat-logger.js"
+import { checkRequest, LlmInferenceTimeoutError } from "./request-context.js"
 
 /**
  * Error thrown by LLM API calls that includes the HTTP status code.
  * Allows ProviderChain to distinguish exhaustion (429/402/503) from other errors.
  */
 export class LlmApiError extends Error {
-  constructor(public statusCode: number, message: string) {
+  constructor(public statusCode: number, message: string, public retryAfterMs?: number) {
     super(message)
     this.name = "LlmApiError"
+  }
+}
+
+export function parseRetryAfter(value: string | null, now = Date.now()): number | undefined {
+  if (!value) return undefined
+  if (/^\d+(?:\.\d+)?$/.test(value.trim())) {
+    const ms = Number(value) * 1000
+    return Number.isFinite(ms) ? Math.min(ms, 2147483647) : undefined
+  }
+  const date = Date.parse(value)
+  return Number.isFinite(date) ? Math.min(2147483647, Math.max(0, date - now)) : undefined
+}
+
+function requestAbort(timeout: number, signal?: AbortSignal) {
+  checkRequest(signal)
+  const controller = new AbortController()
+  const abort = () => controller.abort(signal?.reason)
+  signal?.addEventListener("abort", abort, { once: true })
+  const timer = setTimeout(() => controller.abort(new LlmInferenceTimeoutError()), timeout)
+  return {
+    controller,
+    dispose: () => {
+      clearTimeout(timer)
+      signal?.removeEventListener("abort", abort)
+    },
   }
 }
 
@@ -34,6 +60,9 @@ export function buildLlmHeaders(
 }
 
 export interface CallLlmOptions {
+  signal?: AbortSignal
+  requestID?: string
+  attemptID?: string
   baseUrl: string
   completionsPath: string
   model: string
@@ -84,8 +113,7 @@ async function callLlmNonStreaming(options: CallLlmOptions): Promise<string> {
   log?.(`POST ${url} model=${options.model}`)
   log?.(`REQUEST BODY:\n${JSON.stringify(requestBody, null, 2)}`)
 
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), options.timeout)
+  const { controller, dispose } = requestAbort(options.timeout, options.signal)
   const start = Date.now()
 
   try {
@@ -105,7 +133,7 @@ async function callLlmNonStreaming(options: CallLlmOptions): Promise<string> {
     if (!resp.ok) {
       const errorBody = await resp.text().catch(() => "(unreadable)")
       log?.(`ERROR RESPONSE:\n${errorBody}`)
-      throw new LlmApiError(resp.status, `LLM API error: ${resp.status} ${resp.statusText}`)
+      throw new LlmApiError(resp.status, `LLM API error: ${resp.status} ${resp.statusText}`, parseRetryAfter(resp.headers.get("retry-after")))
     }
 
     const data = (await resp.json()) as {
@@ -129,21 +157,22 @@ async function callLlmNonStreaming(options: CallLlmOptions): Promise<string> {
 
     // Re-throw LlmApiError as-is (already classified)
     if (err instanceof LlmApiError) throw err
+    checkRequest(options.signal)
 
     // Classify the error for better diagnostics
     if (controller.signal.aborted) {
       log?.(`POST ${url} → ABORTED by timeout after ${elapsed}ms (configured: ${options.timeout}ms)`)
-      throw new Error(`LLM request timed out after ${elapsed}ms (configured timeout: ${options.timeout}ms)`)
+      throw new LlmInferenceTimeoutError()
     }
     if (errMsg.includes("timed out") || errMsg.includes("timeout")) {
       log?.(`POST ${url} → TIMED OUT after ${elapsed}ms (external timeout, not our AbortController — configured: ${options.timeout}ms)`)
-      throw new Error(`LLM request timed out externally after ${elapsed}ms: ${errMsg} (our timeout is ${options.timeout}ms — this is likely a system/runtime timeout)`)
+      throw new LlmInferenceTimeoutError()
     }
 
     log?.(`POST ${url} → ERROR after ${elapsed}ms: ${errMsg}`)
     throw err
   } finally {
-    clearTimeout(timer)
+    dispose()
   }
 }
 
@@ -155,7 +184,7 @@ async function callLlmNonStreaming(options: CallLlmOptions): Promise<string> {
 async function callLlmStreaming(options: CallLlmOptions): Promise<string> {
   const url = `${options.baseUrl}${options.completionsPath}`
   const log = options.debugLog
-  const chatLogger = options.chatLogger!
+  const chatLogger = options.chatLogger!.fork(options.requestID ?? crypto.randomUUID(), options.attemptID ?? crypto.randomUUID())
   const componentName = options.componentName || "unknown"
 
   const requestBody: Record<string, unknown> = {
@@ -171,8 +200,7 @@ async function callLlmStreaming(options: CallLlmOptions): Promise<string> {
   log?.(`POST ${url} model=${options.model} stream=true`)
   // Don't log REQUEST BODY / RESPONSE BODY — the chat log has a better version
 
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), options.timeout)
+  const { controller, dispose } = requestAbort(options.timeout, options.signal)
   const start = Date.now()
 
   // Determine tool name from messages (last user message often contains the tool)
@@ -198,7 +226,7 @@ async function callLlmStreaming(options: CallLlmOptions): Promise<string> {
       const errorBody = await resp.text().catch(() => "(unreadable)")
       log?.(`ERROR RESPONSE:\n${errorBody}`)
       chatLogger.endCall(Date.now() - start)
-      throw new LlmApiError(resp.status, `LLM API error: ${resp.status} ${resp.statusText}`)
+      throw new LlmApiError(resp.status, `LLM API error: ${resp.status} ${resp.statusText}`, parseRetryAfter(resp.headers.get("retry-after")))
     }
 
     // Check content type — if server doesn't support streaming, fall back
@@ -233,20 +261,21 @@ async function callLlmStreaming(options: CallLlmOptions): Promise<string> {
 
     // Re-throw LlmApiError as-is (already classified)
     if (err instanceof LlmApiError) throw err
+    checkRequest(options.signal)
 
     if (controller.signal.aborted) {
       log?.(`POST ${url} → ABORTED by timeout after ${elapsed}ms (configured: ${options.timeout}ms)`)
-      throw new Error(`LLM request timed out after ${elapsed}ms (configured timeout: ${options.timeout}ms)`)
+      throw new LlmInferenceTimeoutError()
     }
     if (errMsg.includes("timed out") || errMsg.includes("timeout")) {
       log?.(`POST ${url} → TIMED OUT after ${elapsed}ms (external timeout, not our AbortController — configured: ${options.timeout}ms)`)
-      throw new Error(`LLM request timed out externally after ${elapsed}ms: ${errMsg} (our timeout is ${options.timeout}ms — this is likely a system/runtime timeout)`)
+      throw new LlmInferenceTimeoutError()
     }
 
     log?.(`POST ${url} → ERROR after ${elapsed}ms: ${errMsg}`)
     throw err
   } finally {
-    clearTimeout(timer)
+    dispose()
   }
 }
 
@@ -346,6 +375,7 @@ async function readSseStream(
 }
 
 export interface CheckLlmHealthOptions {
+  signal?: AbortSignal
   baseUrl: string
   healthCheckPath: string
   timeout: number
@@ -363,8 +393,7 @@ export async function checkLlmHealth(
   const url = `${options.baseUrl}${options.healthCheckPath}`
   const log = options.debugLog
 
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), options.timeout)
+  const { controller, dispose } = requestAbort(options.timeout, options.signal)
   const start = Date.now()
 
   try {
@@ -387,6 +416,6 @@ export async function checkLlmHealth(
     )
     return false
   } finally {
-    clearTimeout(timer)
+    dispose()
   }
 }

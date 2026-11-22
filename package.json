@@ -1,6 +1,6 @@
 {
   "name": "opencode-warden",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "Security plugin for OpenCode — intercepts tool calls to detect secrets, redact sensitive data, evaluate safety risks, block access to sensitive files, and maintain an audit trail",
   "type": "module",
   "main": "dist/index.js",
@@ -29,6 +29,7 @@
     "opencode-warden.example.json",
     "LICENSE",
     "README.md",
+    "warden-icon.svg",
     "CHANGELOG.md"
   ],
   "scripts": {

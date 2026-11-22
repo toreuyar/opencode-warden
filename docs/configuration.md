@@ -17,7 +17,7 @@ Warden loads configuration from three layers, each deep-merging into the previou
 
 **Inline options are a fallback, not another layer.** If the global or project file exists — even if it is invalid, unreadable, a dangling symlink, or a directory — inline `ctx.options` are ignored entirely. The file always wins; there is no fallback to defaults or a lower file layer when a present source is invalid.
 
-**Invalid configuration is an active lockdown, not an unload.** Warden does not throw out of plugin setup (a failed setup drops every Warden hook and leaves the host unprotected). Instead it installs deny-all/withhold-all hooks: permission requests are denied, tool execution is vetoed, output/error details are withheld, and prompts, model requests, compaction, and shell creation are blocked until the configuration is fixed and OpenCode is restarted. Failure diagnostics are sanitized and never include configured values.
+**Invalid configuration is an active lockdown, not an unload.** Warden does not throw out of plugin setup (a failed setup drops every Warden hook and leaves the host unprotected). Instead it installs deny-all/withhold-all hooks: permission requests are denied, tool execution is vetoed, output/error details are withheld, and prompts, model requests, compaction, and shell creation are blocked until the configuration is fixed and plugin configuration is reloaded. Failure diagnostics are sanitized and never include configured values.
 
 **Global config** is ideal for settings that apply everywhere — your LLM endpoint, personal PII preferences, custom company patterns.
 
@@ -26,15 +26,15 @@ Warden loads configuration from three layers, each deep-merging into the previou
 ### Runtime compatibility
 
 Warden's plugin version is independent of the OpenCode host version. This
-documentation describes Warden **2.1.0**, which targets the V2 plugin API on the
+documentation describes Warden **2.2.0**, which targets the V2 plugin API on the
 OpenCode **2.x** line.
 
 | OpenCode host | Warden plugin | Notes |
 |---|---|---|
 | OpenCode 1.x (V1 plugin API) | **1.3.0**, pinned | Warden 1.3.0 is the last release for OpenCode 1.x (`@opencode-ai/plugin` `^1.2.0`). Install `opencode-warden@1.3.0`; do not install Warden 2.x. |
-| OpenCode 2.0.0–2.0.17 | **2.1.0** | Below the declared supported floor; not verified. Loads with a warning and keeps protections installed. |
-| OpenCode 2.0.18–2.0.28 | **2.1.0** | Declared supported floor; the bounded 2.0.18 runtime probe used Warden 2.0.0, not 2.1.0. Blocks through the older untyped per-call rejection path; typed `Tool.Error` vetoes require 2.0.29+. |
-| OpenCode 2.0.29+ | **2.1.0** | Supported. The typed veto mapping introduced in 2.0.29 is source/package-verified; not runtime-probed on a 2.0.29 or 2.1.4 binary. |
+| OpenCode 2.0.0–2.0.17 | **2.2.0** | Below the declared supported floor; not verified. Loads with a warning and keeps protections installed. |
+| OpenCode 2.0.18–2.0.28 | **2.2.0** | Declared supported floor; the bounded 2.0.18 runtime probe used Warden 2.0.0, not 2.2.0. Blocks through the older untyped per-call rejection path; typed `Tool.Error` vetoes require 2.0.29+. |
+| OpenCode 2.0.29+ | **2.2.0** | Supported. The typed veto mapping introduced in 2.0.29 is source/package-verified; not runtime-probed on a 2.0.29 or 2.1.4 binary. |
 
 The supported 2.x floor is **OpenCode 2.0.18** (`@opencode/plugin` peer
 `^2.0.18`; development and type-checking use the 2.1.4 SDK).
@@ -164,7 +164,7 @@ When enabled, an additional `*-llm.log` file in the same directory records LLM c
 | `llm.baseUrl` | `string` | `""` | LLM API base URL (OpenAI-compatible) — must be configured when LLM is enabled |
 | `llm.model` | `string` | `""` | Model identifier — must be configured when LLM is enabled |
 | `llm.apiKey` | `string` | `""` | API key for authentication |
-| `llm.timeout` | `number` | `0` | Request timeout in milliseconds. `0` means no timeout; explicit values must be positive. Set one when enabling the LLM. |
+| `llm.timeout` | `number` | `0` (unresolved sentinel) | Inference timeout in milliseconds; configure a positive value when enabling the LLM. `0` is not an unlimited timeout. The remaining overall evaluation budget also caps each request. |
 | `llm.contextAccumulation` | `boolean` | `false` | Retain conversation history across evaluations |
 | `llm.contextDetectionsOnly` | `boolean` | `true` | Only keep history entries with detections |
 | `llm.maxContextPairs` | `number` | `5` | Maximum user+assistant pairs to retain |
@@ -176,6 +176,132 @@ When enabled, an additional `*-llm.log` file in the same directory records LLM c
 | `llm.providers` | `Provider[]` | `[]` | Shared provider chain inherited by components without their own providers. Each provider has `name`, `cooldown`, endpoint fields, and `maxTokens` (default generation cap `32768`). |
 
 **Fail-closed behavior:** With `llm.enabled: true`, an unavailable, misconfigured, timed-out, or garbage evaluator/sanitizer blocks the operation **regardless of `actionMode`** (`warn` and `permission` do not allow an outage through). A genuine model risk verdict may still follow `warn`; an evaluator failure may not. An enabled-but-null component for a tool in its configured list also blocks. Explicit `llm.enabled: false` (or an explicitly disabled component) is deterministic-only and does not block because of LLM absence.
+
+### Provider concurrency, queueing, and retries
+
+Set `requestPolicy` on entries in `llm.providers` or a component's `providers`.
+With legacy flat endpoint fields, `llm.requestPolicy` is inherited alongside
+those fields. A provider's explicit policy overrides its section's policy.
+
+Example for a single-request llama-swap/llama.cpp server:
+
+```json
+{
+  "llm": {
+    "enabled": true,
+    "providers": [{
+      "name": "local-gpu",
+      "baseUrl": "http://localhost:8080/v1",
+      "model": "your-evaluation-model",
+      "timeout": 120000,
+      "completionsPath": "/chat/completions",
+      "healthCheckPath": "/models",
+      "requestPolicy": {
+        "concurrency": 1,
+        "maxQueueSize": 100,
+        "queueTimeoutMs": 300000,
+        "totalTimeoutMs": 300000,
+        "recoveryDelayMs": 5000,
+        "maxAttempts": 5,
+        "initialDelayMs": 5000,
+        "maxDelayMs": 60000
+      }
+    }]
+  }
+}
+```
+
+| `requestPolicy` field | Default | Meaning |
+|---|---|---|
+| `concurrency` | `0` | In-flight request cap; `0` means unlimited unless another chain registers a limit for this endpoint. |
+| `maxQueueSize` | `100` | Maximum waiting requests, excluding active requests. `0` rejects immediately when busy. |
+| `queueTimeoutMs` | `300000` | Maximum wait for a slot on each attempt, in milliseconds. |
+| `totalTimeoutMs` | `300000` | Overall LLM evaluation budget across queue wait, inference, backoff, and fallback. Cannot be disabled. |
+| `recoveryDelayMs` | `5000` | Endpoint-wide admission pause after interrupted inference (timeout/cancellation). `0` disables the pause. |
+| `maxAttempts` | Unset | Total attempts **per provider**, including the first. `1` disables retries; `5` allows four retries. Unset preserves legacy retry behavior. |
+| `initialDelayMs` | `1000` | Initial retry delay in milliseconds, before jitter. |
+| `maxDelayMs` | `300000` | Maximum retry delay, including jitter. |
+
+The FIFO queue is shared across all sessions, safety/file evaluations, prechecks,
+sanitization, triage, and health probes in **one OpenCode process**. Identity is
+the normalized completion URL, not model name, provider label, API key, or session.
+Models behind the same llama-swap endpoint share capacity; different endpoints
+operate independently. Use a consistent URL: different hostname aliases are
+treated as different endpoints.
+
+Use the same limits wherever an endpoint appears. With conflicting definitions,
+the lowest positive concurrency and lowest queue size registered by a limited
+definition win among live registrations. Plugin reload replaces the previous
+registration: increasing capacity admits waiting work immediately; decreasing
+it lets active requests finish before admitting more. Reducing queue capacity
+affects new arrivals, not already admitted waiters. No process restart is
+required. There is no coordination across separate processes.
+After editing Warden's JSON, reload the plugin configuration so Warden rereads
+it; the queue updates when the new plugin setup registers its providers.
+
+Queue wait does **not** consume the provider's HTTP/inference `timeout`. Every
+waiter has its own deadline and promise; expired entries are removed. Success,
+transport failure, and timeout release the slot. Queue saturation/expiry tries
+the next configured provider; if none succeeds, the caller gets an overload
+error and the operation is blocked or output withheld. Local queue overload is
+not retried, keeping each queue wait bounded.
+
+The overall deadline is never extended by another provider or retry. It uses
+the tightest registered component/chain budget for the current hook evaluation.
+Each HTTP request receives at most the remaining budget. A queue timeout or the
+overall deadline may occur first; both fail closed. Synchronous processing and
+host calls without cancellation support cannot be forcibly interrupted, but
+late results cannot be accepted after the deadline.
+
+Cancellation removes queued requests, interrupts backoff, and aborts active
+HTTP requests without retry or fallback. The OpenCode 2.1.4 Promise SDK exposes
+an `AbortSignal` to custom tool execution, used by `security_evaluate`, but not
+to `execute.before`, `execute.after`, or permission hook callbacks. Hook
+cancellation therefore uses session-idle/deletion/reset events and plugin
+disposal, plus deadlines. This is best-effort session-level cancellation, not
+an exact per-tool stop signal. Later requests get fresh cancellation state.
+
+Aborting HTTP does not prove the backend stopped generating. `recoveryDelayMs`
+pauses admission for **all callers of that endpoint**, not just the failed
+call. It holds no active request slot. Recovery pauses survive replacement of
+the provider registration during reload.
+
+With `maxAttempts` set, transport/timeouts, empty answers, invalid verdicts,
+HTTP 429, and transient server errors retry before fallback. Genuine
+allow/warn/block verdicts are final, never retry triggers. Permanent HTTP errors
+(400, 401, 402, 403, 404, 405, 413, 422) skip retries. Configured exhaustion
+cooldown starts after attempts are exhausted.
+
+Backoff doubles after each failure, adds 0–20% positive random jitter, and caps
+at `maxDelayMs`. The example waits approximately 5–6, 10–12, 20–24, then 40–48
+seconds. Use `initialDelayMs: 30000` for a 30–36 second start and a larger cap
+for further doubling. Backoff holds no provider slot; retries rejoin behind
+waiting work. Requests retain their original message snapshot and caller.
+
+For HTTP 429/server errors, `Retry-After` (seconds or an HTTP date) also pauses
+the shared endpoint. Retry delays honor the larger of server guidance and
+local backoff, even above `maxDelayMs`; the overall deadline still wins.
+
+Legacy `llm.retryCount` / `llm.outputSanitizer.retryCount` count **additional**
+sanitizer attempts and retain their behavior when `maxAttempts` is unset.
+Explicit `maxAttempts` overrides them rather than multiplying retry loops.
+All failures remain fail-closed, including warn mode.
+
+**Visibility:** `security_dashboard` reports process-wide queue IDs with
+component/provider-index mappings, active/waiting counts, limits, oldest wait,
+recovery pause, queue-full/queue-timeout/cancellation counters, and scheduled
+retry attempts. Scheduling diagnostics use generated request/call/attempt IDs
+and counters, not prompts or credentials. The separate opt-in LLM chat log
+still records conversation content; each attempt now has isolated streaming
+state and tagged fragments so concurrent calls remain distinguishable.
+
+**Live verification:** `scripts/provider-concurrency-probe.ts` is an opt-in
+synthetic burst/disconnect probe. On 2026-11-22, four concurrent calls through
+two chains to llama-swap using `Nemotron-3.5-Bolt-E4B` completed with peak
+in-flight HTTP requests of one and correct response markers. A streamed
+disconnect followed by an immediate request also recovered successfully.
+This is bounded backend testing, not proof of GPU cancellation or a new
+OpenCode host runtime certification.
 
 ### `llm.safetyEvaluator` — Input Safety Evaluation
 

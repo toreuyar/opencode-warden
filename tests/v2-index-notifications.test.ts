@@ -74,7 +74,7 @@ function makeFakeRpc(options: { failRegister?: boolean } = {}): FakeRpc {
   }
 }
 
-function makeFakeCtx(options: unknown, directory: string, rpc = makeFakeRpc()) {
+function makeFakeCtx(options: unknown, directory: string, rpc = makeFakeRpc(), events?: AsyncIterable<any>) {
   const hooks = new Map<string, (event: any) => any>()
   const calls = { transforms: 0, subscribe: 0 }
 
@@ -108,7 +108,7 @@ function makeFakeCtx(options: unknown, directory: string, rpc = makeFakeRpc()) {
     event: {
       subscribe: () => {
         calls.subscribe++
-        return (async function* () {})()
+        return events ?? (async function* () {})()
       },
     },
   }
@@ -125,6 +125,53 @@ const VALID_INLINE = {
 }
 
 describe("index notification wiring", () => {
+  test("session idle cancels an active hook evaluation and prevents retries", async () => {
+    silenceConsole()
+    process.env.HOME = makeTempDir()
+    const directory = makeTempDir()
+    let requestStarted!: () => void
+    const started = new Promise<void>((resolve) => { requestStarted = resolve })
+    let releaseRequest!: () => void
+    const finish = new Promise<void>((resolve) => { releaseRequest = resolve })
+    let idle!: () => void
+    const idleEvent = new Promise<void>((resolve) => { idle = resolve })
+    const events = (async function* () {
+      await idleEvent
+      yield { type: "session.status", data: { sessionID: "s1", status: { type: "idle" } } }
+    })()
+    let calls = 0
+    const server = Bun.serve({ port: 0, async fetch(request) {
+      if (request.method === "GET") return Response.json({ data: [] })
+      calls++
+      requestStarted()
+      await finish
+      return Response.json({ choices: [{ message: { content: "{}" } }] })
+    } })
+    const fake = makeFakeCtx({
+      ...VALID_INLINE, blockedTools: [], llm: {
+        enabled: true, baseUrl: `http://127.0.0.1:${server.port}/v1`, model: "test",
+        timeout: 10000, completionsPath: "/chat/completions", healthCheckPath: "/models",
+        requestPolicy: { concurrency: 1, maxAttempts: 5, recoveryDelayMs: 0, totalTimeoutMs: 10000 },
+        safetyEvaluator: { enabled: true, tools: ["read"], actionMode: "warn" },
+      },
+    }, directory, makeFakeRpc(), events)
+    const cleanup = await warden.setup(fake.ctx as any)
+    try {
+      const blocked = fake.hooks.get("tool.execute.before")!({
+        tool: "read", sessionID: "s1", id: "cancel-me", input: { path: join(directory, "readme.md") },
+      })
+      await started
+      idle()
+      await expect(blocked).rejects.toThrow("cancelled")
+      expect(calls).toBe(1)
+    } finally {
+      idle()
+      releaseRequest()
+      if (cleanup) await cleanup()
+      server.stop(true)
+    }
+  })
+
   test("vetoes an agent shell sequence but leaves the global path backstop unchanged", async () => {
     silenceConsole()
     process.env.HOME = makeTempDir()

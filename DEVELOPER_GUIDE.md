@@ -307,7 +307,7 @@ There is no returned hook object in V2. `setup()` returns only an optional clean
 - **Policy injection is per request, not synthetic history.** `session.context` and `session.generate` append the policy to the request-local `event.system`; compaction does the same. `session.title` intentionally opts out because it is a narrow tool-less naming request. This avoids history pollution and marker-forgery dedup problems.
 - **Config failure is an active lockdown.** A failed `setup()` would drop every Warden hook, so config failures install deny/withhold hooks and return normally instead.
 - **Runtime version is a warning, not a gate.** Refusing activation on an old runtime would leave the host unprotected.
-- **Shared mutable state is sequential.** `evaluatedCalls`, `sessionAllowlist`, and `toastState` are shared by reference; OpenCode runs hooks sequentially, so there is no concurrent access. Session permission sync is the only in-flight async cache and is race-safe.
+- **Shared mutable state can interleave at awaits.** A single JavaScript event loop is not an async mutex. Session permission synchronization has an in-flight cache; LLM exchanges capture request-specific prompts and completions rather than using one shared pending-message slot.
 - **Notifications never gate enforcement.** The server `showToast` shim routes through `src/tui-notifications.ts`, which emits a strict RPC event; registration or delivery failure is non-blocking. The TUI companion renders fixed copy and cannot influence decisions.
 
 ---
@@ -806,6 +806,52 @@ It intentionally does **not** list every tool description or category (tests enf
 
 ## LLM Integration — `src/llm/`
 
+### Provider admission and retry scheduling
+
+`request-queue.ts` keeps a process-wide registry under a global symbol. Every
+`ProviderChain` registers endpoint capacity before making requests. The
+normalized completion URL is the key: names, credentials, models, and sessions
+do not partition a server's capacity. Conflicting positive limits resolve to
+the strictest live registered limit. Stable project/component owner keys and
+registration tokens replace old limits on reload. Stale updates/disposal cannot
+overwrite a newer registration. Raising capacity drains the FIFO; lowering
+capacity lets active work finish. Existing waiters retain admission if the
+queue size is reduced.
+
+FIFO admission has a bounded waiting list and per-waiter deadline. Timed-out
+waiters are removed. Admission returns an idempotent release function, used in
+`finally` around the HTTP call (including health probes). The HTTP timeout
+starts after admission. Failures release capacity before backoff; retries
+rejoin the queue. Each call snapshots its messages before the first await.
+
+`request-context.ts` carries cancellation and the evaluation deadline through
+AsyncLocalStorage. The hook scope spans all its LLM stages; a nested chain may
+shorten the deadline, never extend it. Abort removes waiters, cancels fetch,
+and interrupts sleep; it never causes another retry/provider attempt. The
+Promise SDK's hooks have no cancellation signal; lifecycle idle/deletion/reset
+and plugin disposal cancel session scopes, while `security_evaluate` uses the
+host's actual tool signal. Tests cover simulated lifecycle delivery; no new
+host runtime probe is implied.
+
+An inference timeout/cancellation sets an endpoint-wide recovery pause before
+releasing the slot. Transient HTTP Retry-After headers set a shared pause too.
+Neither pause holds capacity; queue and overall deadlines still apply.
+Snapshots expose generated IDs, counts, timing and retries in the dashboard
+and diagnostics. Raw endpoint URLs/prompts/credentials are not part of queue
+telemetry. The separately enabled chat log intentionally includes conversation
+content, using attempt-local logger forks and tagged synchronous writes.
+
+Provider `requestPolicy.maxAttempts` includes the first attempt and overrides
+legacy sanitizer retryCount. Exponential delays use 0–20% positive jitter and a
+cap. Transient HTTP/transport failures and validator failures retry; permanent
+client errors and local queue overload proceed to fallback without retry.
+Safety, file execution, triage, sanitizer, and precheck validators run within
+the provider attempt boundary. Genuine model risk decisions never trigger
+retries. Exhausted chains block/withhold; overload has fixed actionable copy.
+
+See [configuration](docs/configuration.md#provider-concurrency-queueing-and-retries)
+for defaults, milliseconds, endpoint identity, and example setup.
+
 ### `llm/client.ts` — HTTP Client
 
 Low-level HTTP client for OpenAI-compatible chat completions APIs.
@@ -854,7 +900,12 @@ The `ConversationContext` class manages a sliding window of message history for 
 1. Drop oldest pairs if count exceeds `maxPairs` (default: 5)
 2. Drop oldest pairs if total character count exceeds `maxChars` (default: 16000)
 
-**`getMessages()`** builds the final message array: `[system, ...history, pending]`. This is what gets sent to the LLM API.
+Production callers use **`beginExchange(prompt)`**, which snapshots
+`[system, ...history, prompt]` and returns a request-specific `complete()` closure.
+Completions retain the correct prompt even when they arrive out of order.
+Reset invalidates outstanding closures so late responses cannot restore old
+history. Legacy `getMessages()` and pending-message methods remain for existing
+callers, but must not be used to pair concurrent production requests.
 
 ### `llm/prompts.ts` — System Prompts and Templates
 

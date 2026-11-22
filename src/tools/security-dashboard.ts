@@ -1,6 +1,7 @@
 import type { SessionStats } from "../audit/session-stats.js"
 import type { SecurityGuardConfig, PatternCategory } from "../types.js"
 import type { LlmSanitizer } from "../llm/index.js"
+import { providerQueueID, providerQueueStats } from "../llm/request-queue.js"
 
 interface DashboardDeps {
   sessionStats?: SessionStats
@@ -74,6 +75,25 @@ export function createSecurityDashboardTool(deps: DashboardDeps) {
       lines.push(`LLM Safety Evaluator: ${config.llm.safetyEvaluator.enabled ? "Enabled" : "Disabled"}`)
       lines.push(`Notifications: ${config.notifications ? "On" : "Off"}`)
       lines.push("")
+
+      if (config.llm.enabled) {
+        lines.push("--- Process-wide LLM Queues ---")
+        for (const component of ["safetyEvaluator", "outputSanitizer", "outputTriage", "outputTextTriage"] as const) {
+          for (const [index, provider] of config.llm[component].providers.entries()) {
+            const id = providerQueueID(provider)
+            if (id) lines.push(`  ${component} provider #${index + 1}: queue ${id}`)
+          }
+        }
+        for (const queue of providerQueueStats()) {
+          lines.push(`Queue ${queue.id}: active ${queue.active}/${queue.concurrency ?? "unlimited"}, waiting ${queue.waiting}/${queue.maxQueueSize ?? "unlimited"}`)
+          lines.push(`  Oldest wait: ${queue.oldestWaitMs}ms | recovery pause: ${queue.recoveryRemainingMs}ms`)
+          lines.push(`  Queue full: ${queue.queueFullCount} | queue timeouts: ${queue.queueTimeoutCount} | cancelled waiters: ${queue.cancelledCount}`)
+          for (const retry of queue.retries) {
+            lines.push(`  Request ${retry.requestID}: attempt ${retry.attempt}, retry in ${retry.delayRemainingMs}ms`)
+          }
+        }
+        lines.push("")
+      }
 
       // Stats
       lines.push("--- Session Statistics ---")

@@ -4,6 +4,18 @@
 
 ## Audit Logging
 
+### Provider scheduling diagnostics (2.2.0)
+
+With diagnostic logging enabled, scheduling records correlate generated
+request/call/attempt IDs with queue admission, active capacity, and retry timing.
+Queue metrics contain no prompts, endpoint credentials, or raw tool arguments.
+The full `security_dashboard` also shows process-wide queue state.
+
+The separate LLM chat log intentionally records conversation content. Each HTTP
+attempt now owns its streaming counters and tags every fragment with request
+and attempt IDs, so overlapping requests remain distinguishable. Chat-log
+failure remains non-critical and cannot change enforcement.
+
 ### Log Format
 
 Audit logs are written as JSON lines (one JSON object per line), enabling easy parsing with standard tools:

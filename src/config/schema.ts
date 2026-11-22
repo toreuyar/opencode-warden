@@ -61,7 +61,19 @@ const indirectExecutionSchema = z.object({
   promptTemplate: z.string().optional(),
 })
 
+const llmRequestPolicySchema = z.strictObject({
+  totalTimeoutMs: z.number().int().min(1).max(2147483647).optional(),
+  recoveryDelayMs: z.number().int().min(0).max(2147483647).optional(),
+  concurrency: z.number().int().min(0).max(10000).optional(),
+  maxQueueSize: z.number().int().min(0).max(100000).optional(),
+  queueTimeoutMs: z.number().int().min(1).max(2147483647).optional(),
+  maxAttempts: z.number().int().min(1).max(100).optional(),
+  initialDelayMs: z.number().int().min(1).max(2147483647).optional(),
+  maxDelayMs: z.number().int().min(1).max(2147483647).optional(),
+})
+
 const llmEndpointSchema = z.object({
+  requestPolicy: llmRequestPolicySchema.optional(),
   baseUrl: z.string().url().optional(),
   model: z.string().optional(),
   apiKey: z.string().optional(),
@@ -129,6 +141,7 @@ const llmOutputTextTriageSchema = llmEndpointSchema.extend({
 })
 
 const llmConfigSchema = z.object({
+  requestPolicy: llmRequestPolicySchema.optional(),
   enabled: z.boolean().optional(),
   debug: z.boolean().optional(),
   retryCount: z.number().int().min(0).optional(),

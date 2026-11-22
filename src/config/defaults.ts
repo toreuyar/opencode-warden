@@ -1,5 +1,16 @@
 import type { SecurityGuardConfig } from "../types.js"
 
+// Applied to each provider; maxAttempts is optional to preserve legacy retryCount.
+export const DEFAULT_REQUEST_POLICY = {
+  totalTimeoutMs: 300000,
+  recoveryDelayMs: 5000,
+  concurrency: 0,
+  maxQueueSize: 100,
+  queueTimeoutMs: 300000,
+  initialDelayMs: 1000,
+  maxDelayMs: 300000,
+}
+
 export const DEFAULT_CONFIG: SecurityGuardConfig = {
   categories: {
     "api-keys": true,

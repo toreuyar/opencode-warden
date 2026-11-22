@@ -21,10 +21,13 @@ import {
   createExecuteAfterAdapter,
   createPermissionAdapter,
   registerFailClosedHooks,
+  withholdExecuteAfter,
   type PermissionEvaluationEvent,
   type ToolAfterEvent,
 } from "./hooks/v2-adapters.js"
 import { createSecurityDashboardTool } from "./tools/security-dashboard.js"
+import { createRequestLifecycle, LlmRequestError, withLlmRequest } from "./llm/request-context.js"
+import { DEFAULT_REQUEST_POLICY } from "./config/defaults.js"
 import { createSecurityReportTool } from "./tools/security-report.js"
 import { createRulesManageTool } from "./tools/rules-manage.js"
 import { createSecurityHelpTool } from "./tools/security-help.js"
@@ -332,6 +335,24 @@ export default Plugin.define({
     let safetyChain: ProviderChain | null = null
     let outputTriage: OutputTriageEvaluator | null = null
     let outputTextTriage: OutputTextTriageEvaluator | null = null
+    const providerChains: ProviderChain[] = []
+    const requestLifecycle = createRequestLifecycle()
+    disposeResources = () => {
+      requestLifecycle.dispose()
+      for (const chain of providerChains) chain.dispose()
+    }
+    const runEvaluation = <T>(sessionID: string, run: () => Promise<T>, signal?: AbortSignal) =>
+      withLlmRequest({
+        signal: signal ? AbortSignal.any([signal, requestLifecycle.signal(sessionID)]) : requestLifecycle.signal(sessionID),
+        timeoutMs: providerChains.length
+          ? Math.min(...providerChains.map((chain) => chain.getTotalTimeout()))
+          : DEFAULT_REQUEST_POLICY.totalTimeoutMs,
+      }, run)
+    const makeChain = (component: "outputSanitizer" | "safetyEvaluator" | "outputTriage" | "outputTextTriage") => {
+      const chain = new ProviderChain(config.llm[component].providers, debugLog, llmChatLogger, `${directory}:${component}`)
+      providerChains.push(chain)
+      return chain
+    }
 
     if (config.llm.enabled) {
       // Panel-based debug log (existing behavior)
@@ -355,21 +376,21 @@ export default Plugin.define({
 
       // Build ProviderChain instances from resolved config
       // Each component uses its own providers (already resolved by config inheritance)
-      sanitizerChain = new ProviderChain(config.llm.outputSanitizer.providers, debugLog, llmChatLogger)
-      safetyChain = new ProviderChain(config.llm.safetyEvaluator.providers, debugLog, llmChatLogger)
+      sanitizerChain = makeChain("outputSanitizer")
+      safetyChain = makeChain("safetyEvaluator")
 
       if (config.llm.outputTriage.enabled) {
-        const triageChain = new ProviderChain(config.llm.outputTriage.providers, debugLog, llmChatLogger)
+        const triageChain = makeChain("outputTriage")
         outputTriage = new OutputTriageEvaluator(config.llm.outputTriage, triageChain, debugLog)
       }
 
       if (config.llm.outputTextTriage.enabled) {
-        const textTriageChain = new ProviderChain(config.llm.outputTextTriage.providers, debugLog, llmChatLogger)
+        const textTriageChain = makeChain("outputTextTriage")
         outputTextTriage = new OutputTextTriageEvaluator(config.llm.outputTextTriage, textTriageChain, debugLog)
       }
 
       // Health check (non-blocking — don't block plugin startup)
-      sanitizerChain.healthCheck().then((healthy) => {
+      runEvaluation("__health__", () => sanitizerChain!.healthCheck()).then((healthy) => {
         if (!healthy) {
           client.app.log({
             body: {
@@ -389,7 +410,7 @@ export default Plugin.define({
             }).catch(() => {})
           }
         }
-      })
+      }).catch(() => { /* cancellation during disposal is non-critical */ })
 
       // Triage health checks (non-blocking)
       if (outputTriage) {
@@ -677,7 +698,10 @@ export default Plugin.define({
       try {
         const swept = sweepStaleSessions(sessions, Date.now(), SESSION_TTL_MS)
         if (swept.length > 0) {
-          for (const sessionID of swept) sessionPermissionSync.forget(sessionID)
+          for (const sessionID of swept) {
+            requestLifecycle.cancel(sessionID)
+            sessionPermissionSync.forget(sessionID)
+          }
           diagnosticLogger?.info(`Session TTL sweep: removed ${swept.length} stale session(s)`, { swept })
           if (swept.includes(latestSessionID)) latestSessionID = "__default__"
         }
@@ -690,7 +714,9 @@ export default Plugin.define({
 
     // ─── Event Subscription (session lifecycle state resets) ───
     const eventController = new AbortController()
+    const disposeLlm = disposeResources
     disposeResources = () => {
+      disposeLlm?.()
       clearInterval(sweepTimer)
       eventController.abort()
     }
@@ -699,6 +725,7 @@ export default Plugin.define({
         try {
           if (event.type === "session.created") {
             const sessionID = sessionIDFromEvent(event)
+            requestLifecycle.cancel(sessionID)
             diagnosticLogger?.info(`Session reset: clearing state for ${sessionID || "default session"}`)
             resetSessionState(sessionID)
             // Drop any state from a prior incarnation, then best-effort sync.
@@ -708,11 +735,14 @@ export default Plugin.define({
             void sessionPermissionSync.sync(sessionID)
           } else if (event.type === "session.deleted") {
             const sessionID = sessionIDFromEvent(event)
+            requestLifecycle.cancel(sessionID)
             sessionPermissionSync.forget(sessionID)
             if (sessionID && sessions.delete(sessionID)) {
               diagnosticLogger?.info(`Session deleted: removed state for ${sessionID}`)
               if (latestSessionID === sessionID) latestSessionID = "__default__"
             }
+          } else if (event.type === "session.status" && asRecord(asRecord(event.data).status).type === "idle") {
+            requestLifecycle.cancel(sessionIDFromEvent(event))
           } else if (event.type === "session.permissions") {
             // The host replaced the session ruleset. Invalidate the cache so
             // the next lazy sync re-reads it and re-appends Warden's rules
@@ -787,12 +817,14 @@ export default Plugin.define({
     // synced first (and awaited) because this hook runs before
     // permission.evaluate; the sync itself is still defense-in-depth only.
     await ctx.tool.hook("execute.before", async (event) => {
-      await sessionPermissionSync.sync(event.sessionID)
-      getSessionState(event.sessionID)
-      await inputSanitizer(
-        { tool: event.tool, sessionID: event.sessionID, callID: event.id },
-        { args: asRecord(event.input) },
-      )
+      return runEvaluation(event.sessionID, async () => {
+        await sessionPermissionSync.sync(event.sessionID)
+        getSessionState(event.sessionID)
+        await inputSanitizer(
+          { tool: event.tool, sessionID: event.sessionID, callID: event.id },
+          { args: asRecord(event.input) },
+        )
+      })
     })
 
     // tool.execute.after — output redaction over textual content, structured
@@ -801,9 +833,14 @@ export default Plugin.define({
       redactor: outputRedactor,
       engine,
     })
-    await ctx.tool.hook("execute.after", (event) =>
-      executeAfter(event as ToolAfterEvent),
-    )
+    await ctx.tool.hook("execute.after", async (event) => {
+      try {
+        await runEvaluation(event.sessionID, () => executeAfter(event as ToolAfterEvent))
+      } catch (error) {
+        if (!(error instanceof LlmRequestError)) throw error
+        withholdExecuteAfter(event as ToolAfterEvent, error.message)
+      }
+    })
 
     // permission evaluate → shared permission handler. The adapter forwards the
     // real V2 action/resources/source call id and writes denial message/effect
@@ -814,8 +851,16 @@ export default Plugin.define({
       // (for example host-initiated assertions). The current event's effect was
       // already computed by the host, so this only narrows later evaluations;
       // the handler below is still the authoritative decision for this one.
-      await sessionPermissionSync.sync(event.sessionID)
-      return permissionAdapter(event as PermissionEvaluationEvent)
+      try {
+        await runEvaluation(event.sessionID, async () => {
+          await sessionPermissionSync.sync(event.sessionID)
+          return permissionAdapter(event as PermissionEvaluationEvent)
+        })
+      } catch (error) {
+        if (!(error instanceof LlmRequestError)) throw error
+        event.effect = "deny"
+        event.message = error.message
+      }
     })
 
     // shell.create.before — deterministic path/cwd backstop for every shell
@@ -956,9 +1001,10 @@ export default Plugin.define({
           required: ["tool"],
           additionalProperties: false,
         },
-        async execute(input) {
+        async execute(input, context) {
           return {
-            content: await evaluateToolDef.execute(input as { tool: string; command?: string; args?: string }),
+            content: await runEvaluation(context.sessionID,
+              () => evaluateToolDef.execute(input as { tool: string; command?: string; args?: string }), context.signal),
           }
         },
       })

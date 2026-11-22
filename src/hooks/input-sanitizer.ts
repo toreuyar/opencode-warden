@@ -1,4 +1,5 @@
 import type { DetectionEngine } from "../detection/engine.js"
+import { requestFailureMessage } from "../llm/request-context.js"
 import type { AuditLogger } from "../audit/index.js"
 import type { SessionStats } from "../audit/session-stats.js"
 import type { SafetyEvaluator, SafetyEvaluationResult } from "../llm/safety-evaluator.js"
@@ -559,6 +560,8 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
             : ""
 
           throw new Error(
+            fileEvalResult.requestFailure ? requestFailureMessage(fileEvalResult.requestFailure) :
+            fileEvalResult.providerOverloaded ? "Warden: LLM provider overloaded by concurrent requests (queue full or wait timed out). Execution blocked; retry later." :
             evalFailed
               ? `Warden: Execution blocked — file content could not be evaluated (fail-closed).\n` +
                 `File: ${execPath}\n` +
@@ -773,6 +776,8 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
             : ""
 
           throw new Error(
+            safetyResult.requestFailure ? requestFailureMessage(safetyResult.requestFailure) :
+            safetyResult.providerOverloaded ? "Warden: LLM provider overloaded by concurrent requests (queue full or wait timed out). Tool call blocked; retry later." :
             evaluationFailed
               ? `Warden: Tool call blocked — safety evaluator unavailable (fail-closed).\n` +
                 `The evaluator is unreachable, misconfigured, timed out, or returned an unusable response. ` +

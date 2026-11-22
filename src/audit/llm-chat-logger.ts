@@ -20,6 +20,8 @@ export class LlmChatLogger {
   private callStartMs = 0
   private firstTokenMs = 0
   private tokenCount = 0
+  private ended = false
+  private prefix = ""
 
   constructor(config: LlmChatLoggerConfig) {
     this.filePath = config.filePath
@@ -33,11 +35,23 @@ export class LlmChatLogger {
     }
   }
 
+  /** Each HTTP attempt owns its streaming state; synchronous writes are atomic
+   * within the process and every fragment carries correlation IDs.
+   */
+  fork(requestID: string, attemptID: string): LlmChatLogger {
+    const logger = new LlmChatLogger({
+      filePath: this.filePath, maxFileSize: this.maxFileSize, maxFiles: this.maxFiles,
+    })
+    logger.prefix = `[request=${requestID} attempt=${attemptID}] `
+    return logger
+  }
+
   /**
    * Write the header and all system/user messages for a new LLM call.
    * Optional providerName shows which provider in the chain is being used.
    */
   startCall(component: string, tool: string, messages: LlmMessage[], providerName?: string): void {
+    this.ended = false
     this.inThinking = false
     this.callStartMs = Date.now()
     this.firstTokenMs = 0
@@ -96,6 +110,8 @@ export class LlmChatLogger {
    * Write the timing footer and separator after the LLM call completes.
    */
   endCall(durationMs: number): void {
+    if (this.ended) return
+    this.ended = true
     if (this.inThinking) {
       this.write("⟩\n")
       this.inThinking = false
@@ -136,7 +152,9 @@ export class LlmChatLogger {
 
   private write(text: string): void {
     try {
-      secureAppendFileSync(this.filePath, text)
+      secureAppendFileSync(this.filePath, this.prefix
+        ? text.split("\n").map((line) => this.prefix + line).join("\n") + "\n"
+        : text)
     } catch {
       // Chat logging must never break the plugin
     }

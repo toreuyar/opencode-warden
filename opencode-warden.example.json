@@ -117,6 +117,16 @@
     "model": "your-model-name",
     "apiKey": "",
     "timeout": 60000,
+    "requestPolicy": {
+      "concurrency": 1,
+      "maxQueueSize": 100,
+      "queueTimeoutMs": 300000,
+      "totalTimeoutMs": 300000,
+      "recoveryDelayMs": 5000,
+      "maxAttempts": 5,
+      "initialDelayMs": 5000,
+      "maxDelayMs": 60000
+    },
     "contextAccumulation": false,
     "contextDetectionsOnly": true,
     "maxContextPairs": 5,

@@ -27,6 +27,7 @@ export class ConversationContext {
   private maxChars: number
   private history: MessagePair[] = []
   private pendingUserMessage: LlmMessage | null = null
+  private generation = 0
 
   constructor(options: ConversationContextOptions) {
     this.systemPrompt = options.systemPrompt
@@ -38,6 +39,29 @@ export class ConversationContext {
 
   addUserMessage(content: string): void {
     this.pendingUserMessage = { role: "user", content }
+  }
+
+  /** Bind history and completion to this request, even when calls overlap. */
+  beginExchange(content: string): {
+    messages: LlmMessage[]
+    complete: (response: string, hadDetection?: boolean) => void
+  } {
+    const generation = this.generation
+    const user: LlmMessage = { role: "user", content }
+    const messages: LlmMessage[] = [{ role: "system", content: this.systemPrompt }]
+    for (const pair of this.history) messages.push({ ...pair.user }, { ...pair.assistant })
+    messages.push(user)
+    let completed = false
+    return {
+      messages,
+      complete: (response, hadDetection = false) => {
+        if (completed || generation !== this.generation) return
+        completed = true
+        if (!this.accumulate || (this.detectionsOnly && !hadDetection)) return
+        this.history.push({ user, assistant: { role: "assistant", content: response }, hadDetection })
+        this.trim()
+      },
+    }
   }
 
   /**
@@ -78,6 +102,7 @@ export class ConversationContext {
   }
 
   reset(): void {
+    this.generation++
     this.history = []
     this.pendingUserMessage = null
   }

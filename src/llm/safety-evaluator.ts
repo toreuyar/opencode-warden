@@ -6,6 +6,8 @@ import type {
   SecurityGuardConfig,
 } from "../types.js"
 import { ConversationContext } from "./context.js"
+import { ProviderOverloadError, PROVIDER_OVERLOAD_MESSAGE } from "./request-queue.js"
+import { LlmRequestError, requestFailureMessage } from "./request-context.js"
 import {
   DEFAULT_SAFETY_SYSTEM_PROMPT,
   DEFAULT_FILE_EXECUTION_SYSTEM_PROMPT,
@@ -285,13 +287,17 @@ export class SafetyEvaluator {
 
     return {
       safe: false,
-      riskLevel: decision === "unavailable" ? "critical" : "none",
+      riskLevel: decision === "simplify" ? "none" : "critical",
       riskDimensions: [],
-      explanation: decision === "simplify" ? SIMPLIFY_SHELL_MESSAGE : SHELL_PRECHECK_UNAVAILABLE_MESSAGE,
+      explanation: decision === "simplify" ? SIMPLIFY_SHELL_MESSAGE :
+        decision === "overloaded" ? PROVIDER_OVERLOAD_MESSAGE :
+          decision === "cancelled" || decision === "deadline" ? requestFailureMessage(decision) : SHELL_PRECHECK_UNAVAILABLE_MESSAGE,
       suggestedAlternative: "",
       recommendation: "block",
-      complexityPrecheck: decision,
-      ...(decision === "unavailable" ? { evaluationFailed: true } : {}),
+      complexityPrecheck: decision === "simplify" ? "simplify" : "unavailable",
+      ...(decision !== "simplify" ? { evaluationFailed: true } : {}),
+      ...(decision === "overloaded" ? { providerOverloaded: true } : {}),
+      ...(decision === "cancelled" || decision === "deadline" ? { requestFailure: decision } : {}),
     }
   }
 
@@ -316,16 +322,16 @@ export class SafetyEvaluator {
       customTemplate || undefined,
       this.config.operationalProfiles,
     )
-    this.context.addUserMessage(prompt)
+    const exchange = this.context.beginExchange(prompt)
 
     try {
       const response = await this.providerChain.call(
-        this.context.getMessages(),
-        { componentName: "safety-evaluator" },
+        exchange.messages,
+        { componentName: "safety-evaluator", validateResponse: (raw) => this.validateResponse(raw) },
       )
       const evaluation = this.parseResponse(response)
       const result = this.applyThresholds(evaluation)
-      this.context.addAssistantMessage(response, result.recommendation !== "allow")
+      exchange.complete(response, result.recommendation !== "allow")
 
       log?.(
         `Safety eval result: riskLevel=${result.riskLevel} recommendation=${result.recommendation} (${Date.now() - start}ms)\nPARSED RESULT:\n${JSON.stringify(result, null, 2)}`,
@@ -343,7 +349,9 @@ export class SafetyEvaluator {
         safe: false,
         riskLevel: "critical",
         riskDimensions: [],
-        explanation: "LLM unreachable — blocking for safety",
+        explanation: err instanceof LlmRequestError ? err.message : err instanceof ProviderOverloadError ? PROVIDER_OVERLOAD_MESSAGE : "LLM unreachable — blocking for safety",
+        ...(err instanceof LlmRequestError ? { requestFailure: err.reason } : {}),
+        ...(err instanceof ProviderOverloadError ? { providerOverloaded: true } : {}),
         suggestedAlternative: "",
         recommendation: "block",
         evaluationFailed: true,
@@ -408,7 +416,7 @@ export class SafetyEvaluator {
     try {
       const response = await this.providerChain.call(
         messages,
-        { componentName: "safety-evaluator-dryrun" },
+        { componentName: "safety-evaluator-dryrun", validateResponse: (raw) => this.validateResponse(raw) },
       )
       const evaluation = this.parseResponse(response)
       const result = this.applyThresholds(evaluation)
@@ -424,7 +432,9 @@ export class SafetyEvaluator {
         safe: false,
         riskLevel: "critical",
         riskDimensions: [],
-        explanation: "LLM unreachable — dry-run cannot evaluate",
+        explanation: err instanceof LlmRequestError ? err.message : err instanceof ProviderOverloadError ? PROVIDER_OVERLOAD_MESSAGE : "LLM unreachable — dry-run cannot evaluate",
+        ...(err instanceof LlmRequestError ? { requestFailure: err.reason } : {}),
+        ...(err instanceof ProviderOverloadError ? { providerOverloaded: true } : {}),
         suggestedAlternative: "",
         recommendation: "block",
         evaluationFailed: true,
@@ -467,7 +477,7 @@ export class SafetyEvaluator {
     try {
       const response = await this.providerChain.call(
         messages,
-        { componentName: "file-execution-evaluator" },
+        { componentName: "file-execution-evaluator", validateResponse: (raw) => this.validateResponse(raw) },
       )
 
       const evaluation = this.parseResponse(response)
@@ -487,7 +497,9 @@ export class SafetyEvaluator {
         safe: false,
         riskLevel: "critical",
         riskDimensions: [],
-        explanation: "File content evaluation failed — blocking for safety",
+        explanation: err instanceof LlmRequestError ? err.message : err instanceof ProviderOverloadError ? PROVIDER_OVERLOAD_MESSAGE : "File content evaluation failed — blocking for safety",
+        ...(err instanceof LlmRequestError ? { requestFailure: err.reason } : {}),
+        ...(err instanceof ProviderOverloadError ? { providerOverloaded: true } : {}),
         suggestedAlternative: "",
         recommendation: "block",
         evaluationFailed: true,
@@ -497,6 +509,13 @@ export class SafetyEvaluator {
 
   reset(): void {
     this.context.reset()
+  }
+
+  private validateResponse(response: string): string {
+    if (this.parseResponse(response).evaluationFailed) {
+      throw new Error("Could not parse safety evaluation — invalid verdict")
+    }
+    return response
   }
 
   private applyThresholds(evaluation: SafetyEvaluation): SafetyEvaluationResult {

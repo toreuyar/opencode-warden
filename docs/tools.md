@@ -43,9 +43,12 @@ Displays a real-time security overview of the current session.
 - Blocked file access attempts
 - Last 10 security events
 - LLM connectivity status
+- Process-wide provider queues: component/provider-index mappings, active and
+  waiting counts, limits, oldest wait, recovery pause, queue-full and timeout
+  counters, and pending retry attempts (when the LLM is enabled)
 
 **Brief mode shows:**
-- A compact summary: total calls, detections, blocks, and top triggered category
+- A compact summary: total calls, detections, blocks, and LLM status
 - Suitable for quick status checks mid-session
 
 ## `security_report`
@@ -71,10 +74,9 @@ Generates a comprehensive session security report.
 Queries the audit log file with optional filters, returning matching entries.
 
 **Arguments:**
-- `limit`: Maximum number of entries to return (default: 50)
+- `limit`: Maximum number of entries to return (default: 20)
 - `tool`: Filter by tool name (e.g., `"shell"`, `"read"`; legacy `"bash"` entries remain valid)
-- `blocked`: `true` to return only blocked calls, `false` for non-blocked, omit for all
-- `since`: ISO 8601 timestamp — only return entries after this time
+- `eventType`: `"block"`, `"detection"`, `"pass"`, `"safety-block"`, or `"safety-warn"`
 - `category`: Filter by detection category (e.g., `"api-keys"`, `"credentials"`)
 
 Returns parsed JSON log entries from `.opencode/warden/audit.log`. Useful for the AI to investigate past security events without requiring external tools.
@@ -84,12 +86,17 @@ Returns parsed JSON log entries from `.opencode/warden/audit.log`. Useful for th
 Dry-run safety evaluation — evaluates a hypothetical tool call without executing it.
 
 **Arguments:**
-- `toolName`: The tool to evaluate (e.g., `"shell"`, `"write"`; legacy `"bash"` is accepted as an alias)
-- `args`: The arguments object as it would be passed to the tool
+- `tool`: The tool to evaluate (e.g., `"shell"`, `"write"`; legacy `"bash"` is accepted as an alias)
+- `command`: Shell command string, or use `args` for other tools
+- `args`: JSON-encoded string containing the tool arguments
 
 Returns the LLM safety evaluation result: risk level, risk dimensions, explanation, and recommendation. Does not execute the tool or log to the audit trail.
 
 Useful for the AI to pre-check whether a command it is considering would be blocked, so it can adjust its approach before attempting execution.
+
+The dry run uses the same provider queues, retry policy, and evaluation deadline
+as other LLM work. Its custom-tool execution context supplies a real cancellation
+signal; cancelling stops queued/backoff/HTTP work without retry.
 
 ## `security_config`
 

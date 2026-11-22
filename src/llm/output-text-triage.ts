@@ -1,6 +1,8 @@
 import type { SecurityGuardConfig } from "../types.js"
 import { DEFAULT_TEXT_TRIAGE_SYSTEM_PROMPT, buildTextTriagePrompt } from "./prompts.js"
 import type { ProviderChain } from "./provider-chain.js"
+import { ProviderOverloadError } from "./request-queue.js"
+import { LlmRequestError } from "./request-context.js"
 import { tryParseJsonObject } from "../utils/json-repair.js"
 
 export interface TextTriageResult {
@@ -64,9 +66,8 @@ export class OutputTextTriageEvaluator {
           { role: "system", content: this.systemPrompt },
           { role: "user", content: prompt },
         ],
-        { componentName: "output-text-triage" },
+        { componentName: "output-text-triage", validateResponse: (raw) => { this.parseResponse(raw); return raw } },
       )
-
       const result = this.parseResponse(response)
 
       log?.(
@@ -75,6 +76,7 @@ export class OutputTextTriageEvaluator {
 
       return result
     } catch (err) {
+      if (err instanceof ProviderOverloadError || err instanceof LlmRequestError) throw err
       const errMsg = err instanceof Error ? err.message : String(err)
       log?.(
         `Text triage failed: ${errMsg} — fail-closed (throwing to block)`,

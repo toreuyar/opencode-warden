@@ -1,6 +1,8 @@
 import type { SecurityGuardConfig } from "../types.js"
 import { DEFAULT_TRIAGE_SYSTEM_PROMPT, buildTriagePrompt } from "./prompts.js"
 import type { ProviderChain } from "./provider-chain.js"
+import { ProviderOverloadError } from "./request-queue.js"
+import { LlmRequestError } from "./request-context.js"
 import { tryParseJsonObject } from "../utils/json-repair.js"
 
 export interface TriageResult {
@@ -63,9 +65,8 @@ export class OutputTriageEvaluator {
           { role: "system", content: this.systemPrompt },
           { role: "user", content: prompt },
         ],
-        { componentName: "output-triage" },
+        { componentName: "output-triage", validateResponse: (raw) => { this.parseResponse(raw); return raw } },
       )
-
       const result = this.parseResponse(response)
 
       log?.(
@@ -74,6 +75,7 @@ export class OutputTriageEvaluator {
 
       return result
     } catch (err) {
+      if (err instanceof ProviderOverloadError || err instanceof LlmRequestError) throw err
       const errMsg = err instanceof Error ? err.message : String(err)
       log?.(
         `Output triage failed: ${errMsg} — fail-closed (throwing to block)`,

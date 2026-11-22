@@ -1,4 +1,5 @@
 import type { DetectionEngine } from "../detection/engine.js"
+import { LlmRequestError } from "../llm/request-context.js"
 import type {
   FailClosedFailure,
   PermissionDecision,
@@ -133,6 +134,20 @@ export type ToolAfterEvent =
   | (ToolAfterBase & { readonly status: "completed"; result: ToolResultLike })
   | (ToolAfterBase & { readonly status: "error"; error: ToolErrorLike })
 
+/** Clear every output channel when the enclosing evaluation scope expires. */
+export function withholdExecuteAfter(event: ToolAfterEvent, message: string): void {
+  const text = `[BLOCKED] Output withheld — ${message}`
+  if (event.status === "completed") {
+    event.result.content = [{ type: "text", text }]
+    event.result.output = undefined
+    event.result.metadata = undefined
+  } else {
+    event.error.message = text
+    event.error.error = undefined
+    event.error.metadata = undefined
+  }
+}
+
 export type OutputRedactorFn = (
   input: {
     tool: string
@@ -263,8 +278,8 @@ async function runRedactor(
   try {
     await redactor(input, holder)
     return true
-  } catch {
-    blockedHolder(holder, "Sanitizer failed — output withheld for safety")
+  } catch (error) {
+    blockedHolder(holder, error instanceof LlmRequestError ? error.message : "Sanitizer failed — output withheld for safety")
     return false
   }
 }

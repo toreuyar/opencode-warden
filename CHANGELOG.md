@@ -4,6 +4,75 @@ All notable user-facing changes to OpenCode Warden are recorded here. The
 project follows [Semantic Versioning](https://semver.org/). Release notes for
 versions before 2.0.0 are available in the git history and release tags.
 
+## [2.2.0] — 2026-11-22
+
+**Provider concurrency and resilient LLM requests.** Run parallel coding-agent
+tool calls against a capacity-limited evaluator without sending them all to the
+GPU at once. Warden queues calls across sessions, keeps results paired with
+their callers, and remains fail-closed when evaluation cannot complete.
+
+### Added
+
+- Add cancellation-aware queue admission, backoff and HTTP requests, an overall
+  evaluation deadline, endpoint-wide recovery pauses, and Retry-After support.
+  Hook cancellation is lifecycle-based because V2 Promise hooks lack a per-tool
+  AbortSignal; the custom evaluation tool uses the host's execution signal.
+- Apply provider limits live across plugin reloads using stable ownership.
+  Add process-wide queue metrics to the dashboard and correlated scheduling logs.
+- Isolate concurrent streaming chat logs by request/attempt ID and per-attempt
+  counters. Verify a bounded queued burst and disconnect/recovery against a
+  live llama-swap server, without claiming GPU cancellation guarantees.
+- Add process-wide, endpoint-scoped FIFO request limits across all LLM
+  components and sessions, with bounded queues and separate admission timeouts.
+- Add provider `requestPolicy.maxAttempts`, exponential backoff with jitter,
+  configurable initial delay/cap, and retries for transient or invalid responses.
+  Explicit attempt limits override legacy sanitizer retry counts.
+- Report queue overload to the original caller while preserving fail-closed
+  blocking/withholding and provider fallback.
+- Bind accumulated conversation exchanges to individual requests so overlapping
+  evaluations cannot pair a response with another call's prompt.
+
+### Documentation and packaging
+
+- Reorder the README for first-time visitors: project benefits and quick start
+  first, then features and documentation; detailed installation, compatibility,
+  runtime boundaries, and migration history remain available further down.
+- Update V2 installation examples to the native `plugins` key; retain V1
+  installation instructions and historical resolver/runtime notes.
+- Add provider scheduling configuration, cancellation limitations, operational
+  metrics, and the opt-in live concurrency probe to the documentation.
+- Include the README's icon in the npm package.
+
+### Upgrade notes
+
+- Existing configs remain valid. Queue limits are opt-in (`concurrency: 0`
+  by default); use `1` for a single-request llama-swap/llama.cpp endpoint.
+- `maxAttempts` counts the first request: `1` disables retries and `5` allows
+  four retries. When unset, legacy sanitizer retry counts retain their semantics.
+- LLM evaluations now have a default **300,000 ms overall budget** covering
+  queueing, inference, backoff, and fallback. Set `totalTimeoutMs` for slower
+  evaluators. Configure a positive provider `timeout`; the unresolved `0`
+  sentinel is not an unlimited inference timeout.
+- Interrupted inference pauses the endpoint for **5,000 ms** by default.
+  `recoveryDelayMs: 0` disables that pause. An HTTP disconnect is not proof that
+  the GPU stopped immediately.
+- Queues are shared by normalized completion URL within one process, including
+  different model names using that URL. Separate OpenCode processes do not share
+  capacity. Reload plugin configuration to apply changed limits without a
+  process restart.
+- The supported host floor remains **OpenCode 2.0.18**; typed tool vetoes require
+  **2.0.29+**. OpenCode 1.x users must retain Warden **1.3.0**.
+
+### Verification
+
+- Typecheck, **1,198 tests**, build, and diff checks passed.
+- A bounded live llama-swap / `Nemotron-3.5-Bolt-E4B` probe verified four queued
+  calls through two chains, peak active requests one, and correct response
+  markers. A follow-up succeeded after disconnecting an unfinished stream.
+- Hook lifecycle cancellation was exercised with simulated host events. No new
+  OpenCode host runtime probe or broad live-model accuracy suite was performed.
+  Historical host validation below belongs to Warden 2.0.0.
+
 ## [2.1.0] — 2026-11-22
 
 ### Added

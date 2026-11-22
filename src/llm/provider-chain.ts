@@ -1,6 +1,8 @@
-import type { LlmMessage, LlmProviderConfig } from "../types.js"
+import type { LlmMessage, LlmProviderConfig, LlmRequestPolicy } from "../types.js"
 import type { LlmChatLogger } from "../audit/llm-chat-logger.js"
 import { buildLlmHeaders, callLlm, checkLlmHealth, LlmApiError } from "./client.js"
+import { DEFAULT_REQUEST_POLICY, ProviderOverloadError, registerProviderQueues, retryDelay } from "./request-queue.js"
+import { checkRequest, currentLlmRequest, LlmInferenceTimeoutError, LlmRequestError, waitForRetry, withLlmRequest } from "./request-context.js"
 
 const EXHAUSTION_CODES = [429, 402, 503]
 
@@ -19,6 +21,7 @@ function normalizeProvider(raw: Partial<LlmProviderConfig>, index: number): LlmP
   return {
     name: raw.name || `provider-${index + 1}`,
     cooldown: raw.cooldown ?? 0,
+    requestPolicy: raw.requestPolicy,
     baseUrl: raw.baseUrl || "",
     model: raw.model || "",
     apiKey: raw.apiKey || "",
@@ -32,9 +35,12 @@ function normalizeProvider(raw: Partial<LlmProviderConfig>, index: number): LlmP
 }
 
 export interface ProviderCallOptions {
+  signal?: AbortSignal
   temperature?: number
   componentName?: string
   retryCount?: number
+  /** Validate raw text inside the attempt loop before accepting a response. */
+  validateResponse?: (response: string) => string
 }
 
 /**
@@ -52,6 +58,8 @@ export class ProviderChain {
   private readonly providers: LlmProviderConfig[]
   private readonly debugLog?: (msg: string) => void
   private readonly chatLogger?: LlmChatLogger
+  private readonly registration: ReturnType<typeof registerProviderQueues>
+  private readonly lifetime = new AbortController()
 
   // Runtime cooldown tracking: providerIndex → timestamp when exhausted
   private readonly exhaustedAt = new Map<number, number>()
@@ -60,18 +68,38 @@ export class ProviderChain {
     providers: LlmProviderConfig[],
     debugLog?: (msg: string) => void,
     chatLogger?: LlmChatLogger,
+    owner?: string,
   ) {
     // Normalize all providers to ensure complete fields with safe defaults
     this.providers = providers.map((p, i) => normalizeProvider(p, i))
+    this.registration = registerProviderQueues(this.providers, owner)
     this.debugLog = debugLog
     this.chatLogger = chatLogger
+  }
+
+  getTotalTimeout(): number {
+    return this.providers.length
+      ? Math.min(...this.providers.map((provider) => provider.requestPolicy?.totalTimeoutMs ?? DEFAULT_REQUEST_POLICY.totalTimeoutMs))
+      : DEFAULT_REQUEST_POLICY.totalTimeoutMs
+  }
+
+  updateRequestPolicy(index: number, policy: LlmRequestPolicy): void {
+    checkRequest(this.lifetime.signal)
+    if (!this.providers[index]) throw new Error("Warden: Unknown provider index")
+    this.registration.update(index, policy)
+    this.providers[index].requestPolicy = { ...policy }
+  }
+
+  dispose(): void {
+    this.lifetime.abort(new LlmRequestError("cancelled"))
+    this.registration.dispose()
   }
 
   /**
    * Execute an LLM call with automatic fallback through the provider chain.
    */
   async call(messages: LlmMessage[], options: ProviderCallOptions = {}): Promise<string> {
-    return this.callValidated(messages, (response) => response, options)
+    return this.callValidated(messages, options.validateResponse ?? ((response) => response), options)
   }
 
   /**
@@ -84,12 +112,33 @@ export class ProviderChain {
     validate: (response: string) => T,
     options: ProviderCallOptions = {},
   ): Promise<T> {
+    return withLlmRequest({
+      signal: options.signal ? AbortSignal.any([options.signal, this.lifetime.signal]) : this.lifetime.signal,
+      timeoutMs: this.getTotalTimeout(),
+    },
+      () => this.runValidated(messages, validate, options))
+  }
+
+  private async runValidated<T>(
+    messages: LlmMessage[],
+    validate: (response: string) => T,
+    options: ProviderCallOptions,
+  ): Promise<T> {
+    const scope = currentLlmRequest()!
+    const callID = crypto.randomUUID()
     const errors: string[] = []
     const retryCount = Math.max(0, options.retryCount ?? 0)
+    let overload: ProviderOverloadError | undefined
+    // Snapshot once: queued/retried calls must never observe later context mutations.
+    messages = messages.map((message) => ({ ...message }))
 
     for (let i = 0; i < this.providers.length; i++) {
+      checkRequest(scope.signal)
       const provider = this.providers[i]
+      const queue = this.registration.queues[i]
       const name = provider.name
+      const policy = { ...DEFAULT_REQUEST_POLICY, ...provider.requestPolicy }
+      const attempts = provider.requestPolicy?.maxAttempts ?? (retryCount + 1)
 
       // Check cooldown
       if (this.isOnCooldown(i)) {
@@ -99,24 +148,49 @@ export class ProviderChain {
         continue
       }
 
-      for (let attempt = 0; attempt <= retryCount; attempt++) {
+      for (let attempt = 0; attempt < attempts; attempt++) {
         try {
-          this.debugLog?.(`ProviderChain: trying ${name} (${provider.baseUrl} model=${provider.model}) attempt=${attempt + 1}/${retryCount + 1}`)
+          checkRequest(scope.signal)
+          const attemptID = crypto.randomUUID()
+          this.debugLog?.(`LLM scheduling ${JSON.stringify({ requestID: scope.id, callID, attemptID, attempt: attempt + 1, phase: "admission", ...queue.snapshot() })}`)
+          this.debugLog?.(`ProviderChain: trying ${name} (${provider.baseUrl} model=${provider.model}) attempt=${attempt + 1}/${attempts}`)
 
           const headers = buildLlmHeaders(provider.apiKey, provider.headers)
-          const response = await callLlm({
-            baseUrl: provider.baseUrl,
-            completionsPath: provider.completionsPath,
-            model: provider.model,
-            messages,
-            temperature: options.temperature ?? provider.temperature,
-            maxTokens: provider.maxTokens,
-            timeout: provider.timeout,
-            headers,
-            debugLog: this.debugLog,
-            chatLogger: this.chatLogger,
-            componentName: options.componentName,
-          })
+          const release = await queue.acquire(policy.queueTimeoutMs, scope.signal)
+          let response: string
+          let transportStarted = false
+          try {
+            checkRequest(scope.signal)
+            this.debugLog?.(`LLM scheduling ${JSON.stringify({ requestID: scope.id, callID, attemptID, attempt: attempt + 1, phase: "inference", ...queue.snapshot() })}`)
+            transportStarted = true
+            response = await callLlm({
+              signal: scope.signal,
+              requestID: scope.id,
+              attemptID,
+              baseUrl: provider.baseUrl,
+              completionsPath: provider.completionsPath,
+              model: provider.model,
+              messages,
+              temperature: options.temperature ?? provider.temperature,
+              maxTokens: provider.maxTokens,
+              timeout: Math.max(1, Math.min(provider.timeout, scope.deadline - Date.now())),
+              headers,
+              debugLog: this.debugLog,
+              chatLogger: this.chatLogger,
+              componentName: options.componentName,
+            })
+          } catch (error) {
+            if (transportStarted && (error instanceof LlmInferenceTimeoutError || scope.signal.aborted)) {
+              queue.pause(policy.recoveryDelayMs)
+            } else if (error instanceof LlmApiError && (error.statusCode === 429 || error.statusCode >= 500)) {
+              queue.pause(error.retryAfterMs ?? 0)
+            }
+            throw error
+          } finally {
+            release()
+          }
+          checkRequest(scope.signal)
+          if (!response.trim()) throw new Error("LLM returned an empty response")
 
           const validated = validate(response)
 
@@ -129,7 +203,30 @@ export class ProviderChain {
 
           return validated
         } catch (err) {
+          checkRequest(scope.signal)
+          if (err instanceof LlmRequestError) throw err
           const errMsg = err instanceof Error ? err.message : String(err)
+          if (err instanceof ProviderOverloadError) {
+            overload = err
+            errors.push(err.message)
+            break // Local overload is bounded by queue policy, not retried.
+          }
+
+          // Explicit request policy retries transport, empty-response and validator
+          // failures before fallback, including overload responses from the server.
+          const permanent = err instanceof LlmApiError &&
+            [400, 401, 402, 403, 404, 405, 413, 422].includes(err.statusCode)
+          if (provider.requestPolicy?.maxAttempts !== undefined && attempt + 1 < attempts && !permanent) {
+            const delay = Math.max(
+              retryDelay(attempt, policy.initialDelayMs, policy.maxDelayMs),
+              err instanceof LlmApiError ? err.retryAfterMs ?? 0 : 0,
+            )
+            this.debugLog?.(`ProviderChain: retrying ${name} in ${delay}ms`)
+            queue.retry(callID, attempt + 2, delay)
+            this.debugLog?.(`LLM scheduling ${JSON.stringify({ requestID: scope.id, callID, phase: "backoff", attempt: attempt + 2, delayMs: delay, ...queue.snapshot() })}`)
+            try { await waitForRetry(delay, scope.signal) } finally { queue.clearRetry(callID) }
+            continue
+          }
 
           if (err instanceof LlmApiError && isExhausted(err.statusCode)) {
             // Exhaustion — mark with cooldown timestamp
@@ -143,7 +240,7 @@ export class ProviderChain {
             break
           }
 
-          if (attempt < retryCount) {
+          if (provider.requestPolicy?.maxAttempts === undefined && attempt < retryCount) {
             this.debugLog?.(`ProviderChain: ${name} attempt ${attempt + 1} failed, retrying: ${errMsg}`)
             continue
           }
@@ -157,6 +254,7 @@ export class ProviderChain {
     }
 
     // All providers exhausted or failed
+    if (overload) throw overload
     throw new Error(`All LLM providers failed: ${errors.join("; ")}`)
   }
 
@@ -164,18 +262,36 @@ export class ProviderChain {
    * Health check — returns true if at least one provider responds.
    */
   async healthCheck(): Promise<boolean> {
-    for (const provider of this.providers) {
+    try {
+      return await withLlmRequest({ signal: this.lifetime.signal, timeoutMs: this.getTotalTimeout() }, () => this.checkHealth())
+    } catch { return false }
+  }
+
+  private async checkHealth(): Promise<boolean> {
+    const scope = currentLlmRequest()!
+    for (const [i, provider] of this.providers.entries()) {
       try {
         const headers = buildLlmHeaders(provider.apiKey, provider.headers)
-        const healthy = await checkLlmHealth({
-          baseUrl: provider.baseUrl,
-          healthCheckPath: provider.healthCheckPath,
-          timeout: 5000,
-          headers,
-          debugLog: this.debugLog,
-        })
+        const release = await this.registration.queues[i].acquire(
+          provider.requestPolicy?.queueTimeoutMs ?? DEFAULT_REQUEST_POLICY.queueTimeoutMs,
+          scope.signal,
+        )
+        let healthy: boolean
+        try {
+          healthy = await checkLlmHealth({
+            signal: scope.signal,
+            baseUrl: provider.baseUrl,
+            healthCheckPath: provider.healthCheckPath,
+            timeout: 5000,
+            headers,
+            debugLog: this.debugLog,
+          })
+        } finally {
+          release()
+        }
         if (healthy) return true
       } catch {
+        checkRequest(scope.signal)
         // Try next provider
       }
     }

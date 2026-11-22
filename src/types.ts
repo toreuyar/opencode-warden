@@ -227,6 +227,7 @@ export type OperationalProfileValue = boolean | OperationalProfileConfig
 // ─── LLM Endpoint Config (shared shape for each component) ───
 
 export interface LlmEndpointConfig {
+  requestPolicy?: LlmRequestPolicy
   baseUrl: string
   model: string
   apiKey: string
@@ -244,6 +245,37 @@ export interface LlmEndpointConfig {
 export interface LlmProviderConfig extends LlmEndpointConfig {
   name: string
   cooldown: number
+}
+
+export interface LlmRequestPolicy {
+  /** Entire evaluation budget across queueing, attempts and fallback. */
+  totalTimeoutMs?: number
+  /** Endpoint-wide admission pause after an interrupted inference request. */
+  recoveryDelayMs?: number
+  /** 0 means unlimited. Shared across chains at the same endpoint, not per session/model. */
+  concurrency?: number
+  maxQueueSize?: number
+  queueTimeoutMs?: number
+  /** Total attempts per provider, including the first; 1 disables retries. */
+  maxAttempts?: number
+  initialDelayMs?: number
+  maxDelayMs?: number
+}
+
+export type LlmRequestFailure = "cancelled" | "deadline"
+
+export interface ProviderQueueStats {
+  id: string
+  active: number
+  concurrency: number | null
+  waiting: number
+  maxQueueSize: number | null
+  oldestWaitMs: number
+  recoveryRemainingMs: number
+  queueFullCount: number
+  queueTimeoutCount: number
+  cancelledCount: number
+  retries: Array<{ requestID: string; attempt: number; delayRemainingMs: number }>
 }
 
 export interface AuditConfig {
@@ -438,6 +470,8 @@ export interface SafetyEvaluation {
  */
 export interface SafetyEvaluationResult extends SafetyEvaluation {
   evaluationFailed?: boolean
+  providerOverloaded?: boolean
+  requestFailure?: LlmRequestFailure
   staticBlock?: "shell-sequence"
   complexityPrecheck?: "simplify" | "unavailable"
 }

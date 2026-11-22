@@ -1,5 +1,7 @@
 import type { LlmSanitizeResult, LlmSanitizeFinding, SecurityGuardConfig } from "../types.js"
 import { ConversationContext } from "./context.js"
+import { ProviderOverloadError } from "./request-queue.js"
+import { LlmRequestError } from "./request-context.js"
 import {
   DEFAULT_SANITIZER_SYSTEM_PROMPT,
   buildSanitizePrompt,
@@ -93,20 +95,20 @@ export class LlmSanitizer {
       customTemplate || undefined,
       context,
     )
-    this.context.addUserMessage(prompt)
+    const exchange = this.context.beginExchange(prompt)
 
     // Step 1: Network call via provider chain (handles fallback/retry internally)
     let response = ""
     try {
       const result = await this.providerChain.callValidated(
-        this.context.getMessages(),
+        exchange.messages,
         (rawResponse) => {
           response = rawResponse
           return this.parseResponse(rawResponse, rawOutput)
         },
         { componentName: "output-sanitizer", retryCount: this.retryCount },
       )
-      this.context.addAssistantMessage(response, result.findings.length > 0)
+      exchange.complete(response, result.findings.length > 0)
 
       log?.(
         `Output sanitizer result: needsSanitization=${result.needsSanitization} ${result.findings.length} finding(s) (${Date.now() - start}ms)\nPARSED RESULT:\n${JSON.stringify(result, null, 2)}`,
@@ -114,6 +116,7 @@ export class LlmSanitizer {
 
       return result
     } catch (err) {
+      if (err instanceof ProviderOverloadError || err instanceof LlmRequestError) throw err
       const errMsg = err instanceof Error ? err.message : String(err)
       const isTimeout = errMsg.includes("timed out") || errMsg.includes("aborted") || errMsg.includes("AbortError")
       log?.(

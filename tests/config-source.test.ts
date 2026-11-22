@@ -56,6 +56,25 @@ function writeGlobalConfig(home: string, contents: string): string {
 }
 
 describe("inline config source", () => {
+  test("request policy survives provider normalization and inheritance for every component", () => {
+    const dir = makeProjectDir()
+    const requestPolicy = { concurrency: 1, maxAttempts: 5, initialDelayMs: 5000 }
+    for (const source of [
+      { baseUrl: "http://localhost:8080/v1", model: "tiny", requestPolicy },
+      { providers: [{ baseUrl: "http://localhost:8080/v1", model: "tiny", requestPolicy }] },
+      { providers: [{ baseUrl: "http://localhost:8080/v1", model: "tiny" }], requestPolicy },
+    ]) {
+      const result = loadConfig(dir, { skipGlobalConfig: true, inlineConfig: { llm: {
+        ...source, enabled: true, safetyEvaluator: { enabled: true },
+      } } })
+      expect(result.failure).toBeNull()
+      for (const component of ["safetyEvaluator", "outputSanitizer", "outputTriage", "outputTextTriage"] as const) {
+        expect(result.config.llm[component].providers[0].requestPolicy).toEqual(requestPolicy)
+        expect(result.config.llm[component].providers[0].baseUrl).toBe("http://localhost:8080/v1")
+      }
+    }
+  })
+
   test("uses inline options over defaults when no config file exists", () => {
     const dir = makeProjectDir()
 
