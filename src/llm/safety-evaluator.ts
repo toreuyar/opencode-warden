@@ -28,6 +28,8 @@ import {
 import { hasStaticFindings } from "./static-findings.js"
 import { tryParseJsonObject } from "../utils/json-repair.js"
 import { canonicalToolName, isToolInList } from "../utils/tool-compat.js"
+import { hasSequentialShellBatch, SHELL_SEQUENCE_BLOCK_REASON, SHELL_SEQUENCE_RETRY } from "../utils/shell-sequence.js"
+import { checkShellComplexity, SHELL_PRECHECK_UNAVAILABLE_MESSAGE, SIMPLIFY_SHELL_MESSAGE } from "./shell-complexity.js"
 
 export type { SafetyEvaluationResult } from "../types.js"
 
@@ -143,6 +145,7 @@ export class SafetyEvaluator {
   private indirectExecutionConfig?: SecurityGuardConfig["indirectExecution"]
   private debugLog?: (msg: string) => void
   private providerChain: ProviderChain
+  private complexityPrecheckEnabled: boolean
   private compiledPatterns: RegExp[]
   private resolvedPatterns: string[]
 
@@ -156,6 +159,8 @@ export class SafetyEvaluator {
     this.indirectExecutionConfig = indirectExecutionConfig
     this.debugLog = debugLog
     this.providerChain = providerChain
+    this.complexityPrecheckEnabled = llmConfig.enabled && this.config.enabled &&
+      this.config.complexityPrecheck?.enabled === true
 
     // Resolve and compile allowed operation patterns once at construction time
     this.resolvedPatterns = resolveAllowedPatterns(
@@ -268,6 +273,28 @@ export class SafetyEvaluator {
     return this.config.enabled && isToolInList(tool, this.config.tools)
   }
 
+  async precheckComplexity(
+    tool: string,
+    args: Record<string, unknown>,
+  ): Promise<"continue" | SafetyEvaluationResult | undefined> {
+    if (!this.complexityPrecheckEnabled || canonicalToolName(tool) !== "shell" ||
+      typeof args.command !== "string") return undefined
+
+    const decision = await checkShellComplexity(args.command, this.providerChain)
+    if (!decision || decision === "continue") return decision
+
+    return {
+      safe: false,
+      riskLevel: decision === "unavailable" ? "critical" : "none",
+      riskDimensions: [],
+      explanation: decision === "simplify" ? SIMPLIFY_SHELL_MESSAGE : SHELL_PRECHECK_UNAVAILABLE_MESSAGE,
+      suggestedAlternative: "",
+      recommendation: "block",
+      complexityPrecheck: decision,
+      ...(decision === "unavailable" ? { evaluationFailed: true } : {}),
+    }
+  }
+
   /**
    * Evaluate a tool call for safety risks using the LLM.
    */
@@ -334,8 +361,23 @@ export class SafetyEvaluator {
   ): Promise<SafetyEvaluationResult> {
     const log = this.debugLog
 
-    // Fast-path: bypassed commands don't need LLM
-    if (this.isBypassed(tool, args)) {
+    if (hasSequentialShellBatch(tool, args.command)) {
+      return {
+        safe: false,
+        riskLevel: "none",
+        riskDimensions: [],
+        explanation: SHELL_SEQUENCE_BLOCK_REASON,
+        suggestedAlternative: SHELL_SEQUENCE_RETRY,
+        recommendation: "block",
+        staticBlock: "shell-sequence",
+      }
+    }
+
+    const precheck = await this.precheckComplexity(tool, args)
+    if (precheck && precheck !== "continue") return precheck
+
+    // An explicit continue is routed to full evaluation, never to pre-approval.
+    if (precheck !== "continue" && this.isBypassed(tool, args)) {
       return {
         safe: true,
         riskLevel: "none",

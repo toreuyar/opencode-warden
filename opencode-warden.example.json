@@ -173,7 +173,8 @@
       "maxTokens": 1024,
       "systemPrompt": "",
       "promptTemplate": "",
-      "actionMode": "block"
+      "actionMode": "block",
+      "complexityPrecheck": { "enabled": false }
     }
   }
 }

@@ -111,6 +111,7 @@ const llmSafetyEvaluatorSchema = llmEndpointSchema.extend({
   systemPrompt: z.string().optional(),
   promptTemplate: z.string().optional(),
   actionMode: safetyActionModeSchema.optional(),
+  complexityPrecheck: z.strictObject({ enabled: z.boolean().optional() }).optional(),
 })
 
 const llmOutputTriageSchema = llmEndpointSchema.extend({

@@ -1,6 +1,6 @@
 {
   "name": "opencode-warden",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Security plugin for OpenCode — intercepts tool calls to detect secrets, redact sensitive data, evaluate safety risks, block access to sensitive files, and maintain an audit trail",
   "type": "module",
   "main": "dist/index.js",
@@ -34,7 +34,7 @@
   "scripts": {
     "typecheck": "bun run tsc --noEmit",
     "test": "bun test",
-    "build": "bun build src/index.ts src/rpc.ts src/tui.ts --outdir dist --target bun",
+    "build": "bun build src/index.ts src/rpc.ts src/tui.ts --outdir dist --target bun --external sh-ast",
     "prepublishOnly": "bun run build"
   },
   "author": {
@@ -50,6 +50,7 @@
     "url": "https://github.com/toreuyar/opencode-warden/issues"
   },
   "dependencies": {
+    "sh-ast": "0.12.0",
     "zod": "^3.23.0"
   },
   "peerDependencies": {

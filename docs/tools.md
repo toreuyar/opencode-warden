@@ -4,7 +4,7 @@
 
 Warden provides 7 built-in tools that the AI (or you) can invoke during a session. These tools give you and the AI real-time visibility into security state, session history, audit records, and rule management — without leaving your workflow.
 
-In Warden 2.0.0 the tools are registered through the OpenCode V2 `tool.transform`
+In Warden 2.x the tools are registered through the OpenCode V2 `tool.transform`
 surface. Configured `blockedTools` removes matching tools from the request and
 registered list (alias-aware for `shell`/`bash` and `subagent`/`task`). Tool
 arguments and outputs are still subject to Warden's normal hook processing.

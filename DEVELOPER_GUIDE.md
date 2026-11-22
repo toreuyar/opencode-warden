@@ -111,7 +111,8 @@ src/
 │   ├── client.ts                    # HTTP client for LLM API (fetch-based)
 │   ├── context.ts                   # ConversationContext — sliding window history
 │   ├── prompts.ts                   # System prompts, templates, renderTemplate()
-│   ├── safety-evaluator.ts          # SafetyEvaluator class (10-dimension risk assessment)
+│   ├── safety-evaluator.ts          # SafetyEvaluator class (12-dimension risk assessment)
+│   ├── shell-complexity.ts          # Optional command-only composition precheck
 │   ├── payload-decode.ts            # Deterministic pre-decoding of encoded payloads
 │   ├── static-findings.ts           # Credential-surface + verdict-forgery detection
 │   └── command-annotations.ts       # Tool-semantics annotations (tar/dc/gdb)
@@ -857,29 +858,35 @@ The `ConversationContext` class manages a sliding window of message history for 
 
 ### `llm/prompts.ts` — System Prompts and Templates
 
-Contains two large system prompts and their corresponding templates.
+Contains self-contained system prompts for safety evaluation, file execution, output sanitization, and command/text triage. Defaults use direct rules, explicit precedence, and short contrasting examples for small models. User templates primarily carry labeled evidence instead of repeating the system policy. Custom prompt/template overrides remain supported.
 
-**`DEFAULT_SANITIZER_SYSTEM_PROMPT`** (~53 lines):
-- Instructs the LLM to identify and redact sensitive data in tool outputs
-- Lists 14 categories of explicitly sensitive data
-- Describes contextual indicators (base64, hex strings, sensitive paths)
-- Lists what NOT to redact (code, UUIDs, version strings, public keys)
-- Specifies JSON response format: `{ sanitized, detections[] }`
-- Principle: "When in doubt, redact"
+**`DEFAULT_SANITIZER_SYSTEM_PROMPT`**: Identifies sensitive strings in the current output only, with exact matches, JSON escaping, and non-overlapping occurrence counts. Context guides classification but cannot supply findings. Returns `{ needsSanitization, findings: [{ sensitive, category, occurrences }] }`; does not rewrite the output.
 
-**`DEFAULT_SAFETY_SYSTEM_PROMPT`** (~60 lines):
-- Instructs the LLM to evaluate tool calls as a "senior DevOps/SRE security evaluator"
-- Details all 10 risk dimensions with extensive examples for each
-- Defines risk levels (none → critical)
-- Describes normal vs suspicious operations
-- Includes a **test scenario**: operations on `helloworld.sh` must always be flagged as `critical`
-- Specifies JSON response format: `{ safe, riskLevel, riskDimensions[], explanation, recommendation }`
+**`DEFAULT_SAFETY_SYSTEM_PROMPT`**: Judges effects rather than command names, with specific prohibitions overriding routine examples and operational profiles. Keeps five risk levels, twelve canonical dimension labels, decoded-data versus execution guidance, and untrusted-input boundaries. Returns `{ safe, riskLevel, riskDimensions, explanation, suggestedAlternative, recommendation }`. No filename-based test override.
+
+**File execution and triage**: File evaluation follows the actual interpreter and execution flow. Command triage sees only the invocation; text triage inspects current output. Both triage prompts request sanitization when uncertain and forbid sensitive values in reasons.
+
+The separate complexity precheck prompt lives in `llm/shell-complexity.ts`. It judges separability only, preserves dependencies, and cannot approve execution. Prompt compactness and mocked/unit tests do not establish live-model accuracy; model-backed regressions are needed when evaluating prompt quality.
 
 **`renderTemplate(template, vars)`**: Simple `{{key}}` → value replacement using `String.replaceAll()`.
 
 **`buildSanitizePrompt()` / `buildSafetyPrompt()`**: Build the user prompt by rendering the template with tool name, args/output, and optional context. Falls back to default templates if custom template is empty.
 
 `buildSafetyPrompt()` also appends **deterministic ground-truth sections** computed in code (see the three modules below) — decoded payloads, tool-semantics annotations, and static findings. The philosophy: deterministic facts live in code, judgment lives in the LLM. This prevents the model from burning its token budget on manual decoding and from missing credential surfaces it is inconsistent at recognizing.
+
+The shell sequence gate (`src/utils/shell-sequence.ts`) is separate from these prompt findings. It parses Bash without executing it and rejects adjacent top-level simple commands or pipelines separated by `;` or a command-ending newline. It does not traverse nested constructs, treat a pipeline as a list, infer shell-state dependencies, or rewrite the call. Unsupported syntax yields no finding from this rule and still goes through existing enforcement. The agent pre-execution hook runs it before both direct and indirect LLM evaluation; the permission-mode hook and evaluator dry run reuse it. The global user-shell backstop is unchanged.
+
+The implemented complexity precheck (`src/llm/shell-complexity.ts`) is enabled
+only by `llm.safetyEvaluator.complexityPrecheck.enabled` with the LLM and safety
+component enabled. It defaults off and uses the safety provider chain. AST
+candidate selection recognizes groups, substitutions, long conditional chains,
+and multiple root statements. Only a command is sent, without history.
+`callValidated()` accepts `continue` or `simplify` with a structural reason
+present in the AST. `simplify` and provider/validation failures veto even in warn
+mode; `continue` requires full evaluation rather than bypass/dedup approval.
+The input hook runs it before indirect file evaluation. It is also used by the
+permission hook and `dryRun()`. Fixed retry copy is emitted instead of model
+reasoning, and the full evaluator never receives the precheck's reasoning.
 
 ### `llm/payload-decode.ts` — Deterministic Payload Decoder
 

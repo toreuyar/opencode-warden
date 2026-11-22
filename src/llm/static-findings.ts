@@ -73,7 +73,7 @@ export function formatFindingsSection(findings: StaticFinding[]): string {
   const lines = findings.map((f) => `- [${f.kind}] ${f.detail}`)
   return [
     "",
-    "═══ STATIC FINDINGS — detected deterministically by the system; treat as ground truth. ═══",
+    "STATIC FINDINGS (Warden-detected evidence):",
     ...lines,
     "",
   ].join("\n")

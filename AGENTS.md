@@ -20,7 +20,7 @@ OpenCode Warden is a **plugin** for [OpenCode](https://opencode.ai), an AI-power
 
 1. **Blocks** access to sensitive files (`.env`, `*.pem`, `*.key`, etc.)
 2. **Scans and redacts** secrets in tool inputs, outputs, outbound model requests, and compaction requests using 65 active regex patterns
-3. **Evaluates safety** of tool calls using an optional LLM (10 risk dimensions)
+3. **Evaluates safety** of tool calls using an optional LLM (12 risk dimensions)
 4. **Sanitizes** environment variables before they reach shell commands
 5. **Applies a global shell backstop** to every shell creation, including user terminals
 6. **Logs** all security events to an audit trail
@@ -37,7 +37,7 @@ The plugin is loaded by the OpenCode runtime and registers **V2 domain hooks** t
 | Schema Validation | [Zod](https://zod.dev) |
 | Plugin SDK | `@opencode/plugin` (V2) |
 | Module System | ESM (`import`/`export`) |
-| Build | `bun build src/index.ts src/rpc.ts src/tui.ts --outdir dist --target bun` |
+| Build | `bun run build` (keeps `sh-ast` external so it can load its packaged WASM) |
 
 ## Commands
 
@@ -91,7 +91,8 @@ src/
 │   ├── client.ts                 # HTTP client for OpenAI-compatible APIs
 │   ├── context.ts                # ConversationContext — sliding window message history
 │   ├── prompts.ts                # System prompts, templates, renderTemplate()
-│   ├── safety-evaluator.ts       # SafetyEvaluator class (10-dimension risk assessment)
+│   ├── safety-evaluator.ts       # SafetyEvaluator class (12-dimension risk assessment)
+│   ├── shell-complexity.ts       # Optional command-only composition precheck
 │   ├── payload-decode.ts         # Deterministic pre-decoding of encoded payloads
 │   ├── static-findings.ts        # Credential-surface + verdict-forgery detection
 │   └── command-annotations.ts    # Tool-semantics annotations for tar/dc/gdb
@@ -646,6 +647,23 @@ Shell write/read targets are extracted by `extractFileTargets()` (returns an arr
 ### Permission Deduplication
 
 The `evaluatedCalls: Set<string>` prevents double LLM evaluation. `v2-adapters.ts` forwards `event.source.id` as the tool call id; in the 2.x SDK this is the same id emitted by `tool.execute.before` and `tool.execute.after` (source-verified, and runtime-observed on 2.0.18). When `permission.evaluate` evaluates a call, it records that id. `tool.execute.before` checks the set and skips re-evaluation. Denied/failed evaluations are not recorded, so a later attempt can re-evaluate. This avoids wasted LLM calls and inconsistent results; it is not a security boundary. In the observed host order, `execute.before` can run before `permission.evaluate`, causing duplicate evaluation but no bypass — the input sanitizer remains the authoritative pre-execution gate.
+
+### Shell composition gates (2.1.0)
+
+`src/utils/shell-sequence.ts` rejects adjacent top-level simple commands or
+pipelines separated by `;` or command-ending newlines using `sh-ast`. It runs
+before model requests in input/permission hooks and evaluator dry runs, even
+with the LLM disabled, subject to existing exclusions and SSH-only scope in the
+hooks. It distinguishes quoted/comment/heredoc data and does not traverse nested
+constructs. Keep `sh-ast` external in the build so its packaged WASM loads.
+
+`llm.safetyEvaluator.complexityPrecheck.enabled` defaults to `false`. When
+enabled with the LLM and evaluator, `src/llm/shell-complexity.ts` sends selected
+shell syntax through a stateless command-only request using the safety provider
+chain. `simplify` requires a recognized structural reason and vetoes the attempt;
+`continue` requires full safety evaluation, never approval or bypass. Invalid or
+unavailable results block even in warn mode. Its prompt is fixed. Neither gate
+extends to user terminals; their global shell backstop remains separate.
 
 ### Fail-Closed LLM
 

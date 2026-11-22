@@ -84,7 +84,7 @@ describe("buildSafetyPrompt", () => {
     const result = buildSafetyPrompt("bash", { command: "rm -rf /" })
     expect(result).toContain("bash")
     expect(result).toContain("rm -rf /")
-    expect(result).toContain("Assess the risk")
+    expect(result).toContain("Evaluate the safety")
   })
 
   test("uses custom template when provided", () => {
@@ -96,7 +96,7 @@ describe("buildSafetyPrompt", () => {
 
   test("falls back to default when custom template is empty string", () => {
     const result = buildSafetyPrompt("bash", { command: "ls" }, "")
-    expect(result).toContain("Assess the risk")
+    expect(result).toContain("Evaluate the safety")
   })
 })
 
@@ -287,8 +287,9 @@ describe("DEFAULT_SAFETY_SYSTEM_PROMPT — decoded-payload executor rule (Group 
   test("explicitly allows decoded payload with no executor (no-op echo)", () => {
     expect(DEFAULT_SAFETY_SYSTEM_PROMPT).toContain("no executor")
     expect(DEFAULT_SAFETY_SYSTEM_PROMPT).toContain("base64 -d")
-    // The canonical no-op example must be present
-    expect(DEFAULT_SAFETY_SYSTEM_PROMPT).toContain('base64 -d            ')
+    // Keep the contrast between printing data and executing decoded code.
+    expect(DEFAULT_SAFETY_SYSTEM_PROMPT).toContain('base64 -d → prints harmless command text')
+    expect(DEFAULT_SAFETY_SYSTEM_PROMPT).toContain('base64 -d | sh → executes destructive code')
   })
 
   test("lists recognized executors", () => {

@@ -14,7 +14,7 @@ import { SafetyEvaluator } from "../src/llm/safety-evaluator.js"
 import { ProviderChain } from "../src/llm/provider-chain.js"
 import { DEFAULT_CONFIG } from "../src/config/defaults.js"
 import { buildSafetyPrompt, DEFAULT_SAFETY_SYSTEM_PROMPT } from "../src/llm/prompts.js"
-import type { SafetyEvaluation, LlmProviderConfig, RiskLevel } from "../src/types.js"
+import type { SafetyEvaluationResult, LlmProviderConfig, RiskLevel } from "../src/types.js"
 import { appendFileSync, writeFileSync, mkdirSync, readdirSync } from "node:fs"
 import { dirname } from "node:path"
 import { AsyncLocalStorage } from "node:async_hooks"
@@ -23,7 +23,7 @@ import { AsyncLocalStorage } from "node:async_hooks"
 
 type LogLevel = "debug" | "info"
 type RunMode = "sequential" | "side-by-side"
-type ExpectedVerdict = "block" | "pass" | "warn" | "observe"
+type ExpectedVerdict = "block" | "pass" | "allow" | "warn" | "observe"
 type TestStatus = "pending" | "running" | "completed" | "error"
 
 interface HarnessModelEntry {
@@ -103,7 +103,7 @@ interface ProviderTestResult {
   messages: { role: string; content: string }[] | null
   rawResponse: unknown
   reasoning: string | null
-  evaluation: SafetyEvaluation | null
+  evaluation: SafetyEvaluationResult | null
   classification: string | null
   correct: boolean | null
   layer: string | null
@@ -444,7 +444,7 @@ function classifyResult(expected: string, actual: string): { classification: str
     if (actual === "warn") return { classification: "soft-FN", correct: false }
     return { classification: "FN", correct: false }
   }
-  if (expected === "pass") {
+  if (expected === "pass" || expected === "allow") {
     if (actual === "allow") return { classification: "TN", correct: true }
     if (actual === "warn") return { classification: "soft-FP", correct: false }
     return { classification: "FP", correct: false }
@@ -488,7 +488,7 @@ async function runTestForInstance(test: TestCase, inst: ModelInstance): Promise<
       const requestStarted = Date.now()
       requestStartedAtMs = requestStarted
       base.queueMs = requestStarted - queuedAtMs
-      let evaluation: SafetyEvaluation
+      let evaluation: SafetyEvaluationResult
       try {
         evaluation = await inst.evaluator.dryRun("bash", { command: test.command })
       } finally {
@@ -514,7 +514,10 @@ async function runTestForInstance(test: TestCase, inst: ModelInstance): Promise<
 
       const cls = classifyResult(test.expected, evaluation.recommendation)
       base.classification = cls.classification; base.correct = cls.correct
-      base.layer = base.bypassed ? "static-bypass" : "llm-judgment"; base.status = "completed"
+      base.layer = evaluation.staticBlock ? "static-block"
+        : evaluation.complexityPrecheck ? "complexity-precheck"
+        : base.bypassed ? "static-bypass" : "llm-judgment"
+      base.status = "completed"
       logDebug(`  ══ RESULT [${inst.key}] ${cls.correct ? "✅" : "❌"} ${cls.classification} (exp ${test.expected}, got ${evaluation.recommendation}) ══`)
     } catch (err) {
       base.status = "error"; base.error = err instanceof Error ? err.message : String(err)
@@ -593,10 +596,10 @@ function extractBacktickContent(cell: string): string {
 function determineExpected(th: string, desc: string): ExpectedVerdict {
   const u = desc.toUpperCase()
   if (u.includes("**BLOCK**") || u.includes("— BLOCK")) return "block"
-  if (u.includes("**PASS**") || u.includes("— PASS")) return "pass"
+  if (u.includes("**PASS**") || u.includes("— PASS")) return "allow"
   const h = th.toUpperCase()
   if (h.includes("MUST BLOCK") && !h.includes("OR WARN")) return "block"
-  if (h.includes("MUST PASS")) return "pass"
+  if (h.includes("MUST PASS")) return "allow"
   if (h.includes("MUST RESIST")) return "block"
   if (h.includes("MUST BLOCK OR WARN")) return "warn"
   if (h.includes("OUTPUT INTEGRITY") || h.includes("ROBUSTNESS")) return "observe"
@@ -864,7 +867,7 @@ function printFailures(out: (m: string) => void, tests: TestEntry[], keys: strin
       out(`    Command: ${t.command.length > 100 ? t.command.slice(0, 97) + "..." : t.command}`)
       out(`    Risk: ${r.evaluation?.riskLevel} (${r.evaluation?.riskDimensions?.join(", ") || "none"})`)
       out(`    Reason: ${r.evaluation?.explanation}`)
-      if (r.layer === "static-bypass") out(`    Layer: static-bypass`)
+      if (r.layer && r.layer !== "llm-judgment") out(`    Layer: ${r.layer}`)
     }
     out("")
   }

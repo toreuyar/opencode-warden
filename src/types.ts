@@ -330,6 +330,7 @@ export interface SecurityGuardConfig {
       systemPrompt: string
       promptTemplate: string
       actionMode: SafetyActionMode
+      complexityPrecheck: { enabled: boolean }
     }
     outputTriage: LlmEndpointConfig & {
       enabled: boolean
@@ -437,6 +438,8 @@ export interface SafetyEvaluation {
  */
 export interface SafetyEvaluationResult extends SafetyEvaluation {
   evaluationFailed?: boolean
+  staticBlock?: "shell-sequence"
+  complexityPrecheck?: "simplify" | "unavailable"
 }
 
 // ─── Session Stats Types ───

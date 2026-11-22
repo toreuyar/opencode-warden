@@ -17,6 +17,7 @@ import {
   extractRemoteFilePathsFromArgs,
 } from "../utils/paths.js"
 import { canonicalToolName, isToolInList } from "../utils/tool-compat.js"
+import { hasSequentialShellBatch, SHELL_SEQUENCE_BLOCK_MESSAGE, SHELL_SEQUENCE_BLOCK_REASON } from "../utils/shell-sequence.js"
 
 export type { PermissionDecision, PermissionInput } from "../types.js"
 
@@ -219,6 +220,38 @@ export function createPermissionHandler(deps: PermissionHandlerDeps) {
       } catch { /* session prompt injection is non-critical */ }
 
       diagnosticLogger?.hookEnd("permission-handler", action, callID ?? input.id, Date.now() - hookStart, { outcome: "deny", reason: "blockedTools" })
+      return
+    }
+
+    if (
+      canonicalAction === "shell" &&
+      !isToolInList(action, config.excludedTools) &&
+      [args.command, ...resourceCommands].some((command) => hasSequentialShellBatch(action, command))
+    ) {
+      output.status = "deny"
+      output.message = SHELL_SEQUENCE_BLOCK_MESSAGE
+      diagnosticLogger?.decision("permission-handler", action, SHELL_SEQUENCE_BLOCK_REASON)
+      try {
+        await auditLogger.log({
+          timestamp: new Date().toISOString(),
+          tool: action,
+          hook: "permission",
+          sessionId: input.sessionID,
+          callId: callID ?? input.id,
+          detections: [],
+          blocked: true,
+          blockReason: SHELL_SEQUENCE_BLOCK_REASON,
+          redactedCount: 0,
+        })
+      } catch { /* audit failure is non-critical */ }
+      if (config.notifications) {
+        try {
+          await client.tui.showToast({
+            body: { message: `🛡 Denied: ${SHELL_SEQUENCE_BLOCK_REASON}`, variant: "error" as const },
+          })
+        } catch { /* toast failure is non-critical */ }
+      }
+      diagnosticLogger?.hookEnd("permission-handler", action, callID ?? input.id, Date.now() - hookStart, { outcome: "deny", reason: SHELL_SEQUENCE_BLOCK_REASON })
       return
     }
 
@@ -449,8 +482,40 @@ export function createPermissionHandler(deps: PermissionHandlerDeps) {
       return
     }
 
-    // Check bypass list
-    if (safetyEvaluator.isBypassed(action, args)) {
+    const precheck = canonicalAction === "shell" && !isToolInList(action, config.excludedTools) &&
+      config.llm.enabled && config.llm.safetyEvaluator.complexityPrecheck?.enabled
+      ? await safetyEvaluator.precheckComplexity(action, args)
+      : undefined
+    if (precheck && precheck !== "continue") {
+      output.status = "deny"
+      output.message = precheck.explanation
+      try {
+        await auditLogger.log({
+          timestamp: new Date().toISOString(),
+          tool: action,
+          hook: "permission",
+          sessionId: input.sessionID,
+          callId: callID ?? input.id,
+          detections: [],
+          blocked: true,
+          blockReason: precheck.explanation,
+          redactedCount: 0,
+          safetyEvaluation: precheck,
+        })
+      } catch { /* audit failure is non-critical */ }
+      if (config.notifications) {
+        try {
+          await client.tui.showToast({
+            body: { message: `🛡 Denied: ${precheck.explanation}`, variant: "error" as const },
+          })
+        } catch { /* toast failure is non-critical */ }
+      }
+      diagnosticLogger?.hookEnd("permission-handler", action, callID ?? input.id, Date.now() - hookStart, { outcome: "deny", reason: precheck.explanation })
+      return
+    }
+
+    // A precheck continuation is not pre-approval.
+    if (precheck !== "continue" && safetyEvaluator.isBypassed(action, args)) {
       debugLog?.(`Permission hook: action=${action} → BYPASSED → auto-allow`)
       diagnosticLogger?.decision("permission-handler", action, "BYPASSED → auto-allow")
       output.status = "allow"

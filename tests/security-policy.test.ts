@@ -50,7 +50,9 @@ describe("buildSecurityPolicyContext", () => {
   test("contains blocked commands warning", () => {
     const result = buildSecurityPolicyContext(DEFAULT_CONFIG)
     expect(result).toContain("### Blocked Commands")
-    expect(result).toContain("Do NOT retry")
+    expect(result).toContain("Do not bypass a safety denial")
+    expect(result).toContain("When Warden explicitly requests separate or simpler shell calls")
+    expect(result).toContain("each revised call still requires all security checks")
   })
 
   test("shows output limits when configured", () => {

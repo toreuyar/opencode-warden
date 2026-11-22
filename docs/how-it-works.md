@@ -2,7 +2,7 @@
 
 [← Back to README](../README.md)
 
-Warden **2.0.0** runs as an OpenCode V2 plugin through `@opencode/plugin`
+Warden **2.1.0** runs as an OpenCode V2 plugin through `@opencode/plugin`
 (`Plugin.define` + `setup(ctx)`). It registers domain hooks rather than the legacy
 single-hook API. The supported OpenCode **host** floor is **2.0.18**; that is a
 host requirement, not the Warden version. Typed per-call `Tool.Error` vetoes
@@ -10,14 +10,17 @@ require host **2.0.29+**.
 
 | OpenCode host | Warden plugin | Notes |
 |---|---|---|
-| OpenCode 1.x (V1 plugin API) | **1.3.0**, pinned | Warden 2.0.0 is not compatible with a V1 host. Use `opencode-warden@1.3.0`. |
-| OpenCode 2.0.0–2.0.17 | **2.0.0** | Below the declared 2.0.18 floor; not verified. Loads with a warning and keeps protections installed. |
-| OpenCode 2.0.18–2.0.28 | **2.0.0** | Declared supported floor, bounded runtime-validated on 2.0.18 with local mocks. Blocks through the older untyped per-call rejection path; typed `Tool.Error` vetoes require 2.0.29+. |
-| OpenCode 2.0.29+ | **2.0.0** | Supported. Typed veto mapping is source/package-verified; not runtime-probed on a 2.0.29 or 2.1.4 binary. |
+| OpenCode 1.x (V1 plugin API) | **1.3.0**, pinned | Warden 2.x is not compatible with a V1 host. Use `opencode-warden@1.3.0`. |
+| OpenCode 2.0.0–2.0.17 | **2.1.0** | Below the declared 2.0.18 floor; not verified. Loads with a warning and keeps protections installed. |
+| OpenCode 2.0.18–2.0.28 | **2.1.0** | Declared supported floor. Historical bounded 2.0.18 runtime validation used Warden 2.0.0. Blocks through the older untyped per-call rejection path; typed `Tool.Error` vetoes require 2.0.29+. |
+| OpenCode 2.0.29+ | **2.1.0** | Supported. Typed veto mapping is source/package-verified; not runtime-probed on a 2.0.29 or 2.1.4 binary. |
 
 OpenCode 2.x is the target line, but not every 2.x host is certified.
 
 ### Runtime verification
+
+The 2.1.0 changes have unit/mocked-test and build coverage, not a new host probe
+or live-provider accuracy evaluation. The following results belong to 2.0.0.
 
 Bounded validation of the built 2.0.0 on **OpenCode 2.0.18** (the declared floor,
 using local mocks and loaded through a root `index.js`) passed config precedence and inline fallback, invalid-config
@@ -122,13 +125,19 @@ This is the primary pre-execution guard. It:
 
 1. Lazily synchronizes session deny rules for the current session.
 2. Enforces `blockedTools`, `excludedTools`, and `sshOnlyMode` (alias-aware).
-3. Checks every file target: V2 `path` (with legacy `filePath` fallback), every
+3. Rejects adjacent top-level shell commands/pipelines joined by `;` or a
+   command-ending newline using a Bash AST, before any model request.
+4. Checks every file target: V2 `path` (with legacy `filePath` fallback), every
    `patchText` add/update/delete/move target, and shell redirections/reads.
-4. Deep-scans arguments for secrets and redacts in place, subject to
+5. Deep-scans arguments for secrets and redacts in place, subject to
    `redactionEnabled`, `redactOnWrite`, and `redactionExemptPaths`.
-5. Runs the LLM safety evaluator when the tool is eligible and the call was not
-   already evaluated by `permission.evaluate`.
-6. Throws a per-call veto on a block verdict or evaluator failure. On
+   Rechecks the static shell gate if redaction changed the command.
+6. If enabled, runs the command-only complexity precheck for eligible shell
+   syntax before file-content or direct safety evaluation. `simplify` vetoes;
+   `continue` requires full evaluation. A precheck failure also vetoes.
+7. Runs the LLM safety evaluator when the tool is eligible, with permission-call
+   deduplication except when a precheck continuation requires a fresh verdict.
+8. Throws a per-call veto on a block verdict or evaluator failure. On
    `@opencode/plugin` 2.0.29+ this maps to a typed `Tool.Error`; on 2.0.18–2.0.28
    it aborts the call through the older untyped rejection path.
 
@@ -137,6 +146,11 @@ Skipping a call here is a security decision only for `llm.enabled: false`
 tool also blocks.
 
 ### `shell.create.before` — global shell backstop
+
+The sequence gate and complexity precheck above are agent-tool checks, not user
+terminal checks. The static gate does not traverse nested constructs or reject
+conditional lists/background jobs merely for their composition. Model precheck
+selection is broader, but remains optional. Neither gate rewrites commands.
 
 Every shell creation goes through a deterministic path backstop, not only agent
 tool calls. Blocked paths and write-protected paths therefore also apply to the
@@ -273,7 +287,7 @@ llama.cpp, vLLM, LM Studio, OpenAI, Azure OpenAI, and compatible gateways.
 
 ### Safety Evaluator
 
-The safety evaluator analyzes tool calls across **10 risk dimensions**:
+The safety evaluator analyzes tool calls across **12 risk dimensions**:
 
 | Dimension | Examples |
 |---|---|
@@ -287,6 +301,11 @@ The safety evaluator analyzes tool calls across **10 risk dimensions**:
 | **Resource Abuse** | Fork bombs, infinite loops, cryptocurrency miners |
 | **Network Manipulation** | `iptables`, DNS configuration, firewall rule changes |
 | **Supply Chain** | `curl | bash`, `pip install` from unknown sources |
+| **Remote Execution** | Remote host blast radius, transfer destinations, forwarding and recovery access |
+| **Indirect Execution** | Effects of written scripts or other files subsequently executed |
+
+Dimensions describe effects, not blanket bans on command names. Routine sudo,
+monitoring, and service maintenance are distinguished from prohibited effects.
 
 Each eligible call receives a risk level (`none`, `low`, `medium`, `high`,
 `critical`) and a recommendation (`allow`, `warn`, `block`) based on configured
@@ -305,7 +324,8 @@ The evaluator can retain a sliding window of conversation history:
 
 ## Customizing Prompts
 
-Every LLM prompt in Warden can be replaced via configuration. Set
+The components below support configurable prompts. The optional shell
+complexity precheck has a fixed prompt and strict structural verdict schema. Set
 `systemPrompt` to replace system-level instructions and `promptTemplate` to
 replace the user-level prompt format.
 
@@ -319,6 +339,11 @@ replace the user-level prompt format.
 
 Template variables use `{{variableName}}` syntax and are replaced at runtime.
 An empty or omitted field uses the built-in default prompt.
+
+The 2.1.0 defaults use compact, self-contained instructions with explicit rule
+precedence and JSON contracts for small evaluator models. Custom overrides do
+not inherit these default instructions. Shorter prompts have unit/mocked
+coverage, not a claim of equal accuracy across all models.
 
 **Example** — custom safety evaluator prompt for a CI/CD environment:
 

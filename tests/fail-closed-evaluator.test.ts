@@ -7,6 +7,8 @@ import { createOutputRedactor } from "../src/hooks/output-redactor.js"
 import { createPermissionHandler } from "../src/hooks/permission-handler.js"
 import { SafetyEvaluator } from "../src/llm/safety-evaluator.js"
 import { ProviderChain } from "../src/llm/provider-chain.js"
+import { SHELL_SEQUENCE_BLOCK_MESSAGE } from "../src/utils/shell-sequence.js"
+import { SHELL_PRECHECK_UNAVAILABLE_MESSAGE, SIMPLIFY_SHELL_MESSAGE } from "../src/llm/shell-complexity.js"
 import type {
   LlmProviderConfig,
   PluginClient,
@@ -100,6 +102,52 @@ const validSafeVerdict = {
   recommendation: "allow",
 }
 
+describe("static shell sequence enforcement", () => {
+  test.each(["block", "warn", "permission"] as const)(
+    "blocks before either evaluator or deduplication in %s mode",
+    async (actionMode) => {
+      const config = makeConfig({ llm: { enabled: true, safetyEvaluator: { actionMode } } })
+      const evaluator = makeEvaluator()
+      const deps = makeInputDeps(config, {
+        safetyEvaluator: evaluator,
+        evaluatedCalls: new Set(["known-call"]),
+      })
+      const hook = createInputSanitizer(deps)
+      await expect(hook(
+        { tool: "shell", sessionID: "s1", callID: "known-call" },
+        { args: { command: "git status; git diff" } },
+      )).rejects.toThrow(SHELL_SEQUENCE_BLOCK_MESSAGE)
+      expect(evaluator.shouldEvaluate).not.toHaveBeenCalled()
+      expect(evaluator.evaluate).not.toHaveBeenCalled()
+      expect(evaluator.evaluateFileExecution).not.toHaveBeenCalled()
+    },
+  )
+
+  test("blocks the legacy alias with the LLM disabled but does not block a pipeline", async () => {
+    const hook = createInputSanitizer(makeInputDeps(makeConfig({ llm: { enabled: false } })))
+    const input = { tool: "bash", sessionID: "s1", callID: "c1" }
+    await expect(hook(input, { args: { command: "git status\ngit diff" } }))
+      .rejects.toThrow(SHELL_SEQUENCE_BLOCK_MESSAGE)
+    await expect(hook(input, { args: { command: "git diff |\nwc -l" } }))
+      .resolves.toBeUndefined()
+  })
+
+  test("permission mode denies a batch in any shell resource before the evaluator", async () => {
+    const config = makeConfig({ llm: { enabled: true, safetyEvaluator: { actionMode: "permission" } } })
+    const evaluator = makeEvaluator()
+    const hook = createPermissionHandler(makeInputDeps(config, { safetyEvaluator: evaluator }))
+    const output: { status: "ask" | "deny"; message?: string } = { status: "ask" }
+    await hook({
+      id: "p1", sessionID: "s1", action: "shell",
+      metadata: { command: "git status" },
+      resources: ["git status", "git status\ngit diff"],
+    }, output)
+    expect(output).toEqual({ status: "deny", message: SHELL_SEQUENCE_BLOCK_MESSAGE })
+    expect(evaluator.shouldEvaluate).not.toHaveBeenCalled()
+    expect(evaluator.evaluate).not.toHaveBeenCalled()
+  })
+})
+
 describe("SafetyEvaluator failure signal", () => {
   function makeLlmConfig(
     overrides: Record<string, unknown> = {},
@@ -129,6 +177,134 @@ describe("SafetyEvaluator failure signal", () => {
       completionsPath: "/chat/completions",
     }
   }
+
+  function makeComplexityEvaluator(config = makeLlmConfig({
+    safetyEvaluator: { complexityPrecheck: { enabled: true } },
+  }), response = '{"decision":"continue"}') {
+    const chain = new ProviderChain([makeProvider()])
+    const precheck = mock<ProviderChain["callValidated"]>(async (_messages, validate) => validate(response))
+    const safety = mock<ProviderChain["call"]>(async () => JSON.stringify(validSafeVerdict))
+    chain.callValidated = precheck
+    chain.call = safety
+    return { evaluator: new SafetyEvaluator(config, chain), precheck, safety }
+  }
+
+  test("default-off and explicitly disabled modes do not consult the precheck", async () => {
+    for (const config of [
+      makeLlmConfig(),
+      makeLlmConfig({ enabled: false, safetyEvaluator: { complexityPrecheck: { enabled: true } } }),
+      makeLlmConfig({ safetyEvaluator: { enabled: false, complexityPrecheck: { enabled: true } } }),
+    ]) {
+      const { evaluator, precheck } = makeComplexityEvaluator(config)
+      expect(await evaluator.precheckComplexity("shell", { command: "(git status)" })).toBeUndefined()
+      expect(precheck).not.toHaveBeenCalled()
+    }
+  })
+
+  test("static blocks, simple commands, and pipelines do not call the precheck", async () => {
+    const { evaluator, precheck } = makeComplexityEvaluator()
+    expect((await evaluator.dryRun("bash", { command: "git status; git diff" })).staticBlock).toBe("shell-sequence")
+    for (const command of [
+      "git status",
+      "git diff | wc -l",
+      "git status && git diff",
+      "printf '%s' '$(text); data'",
+      "cat <<'EOF'\n(git status)\nEOF\n",
+    ]) {
+      expect(await evaluator.precheckComplexity("shell", { command })).toBeUndefined()
+    }
+    expect(precheck).not.toHaveBeenCalled()
+  })
+
+  test("continue sends only the command to the precheck and still requires full evaluation", async () => {
+    const { evaluator, precheck, safety } = makeComplexityEvaluator()
+    const command = 'printf "%s" "$(git status --short)"'
+    evaluator.isBypassed = mock(() => true)
+    const result = await evaluator.dryRun("shell", { command, description: "private task context" })
+    expect(result.recommendation).toBe("allow")
+    expect(precheck).toHaveBeenCalledTimes(1)
+    const [messages] = precheck.mock.calls[0]!
+    expect(messages).toHaveLength(2)
+    expect(messages[1]).toEqual({ role: "user", content: JSON.stringify({ command }) })
+    expect(safety).toHaveBeenCalledTimes(1)
+    expect(evaluator.isBypassed).not.toHaveBeenCalled()
+    expect(JSON.stringify(safety.mock.calls[0])).not.toContain("conditional-chain")
+  })
+
+  test("candidate selection depends on shell syntax, not the command's risk", async () => {
+    const { evaluator, precheck, safety } = makeComplexityEvaluator()
+    await evaluator.dryRun("shell", { command: "rm -rf /" })
+    expect(precheck).not.toHaveBeenCalled()
+    expect(safety).toHaveBeenCalledTimes(1)
+
+    for (const command of ["(printf ok; git status)", "(printf ok; rm -rf /)"]) {
+      expect(await evaluator.precheckComplexity("shell", { command })).toBe("continue")
+    }
+    expect(precheck).toHaveBeenCalledTimes(2)
+  })
+
+  test("a provider outage is distinct from a simplification verdict", async () => {
+    const { evaluator, precheck, safety } = makeComplexityEvaluator()
+    precheck.mockRejectedValueOnce(new Error("provider unavailable"))
+    const result = await evaluator.dryRun("shell", { command: "(git status)" })
+    expect(result).toMatchObject({
+      recommendation: "block",
+      evaluationFailed: true,
+      complexityPrecheck: "unavailable",
+    })
+    expect(safety).not.toHaveBeenCalled()
+  })
+
+  test("valid simplification in warn mode vetoes before either safety request", async () => {
+    const config = makeConfig({
+      llm: { enabled: true, safetyEvaluator: { actionMode: "warn", complexityPrecheck: { enabled: true } } },
+    })
+    const { evaluator, precheck, safety } = makeComplexityEvaluator(config.llm,
+      '{"decision":"simplify","reason":"group"}')
+    const fileSafety = mock(evaluator.evaluateFileExecution.bind(evaluator))
+    evaluator.evaluateFileExecution = fileSafety
+    const hook = createInputSanitizer(makeInputDeps(config, { safetyEvaluator: evaluator }))
+    await expect(hook(
+      { tool: "shell", sessionID: "s1", callID: "c1" },
+      { args: { command: "(git status; git diff)" } },
+    )).rejects.toThrow(SIMPLIFY_SHELL_MESSAGE)
+    expect(precheck).toHaveBeenCalledTimes(1)
+    expect(safety).not.toHaveBeenCalled()
+    expect(fileSafety).not.toHaveBeenCalled()
+  })
+
+  test.each([
+    '{"decision":"allow"}',
+    '{"decision":"continue","reason":"group"}',
+    '{"decision":"simplify","reason":"substitution"}',
+    '{"decision":"simplify","reason":"dangerous"}',
+    'not JSON',
+  ])("invalid precheck %s fails closed without calling full evaluation", async (response) => {
+    const config = makeConfig({
+      llm: { enabled: true, safetyEvaluator: { actionMode: "permission", complexityPrecheck: { enabled: true } } },
+    })
+    const { evaluator, safety } = makeComplexityEvaluator(config.llm, response)
+    const hook = createPermissionHandler(makeInputDeps(config, { safetyEvaluator: evaluator }))
+    const output: { status: "ask" | "deny"; message?: string } = { status: "ask" }
+    await hook({ id: "p1", sessionID: "s1", action: "shell", resources: ["(git status)"] }, output)
+    expect(output).toEqual({ status: "deny", message: SHELL_PRECHECK_UNAVAILABLE_MESSAGE })
+    expect(safety).not.toHaveBeenCalled()
+  })
+
+  test("T7.5 harness fixture is blocked statically without calling the provider", async () => {
+    const suite = await Bun.file(new URL("../scripts/llm-harness-tests.json", import.meta.url)).json()
+    const fixture = suite.tests.find((entry: { id: string }) => entry.id === "T7.5")
+    expect(fixture.command.split("\n")).toHaveLength(3)
+    const chain = new ProviderChain([makeProvider()])
+    const call = mock(async () => JSON.stringify(validSafeVerdict))
+    chain.call = call
+    const evaluator = new SafetyEvaluator(makeLlmConfig(), chain)
+    const result = await evaluator.dryRun("bash", { command: fixture.command })
+    expect(result.recommendation).toBe("block")
+    expect(result.staticBlock).toBe("shell-sequence")
+    expect(result.evaluationFailed).toBeUndefined()
+    expect(call).not.toHaveBeenCalled()
+  })
 
   test("LLM transport failure is marked evaluationFailed", async () => {
     const chain = new ProviderChain([makeProvider()])

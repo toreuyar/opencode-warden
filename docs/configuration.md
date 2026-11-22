@@ -26,15 +26,15 @@ Warden loads configuration from three layers, each deep-merging into the previou
 ### Runtime compatibility
 
 Warden's plugin version is independent of the OpenCode host version. This
-documentation describes Warden **2.0.0**, which targets the V2 plugin API on the
+documentation describes Warden **2.1.0**, which targets the V2 plugin API on the
 OpenCode **2.x** line.
 
 | OpenCode host | Warden plugin | Notes |
 |---|---|---|
-| OpenCode 1.x (V1 plugin API) | **1.3.0**, pinned | Warden 1.3.0 is the last release for OpenCode 1.x (`@opencode-ai/plugin` `^1.2.0`). Install `opencode-warden@1.3.0`; do not install 2.0.0. |
-| OpenCode 2.0.0–2.0.17 | **2.0.0** | Below the declared supported floor; not verified. Loads with a warning and keeps protections installed. |
-| OpenCode 2.0.18–2.0.28 | **2.0.0** | Declared supported floor, bounded runtime-validated on 2.0.18 with local mocks and a root `index.js` load. Blocks through the older untyped per-call rejection path; typed `Tool.Error` vetoes require 2.0.29+. |
-| OpenCode 2.0.29+ | **2.0.0** | Supported. The typed veto mapping introduced in 2.0.29 is source/package-verified; not runtime-probed on a 2.0.29 or 2.1.4 binary. |
+| OpenCode 1.x (V1 plugin API) | **1.3.0**, pinned | Warden 1.3.0 is the last release for OpenCode 1.x (`@opencode-ai/plugin` `^1.2.0`). Install `opencode-warden@1.3.0`; do not install Warden 2.x. |
+| OpenCode 2.0.0–2.0.17 | **2.1.0** | Below the declared supported floor; not verified. Loads with a warning and keeps protections installed. |
+| OpenCode 2.0.18–2.0.28 | **2.1.0** | Declared supported floor; the bounded 2.0.18 runtime probe used Warden 2.0.0, not 2.1.0. Blocks through the older untyped per-call rejection path; typed `Tool.Error` vetoes require 2.0.29+. |
+| OpenCode 2.0.29+ | **2.1.0** | Supported. The typed veto mapping introduced in 2.0.29 is source/package-verified; not runtime-probed on a 2.0.29 or 2.1.4 binary. |
 
 The supported 2.x floor is **OpenCode 2.0.18** (`@opencode/plugin` peer
 `^2.0.18`; development and type-checking use the 2.1.4 SDK).
@@ -189,6 +189,7 @@ When enabled, an additional `*-llm.log` file in the same directory records LLM c
 | `safetyEvaluator.systemPrompt` | `string` | `""` | Custom system prompt (empty = built-in default) |
 | `safetyEvaluator.promptTemplate` | `string` | `""` | Custom prompt template (empty = built-in default) |
 | `safetyEvaluator.actionMode` | `"block" \| "permission" \| "warn"` | `"block"` | How to handle dangerous tool calls |
+| `safetyEvaluator.complexityPrecheck.enabled` | `boolean` | `false` | Add a command-only model check for unnecessary shell composition before full safety evaluation |
 
 Action modes:
 
@@ -197,6 +198,46 @@ Action modes:
 | `"block"` | Auto-block dangerous calls by throwing an error — the AI sees the block reason and can inform the user |
 | `"permission"` | Integrate with OpenCode's permission system — deny on block, ask on warn, allow on allow, fall back to `"block"` if the permission hook doesn't fire |
 | `"warn"` | Allow a genuine risky call to proceed after a warning — but an evaluator outage still blocks (fail-closed) |
+
+#### Shell complexity precheck
+
+Enable this on top of your existing LLM/provider configuration:
+
+```json
+{
+  "llm": {
+    "enabled": true,
+    "safetyEvaluator": {
+      "enabled": true,
+      "complexityPrecheck": { "enabled": true }
+    }
+  }
+}
+```
+
+The precheck uses the safety evaluator's provider chain and only runs for eligible
+shell calls. Syntax candidates include brace/subshell groups, command/process
+substitutions, chains with at least two `&&`/`||` operators, and multiple
+top-level statements. Simple commands and straightforward pipelines add no call.
+
+It sees only the command, with no conversation history. A strict `simplify`
+verdict must name a structural reason present in the parsed command. It blocks
+the attempt with fixed retry guidance, even in `warn` mode. A `continue` verdict
+requires full safety evaluation, not command bypass/pre-approval; precheck
+reasoning is not passed to that evaluator. Provider failure or an invalid
+response blocks the candidate call.
+
+The flag defaults to `false`; explicit `llm.enabled: false` or
+`safetyEvaluator.enabled: false` also disables the precheck. Its prompt and
+reason vocabulary are fixed, not configurable. Existing exclusions and SSH-only
+scope apply. The precheck does not apply to user terminals.
+
+**Independent static gate:** Warden first rejects adjacent top-level simple
+commands/pipelines separated by `;` or command-ending newlines without a model.
+This gate has no new config switch and remains active with the LLM disabled
+within the existing tool/scope gates. Split batches into separate calls; keep
+necessary pipelines intact. Unsupported parser syntax is not an approval and
+still goes through the remaining checks.
 
 ### `llm.outputSanitizer` — Output Sanitization
 

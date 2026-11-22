@@ -176,6 +176,7 @@ export const DEFAULT_CONFIG: SecurityGuardConfig = {
       systemPrompt: "",
       promptTemplate: "",
       actionMode: "block",
+      complexityPrecheck: { enabled: false },
     },
     outputTriage: {
       enabled: true,

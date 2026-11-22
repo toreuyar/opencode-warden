@@ -3,6 +3,13 @@ import { DEFAULT_CONFIG } from "../src/config/defaults.js"
 import { securityGuardConfigSchema } from "../src/config/schema.js"
 
 describe("Configuration", () => {
+  test("shell complexity precheck defaults off and accepts only a boolean flag", () => {
+    expect(DEFAULT_CONFIG.llm.safetyEvaluator.complexityPrecheck).toEqual({ enabled: false })
+    const config = (enabled: unknown) => ({ llm: { safetyEvaluator: { complexityPrecheck: { enabled } } } })
+    expect(securityGuardConfigSchema.safeParse(config(true)).success).toBe(true)
+    expect(securityGuardConfigSchema.safeParse(config("true")).success).toBe(false)
+  })
+
   test("default config has all categories", () => {
     const categories = Object.keys(DEFAULT_CONFIG.categories)
     expect(categories).toContain("api-keys")

@@ -22,12 +22,12 @@ Warden line that matches your host's plugin API:
 
 | OpenCode host | Warden plugin | Status |
 |---|---|---|
-| **OpenCode 1.x** (V1 plugin API) | **1.3.0**, pinned exactly | Last Warden release for OpenCode 1.x. Published with `@opencode-ai/plugin` `^1.2.0`. **Do not install Warden 2.0.0 on OpenCode 1.x.** |
-| **OpenCode 2.0.0–2.0.17** | **2.0.0** | **Below the declared supported floor (2.0.18); not verified.** Warden loads with a warning and keeps protections installed, but host compatibility is not guaranteed. |
-| **OpenCode 2.0.18–2.0.28** | **2.0.0** | **Supported floor.** Bounded runtime validation of the built plugin with local mocks passed on 2.0.18, including the untyped per-call block path. Clean typed `Tool.Error` vetoes require 2.0.29+. |
-| **OpenCode 2.0.29+** | **2.0.0** | Supported. The typed per-call veto mapping introduced in 2.0.29 is source/package-verified; **not runtime-probed on a 2.0.29 or 2.1.4 binary**. See [Verification status](#runtime-boundaries). |
+| **OpenCode 1.x** (V1 plugin API) | **1.3.0**, pinned exactly | Last Warden release for OpenCode 1.x. Published with `@opencode-ai/plugin` `^1.2.0`. **Do not install Warden 2.x on OpenCode 1.x.** |
+| **OpenCode 2.0.0–2.0.17** | **2.1.0** | **Below the declared supported floor (2.0.18); not verified.** Warden loads with a warning and keeps protections installed, but host compatibility is not guaranteed. |
+| **OpenCode 2.0.18–2.0.28** | **2.1.0** | **Supported floor.** Warden 2.0.0 was bounded-runtime-validated on 2.0.18 with local mocks. Blocking uses the untyped path; typed `Tool.Error` vetoes require 2.0.29+. No new host probe for 2.1.0. |
+| **OpenCode 2.0.29+** | **2.1.0** | Supported. The typed per-call veto mapping introduced in 2.0.29 is source/package-verified; **not runtime-probed on a 2.0.29 or 2.1.4 binary**. See [Verification status](#runtime-boundaries). |
 
-OpenCode 2.x is the target line for Warden 2.0.0, but **not every 2.x host is
+OpenCode 2.x is the target line for Warden 2.1.0, but **not every 2.x host is
 verified**. The minimum declared floor is 2.0.18. Warden does not claim that all
 OpenCode 2.x versions are certified.
 
@@ -58,7 +58,9 @@ fallback branch is unit-test only.
 - **65 active built-in detection patterns** across 11 categories — API keys, credentials, private keys, PII, cloud provider secrets, Docker, Kubernetes, and more (66 defined; `pii-ip-address` is off by default)
 - **V2-native tool vocabulary** — policies use `shell`, `subagent`, and `path`; legacy `bash`, `task`, and `filePath` configs and callers remain accepted as aliases. `patch` inputs are inspected through every `patchText` add/update/delete/move target
 - **Optional user prompt scanning** — opt-in via `scanUserPrompts: true`. When enabled, incoming prompt text plus attachment metadata (file URI/name/description, agent/skill names, mentions) is scanned before it reaches the LLM; prompts containing detected secrets are blocked and never persisted. File contents are deliberately not read. Disabled by default due to upstream TUI limitations on how blocked prompts are surfaced.
-- **LLM-powered safety evaluation** across 10 risk dimensions (exfiltration, destruction, privilege escalation, and more)
+- **LLM-powered safety evaluation** across 12 risk dimensions (exfiltration, destruction, privilege escalation, remote and indirect execution, and more)
+- **Static shell sequence blocking** — agent shell calls with adjacent top-level simple commands or pipelines joined by `;` or a command-ending newline are rejected before model evaluation, even with the LLM disabled. A single pipeline, quoted data, heredoc bodies, and conditional lists (`&&`/`||`) are not themselves sequences under this rule. Submit separate shell calls rather than batching; Warden does not rewrite commands. This rule does not apply to user terminals.
+- **Optional shell complexity precheck** — set `llm.safetyEvaluator.complexityPrecheck.enabled` to `true` (default `false`) to add a separate, command-only model check for shell calls with more complex syntax. It can require simplification but cannot approve execution. A failed precheck blocks the candidate call; explicitly disabling the LLM or safety evaluator also disables the precheck.
 - **LLM-enhanced output sanitization** — catches context-dependent secrets that regex alone misses
 - **Outbound request scanning** — before provider dispatch, `session.context` redacts supported system/message/tool-result text and compaction requests, and injects the security policy as a per-request system part. `session.generate` reuses the same policy, blocked-tool restrictions, and scanning as a primary request; the tool-less `session.title` request gets deterministic redaction without policy injection so title output is preserved. Tool-call ids/names and provider metadata are preserved; historical tool-call input strings are structurally redacted in the request projection, while file/media identifiers are scanned read-only and a detection withholds the request
 - **File path blocking** with glob patterns — prevents access to `.env`, `*.pem`, `*.key`, kubeconfig, tfstate, and other sensitive files
@@ -71,7 +73,7 @@ fallback branch is unit-test only.
 - **SSH-only mode** — monitor only remote commands (ssh, scp, sftp, rsync, rclone) while bypassing all local operations
 - **7 built-in tools** — dashboard, reports, audit queries, dry-run evaluation, config view, and rule management. Plugin tools use OpenCode's Code Mode by default, so the agent invokes them through `execute` (for example `tools.security_help`), not the native provider tool list
 - **Three-layer rule architecture** — builtin, user-managed, and AI-managed detection rules
-- **Customizable prompts** — replace any LLM prompt via config using `{{variableName}}` templates
+- **Customizable prompts** — override safety, file-execution, sanitizer, and triage prompts via config using `{{variableName}}` templates. The shell complexity precheck uses a fixed prompt.
 - **Zero-config operation** — works out of the box with sensible defaults, no LLM required
 - **Comprehensive audit logging** — JSON-line log files with rotation, verbosity levels, and session statistics
 - **Configurable action modes** — auto-block, user-prompted permission, or warn-only for both input safety and output sanitization. When the LLM is enabled, an outage still blocks input safety and non-`pass` output paths regardless of the configured mode
@@ -80,7 +82,7 @@ fallback branch is unit-test only.
 
 ### Prerequisites
 
-- **OpenCode 2.x** for Warden **2.0.0**. The declared supported floor is
+- **OpenCode 2.x** for Warden **2.1.0**. The declared supported floor is
   **OpenCode 2.0.18** (`@opencode/plugin` `^2.0.18`). Development and
   type-checking use the 2.1.4 SDK; the peer range expresses the 2.0.18 API floor
   that Warden's used surface is verified against. Hosts on 2.0.0–2.0.17 are
@@ -88,11 +90,11 @@ fallback branch is unit-test only.
   On 2.0.18–2.0.28, Warden blocks per call through the older untyped rejection
   path exercised on 2.0.18; clean typed `Tool.Error` vetoes require 2.0.29+.
   Neither the 2.0.29 nor the 2.1.4 binary has been runtime-probed.
-- **OpenCode 1.x** requires Warden **1.3.0** (pinned). Warden 2.0.0 uses the V2
+- **OpenCode 1.x** requires Warden **1.3.0** (pinned). Warden 2.x uses the V2
   plugin API and is not a drop-in replacement on a V1 host.
 - [Bun](https://bun.sh) runtime (OpenCode uses Bun for plugins)
 
-### Install Warden 2.0.0 on OpenCode 2.x
+### Install Warden 2.1.0 on OpenCode 2.x
 
 Add the pinned package to the `plugin` array in your OpenCode configuration.
 Installing by **package name** is the supported form; OpenCode resolves the
@@ -102,7 +104,7 @@ published `exports` correctly:
 
 ```json
 {
-  "plugin": ["opencode-warden@2.0.0"]
+  "plugin": ["opencode-warden@2.1.0"]
 }
 ```
 
@@ -110,11 +112,11 @@ published `exports` correctly:
 
 ```json
 {
-  "plugin": ["opencode-warden@2.0.0"]
+  "plugin": ["opencode-warden@2.1.0"]
 }
 ```
 
-You may omit `@2.0.0` to track the newest release, but pinning avoids surprise
+You may omit `@2.1.0` to track the newest release, but pinning avoids surprise
 upgrades. OpenCode installs npm plugins automatically with Bun at startup.
 
 ### Install Warden 1.3.0 on OpenCode 1.x
@@ -129,19 +131,19 @@ OpenCode 1.x uses the V1 plugin API. Pin the last Warden release for that line:
 
 Use the same `plugin` array in either the global or project `opencode.json`.
 Warden 1.3.0 is published on npm with peer dependency
-`@opencode-ai/plugin` `^1.2.0`. **Do not install `opencode-warden@2.0.0` on
+`@opencode-ai/plugin` `^1.2.0`. **Do not install `opencode-warden@2.1.0` on
 OpenCode 1.x.** An unpinned install can resolve differently after a new release
 is tagged `latest`, so pin `1.3.0` explicitly. For the 1.3.0 configuration
 reference, use the [v1.3.0 README](https://github.com/toreuyar/opencode-warden/blob/v1.3.0/README.md)
 and [v1.3.0 example config](https://github.com/toreuyar/opencode-warden/blob/v1.3.0/opencode-warden.example.json)
-rather than this 2.0.0 documentation.
+rather than this 2.1.0 documentation.
 
 ### Install from Source
 
 If you prefer to run from source (for development or customization):
 
 ```bash
-# Warden 2.0.0 for OpenCode 2.x
+# Warden 2.1.0 for OpenCode 2.x
 git clone https://github.com/toreuyar/opencode-warden.git
 cd opencode-warden
 bun install
@@ -153,7 +155,7 @@ cd opencode-warden
 bun install
 ```
 
-> **Local-directory entrypoint:** on OpenCode 2.x, when a 2.0.0 `plugin` entry
+> **Local-directory entrypoint:** on OpenCode 2.x, when a Warden `plugin` entry
 > points at a local **directory**, OpenCode probes `<directory>/server` and
 > `<directory>/index`. It does not read the package's `package.json` `main`/`exports`, so a checkout that only has
 > `dist/index.js` loads Warden silently as a no-op. This was reproduced on
@@ -238,27 +240,42 @@ Place this file at `.opencode/opencode-warden.json` in your project root or `~/.
 - **Verification status:** bounded runtime validation was performed on **OpenCode 2.0.18** (the declared floor) with the built Warden 2.0.0, loaded through a root `index.js` entrypoint and using local mocks rather than an external provider. It passed config precedence and inline fallback, invalid-config lockdown, V2 path/shell/subagent blocking, write/read/error redaction, bounded secret-write replay with structural tool-call-input projection redaction (exit 0, next request redacted, policy present), outbound tool-result redaction and policy injection, title and generate replay (title redacted with no policy and preserved `Replay Title`; generate redacted with policy/tools and returned `PROBE_DONE`), shell backstop, evaluator/sanitizer outage blocking in `warn`, explicit `llm.enabled: false` deterministic mode, `session.update({ permissions })` preservation and application, server RPC/SSE notification delivery, and compaction policy injection plus redaction with a valid summary. These are bounded results, not a certification of every host behavior. They were not run on 2.1.4. The **typed per-call veto mapping** (`Tool.Error`) was introduced in `@opencode/plugin` 2.0.29 and is source/package-verified there and in 2.1.4; on 2.0.18–2.0.28 the host uses the older untyped per-call rejection path, which the 2.0.18 validation exercised. **Live rendered TUI toasts remain untested** (server RPC/SSE delivery passed on 2.0.18). Structured output passed at runtime through the host-normalized content path; the content-less structured fallback branch is unreachable on 2.0.18 and remains unit-test only.
 - **Notifications:** UI alerts are UX-only. Enforcement decisions, blocks, and audit records do not depend on a toast or TUI connection succeeding.
 
-## Versioning and upgrading to 2.0.0
+## Versioning and upgrading to 2.1.0
 
-**Warden 2.0.0 is the plugin version.** It is separate from the OpenCode host
-version. Warden 2.0.0 targets the OpenCode V2 plugin API with a supported host
+**Warden 2.1.0 is the plugin version.** It is separate from the OpenCode host
+version. Warden 2.1.0 targets the OpenCode V2 plugin API with a supported host
 floor of **OpenCode 2.0.18** (`@opencode/plugin` peer `^2.0.18`, developed and
 type-checked against 2.1.4). References to OpenCode 2.0.18 elsewhere describe the
 declared floor and the bounded-validation host, not the Warden version.
 Typed per-call `Tool.Error` vetoes are available from host 2.0.29; earlier
 supported hosts (2.0.18–2.0.28) still block per call through the untyped path.
 
-### Upgrade checklist
+### Changes from 2.0.0
+
+- Existing configs remain valid. Sequential agent shell batches (`;` or
+  command-ending newlines) now require separate calls, even in deterministic
+  mode. Specify working directory and environment per call. Single pipelines
+  remain intact; existing tool exclusions and SSH-only scope still apply.
+- The new [complexity precheck](docs/configuration.md#shell-complexity-precheck)
+  is off by default. When enabled, it may add a model request and require
+  simplification before full safety evaluation.
+- Default prompts are leaner and clearer for small models. Custom overrides
+  retain their configured text. No live-model accuracy claim accompanies this
+  reduction.
+- Typecheck, unit/mocked tests, and build were checked for 2.1.0. Host runtime
+  results documented above are historical 2.0.0 results, not a fresh 2.1.0 probe.
+
+### Upgrade checklist (including migration from 1.x)
 
 1. **Check the host line first.** On **OpenCode 1.x**, do **not** upgrade to
-   Warden 2.0.0. Pin `opencode-warden@1.3.0` (see
+   Warden 2.x. Pin `opencode-warden@1.3.0` (see
    [Compatibility](#compatibility)).
 2. **Upgrade OpenCode first** on the 2.x line. Use at least a 2.0.18 host. For
    clean typed per-call tool vetoes, use 2.0.29+. Hosts on 2.0.0–2.0.17 are
    below the floor and load with a warning; 2.0.18–2.0.28 load with a
    typed-veto advisory and block through the older untyped path exercised on
    2.0.18.
-3. **Upgrade the plugin** to `opencode-warden@2.0.0` and restart OpenCode.
+3. **Upgrade the plugin** to `opencode-warden@2.1.0` and restart OpenCode.
 4. **Remove obsolete tool entries.** V2 has no `list` tool, so `excludedTools`
    now defaults to `[]`; delete any `"list"` entry.
 5. **Keep legacy config names if you prefer.** `bash`, `task`, and `filePath`
@@ -271,7 +288,7 @@ supported hosts (2.0.18–2.0.28) still block per call through the untyped path.
    If you run without the TUI companion, enforcement and audit logging continue
    but UI alerts may be absent.
 
-### Breaking changes and behavior changes
+### V2 migration changes (introduced in 2.0.0)
 
 - **OpenCode 1.x is not supported by Warden 2.0.0.** The legacy plugin API and
   `chat.message`/`shell.env`/`permission.ask` integration points are replaced by
@@ -302,7 +319,7 @@ supported hosts (2.0.18–2.0.28) still block per call through the untyped path.
 - Session deny-rule sync replaces the host ruleset non-atomically; it is defense
   in depth, not the authoritative guard.
 
-See [CHANGELOG.md](CHANGELOG.md) for the complete 2.0.0 release notes.
+See [CHANGELOG.md](CHANGELOG.md) for the complete release notes.
 
 ## Documentation
 
@@ -312,7 +329,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the complete 2.0.0 release notes.
 - [**Detection Patterns**](docs/detection-patterns.md) — Full pattern tables for all categories: API keys, credentials, private keys, Docker, Kubernetes, cloud providers, and PII
 - [**Use Cases**](docs/use-cases.md) — 8 example configurations covering solo dev, team projects, CI/CD, SSH-only mode, enterprise, and more
 - [**Audit Logging & Environment Sanitization**](docs/audit-logging.md) — Log format, rotation, querying, and environment variable sanitization
-- [**Changelog**](CHANGELOG.md) — Release notes and the 2.0.0 upgrade/breaking-change summary
+- [**Changelog**](CHANGELOG.md) — Release notes and upgrade summaries
 
 ## Contributing
 

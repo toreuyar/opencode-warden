@@ -4,6 +4,66 @@ All notable user-facing changes to OpenCode Warden are recorded here. The
 project follows [Semantic Versioning](https://semver.org/). Release notes for
 versions before 2.0.0 are available in the git history and release tags.
 
+## [2.1.0] — 2026-11-22
+
+### Added
+
+- **Deterministic shell sequence gate.** Rejects adjacent top-level simple
+  commands or pipelines separated by `;` or a command-ending newline before
+  model evaluation. The agent receives guidance to use separate shell calls.
+  Runs in agent pre-execution, permission checks, and evaluator dry runs, even
+  with the LLM disabled. Single pipelines, quoted text, comments, continuations,
+  and heredoc data are distinguished from command separators. Conditional lists,
+  background jobs, and nested constructs are outside this static rule.
+- **Optional shell complexity precheck**, configured with
+  `llm.safetyEvaluator.complexityPrecheck.enabled` (default `false`). Selected
+  complex shell calls receive a stateless, command-only request through the
+  safety evaluator's provider chain. A validated structural `simplify` verdict
+  blocks the attempt; `continue` requires full safety evaluation and never
+  approves execution. Invalid/unavailable results block even in warn mode.
+
+### Changed
+
+- **Leaner prompts for small models.** The five main system prompts are about
+  48% shorter by character count than the preceding working versions. Defaults
+  use direct rules, explicit precedence, fewer contrasting examples, and exact
+  response formats. Request templates and evidence headings are also shorter.
+- Clarified untrusted-data boundaries, current-output-only sanitizer findings,
+  interpreter-aware file evaluation, and specific-rule precedence over routine
+  maintenance examples. Decoded data is checked for disclosure and write effects
+  even when it is not executed. Triage no longer treats build/test logs or
+  process/service output as inherently safe.
+- Removed the built-in `helloworld.sh` test-only block rule. Remote execution
+  risk follows concrete effects rather than an undefined remote premium.
+- Agent policy distinguishes bypass attempts from Warden-requested
+  simplification retries.
+- Added `sh-ast` as a runtime dependency, kept external in the Bun build so its
+  packaged WASM remains loadable.
+- Harness results identify `static-block` and `complexity-precheck` layers.
+  Expected verdicts use `allow` while retaining legacy `pass` compatibility.
+  T7.5 now contains real command-ending newlines.
+
+### Upgrade notes
+
+- The host floor remains **OpenCode 2.0.18**; typed tool vetoes require
+  **2.0.29+**. OpenCode 1.x users must keep Warden **1.3.0**.
+- Existing configuration remains valid. The static gate is active without a new
+  setting, subject to existing tool exclusions and SSH-only scope. Split
+  sequential agent commands and specify the working directory/environment on
+  each call. User terminals retain the existing global shell backstop.
+- The complexity precheck is off by default. It also stays off when the LLM or
+  safety evaluator is explicitly disabled. It uses the safety evaluator's
+  providers; its prompt and structural reason vocabulary are fixed.
+- Custom system prompts/templates still override the corresponding defaults.
+  Review overrides separately to benefit from the new prompt guidance.
+
+### Verification
+
+- Typecheck, 1,163 unit/mocked tests, build, and diff checks passed during
+  preparation. Prompt reductions are not a live-model accuracy claim.
+- No live-provider regression suite or new host runtime probe was performed for
+  2.1.0. The bounded 2.0.18 host results below belong to the 2.0.0 release.
+
 ## [2.0.0] — 2026-10-24
 
 Warden **2.0.0** is the plugin release that ports the project to OpenCode's V2

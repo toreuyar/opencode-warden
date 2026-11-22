@@ -125,6 +125,27 @@ const VALID_INLINE = {
 }
 
 describe("index notification wiring", () => {
+  test("vetoes an agent shell sequence but leaves the global path backstop unchanged", async () => {
+    silenceConsole()
+    process.env.HOME = makeTempDir()
+    const directory = makeTempDir()
+    const fake = makeFakeCtx({ ...VALID_INLINE, blockedTools: [] }, directory)
+    const cleanup = await warden.setup(fake.ctx as any)
+
+    try {
+      const command = "git status; git diff"
+      await expect(fake.hooks.get("tool.execute.before")!({
+        tool: "shell",
+        sessionID: "s1",
+        id: "call-1",
+        input: { command },
+      })).rejects.toThrow(/Multiple sequential shell operations/)
+      await fake.hooks.get("shell.create.before")!({ command, cwd: directory, env: {} })
+    } finally {
+      if (cleanup) await cleanup()
+    }
+  })
+
   test("routes hook toasts through the RPC bridge after config loads", async () => {
     silenceConsole()
     process.env.HOME = makeTempDir()

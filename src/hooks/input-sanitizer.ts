@@ -21,6 +21,7 @@ import {
   hasExecutableExtension,
 } from "../utils/script-detection.js"
 import { isRemoteCommand } from "../utils/ssh.js"
+import { hasSequentialShellBatch, SHELL_SEQUENCE_BLOCK_MESSAGE, SHELL_SEQUENCE_BLOCK_REASON } from "../utils/shell-sequence.js"
 
 interface InputSanitizerDeps {
   engine: DetectionEngine
@@ -169,6 +170,37 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
         return
       }
     }
+
+    const enforceShellSequence = async (command: unknown) => {
+      if (!hasSequentialShellBatch(input.tool, command)) return
+
+      sessionStats.recordBlock(input.tool, "", SHELL_SEQUENCE_BLOCK_REASON)
+      diagnosticLogger?.decision("input-sanitizer", input.tool, SHELL_SEQUENCE_BLOCK_REASON)
+      try {
+        await auditLogger.log({
+          timestamp: new Date().toISOString(),
+          tool: input.tool,
+          hook: "before",
+          sessionId: input.sessionID,
+          callId: input.callID,
+          detections: [],
+          blocked: true,
+          blockReason: SHELL_SEQUENCE_BLOCK_REASON,
+          redactedCount: 0,
+        })
+      } catch { /* audit failure is non-critical */ }
+      if (config.notifications && canToast(toastState)) {
+        try {
+          await client.tui.showToast({
+            body: { message: `🛡 Blocked: ${SHELL_SEQUENCE_BLOCK_REASON}`, variant: "error" as const },
+          })
+        } catch { /* toast failure is non-critical */ }
+      }
+      throw new Error(SHELL_SEQUENCE_BLOCK_MESSAGE)
+    }
+
+    const originalCommand = output.args.command
+    if (canonicalTool === "shell") await enforceShellSequence(originalCommand)
 
     // Step 1: Check every local file target (mode-aware). The shared
     // multi-target extractor covers V2 `path`, legacy `filePath`, all patch
@@ -357,6 +389,43 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
       }
     }
 
+    if (canonicalTool === "shell" && output.args.command !== originalCommand) {
+      await enforceShellSequence(output.args.command)
+    }
+
+    // Before either file-content evaluation or the contextual safety verdict.
+    const precheck =
+      config.llm.enabled && config.llm.safetyEvaluator.complexityPrecheck?.enabled &&
+      canonicalTool === "shell" && safetyEvaluator?.shouldEvaluate(input.tool)
+        ? await safetyEvaluator.precheckComplexity(input.tool, output.args)
+        : undefined
+    if (precheck && precheck !== "continue") {
+      sessionStats.recordSafetyEvaluation(input.tool, precheck)
+      diagnosticLogger?.decision("input-sanitizer", input.tool, precheck.explanation)
+      try {
+        await auditLogger.log({
+          timestamp: new Date().toISOString(),
+          tool: input.tool,
+          hook: "before",
+          sessionId: input.sessionID,
+          callId: input.callID,
+          detections: [],
+          blocked: true,
+          blockReason: precheck.explanation,
+          redactedCount: totalDetections,
+          safetyEvaluation: precheck,
+        })
+      } catch { /* audit failure is non-critical */ }
+      if (config.notifications && canToast(toastState)) {
+        try {
+          await client.tui.showToast({
+            body: { message: `🛡 Blocked: ${precheck.explanation}`, variant: "error" as const },
+          })
+        } catch { /* toast failure is non-critical */ }
+      }
+      throw new Error(precheck.explanation)
+    }
+
     // Step 3: Indirect execution check (Layer 2) — shell only
     const indirectConfig = config.indirectExecution
     if (
@@ -524,8 +593,9 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
     const safetyActionMode = config.llm.safetyEvaluator.actionMode
     let safetyResult: SafetyEvaluationResult | null = null
 
-    // Skip safety eval if already evaluated by permission.ask handler
-    const alreadyEvaluated = evaluatedCalls.has(input.callID)
+    // Do not let an earlier permission verdict for the original arguments
+    // substitute for evaluation of a candidate whose arguments may be redacted.
+    const alreadyEvaluated = precheck !== "continue" && evaluatedCalls.has(input.callID)
     if (alreadyEvaluated) {
       debugLog?.(`Input hook: tool=${input.tool} callID=${input.callID} → SKIPPED (already evaluated by permission.ask)`)
     }
@@ -580,6 +650,7 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
     // Log bypass for audit trail when safety evaluator would have evaluated
     if (
       !alreadyEvaluated &&
+      precheck !== "continue" &&
       safetyEvaluator &&
       safetyEvaluator.shouldEvaluate(input.tool) &&
       safetyEvaluator.isBypassed(input.tool, output.args)
@@ -619,7 +690,7 @@ export function createInputSanitizer(deps: InputSanitizerDeps) {
       !alreadyEvaluated &&
       safetyEvaluator &&
       safetyEvaluator.shouldEvaluate(input.tool) &&
-      !safetyEvaluator.isBypassed(input.tool, output.args)
+      (precheck === "continue" || !safetyEvaluator.isBypassed(input.tool, output.args))
     ) {
       // In "permission" mode, if we get here it means permission.ask didn't fire
       // for this tool (e.g., tool is auto-allowed in OpenCode config).

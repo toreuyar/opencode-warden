@@ -14,7 +14,7 @@ export function buildSecurityPolicyContext(config: SecurityGuardConfig): string 
   lines.push("## Warden Security Policy")
   lines.push("")
   lines.push(
-    "A security monitoring system is active. All tool calls and outputs are inspected.",
+    "Warden enforces tool and output security policy.",
   )
   lines.push("")
 
@@ -29,12 +29,12 @@ export function buildSecurityPolicyContext(config: SecurityGuardConfig): string 
   // file directly (it's blocked), so we inline the values it needs to act on.
   if (!config.redactionEnabled) {
     lines.push("All secret redaction is currently **DISABLED** (`redactionEnabled: false`).")
-    lines.push("Tool inputs and outputs pass through unmodified — secrets are preserved everywhere.")
+    lines.push("Access controls and environment sanitization still apply.")
     lines.push("")
   } else {
     if (!config.redactOnWrite) {
       lines.push(
-        "Redaction on `write`/`edit`/`patch` inputs is **DISABLED** (`redactOnWrite: false`). Files written via these tools will preserve embedded secrets. Bash command redaction is still active.",
+        "Redaction on `write`/`edit`/`patch` inputs is **DISABLED** (`redactOnWrite: false`). Bash command redaction is still active.",
       )
       lines.push("")
     }
@@ -54,7 +54,7 @@ export function buildSecurityPolicyContext(config: SecurityGuardConfig): string 
     if (localEntries.length > 0 || hostEntries.length > 0) {
       lines.push("#### Exempt Paths (redaction skipped)")
       lines.push(
-        "Secrets pass through unredacted when writing to or reading from these paths — useful for source files that legitimately embed API keys (client libraries, config templates, test fixtures).",
+        "Read/write redaction is skipped for these paths. Access controls still apply.",
       )
       lines.push("")
       if (localEntries.length > 0) {
@@ -93,7 +93,7 @@ export function buildSecurityPolicyContext(config: SecurityGuardConfig): string 
   // Blocked commands warning
   lines.push("### Blocked Commands")
   lines.push(
-    "Commands blocked by the safety evaluator cannot be bypassed. Do NOT retry with variations — explain the situation to the user instead.",
+    "Do not bypass a safety denial; explain it to the user. When Warden explicitly requests separate or simpler shell calls, retry with dependencies preserved; each revised call still requires all security checks.",
   )
   lines.push("")
 

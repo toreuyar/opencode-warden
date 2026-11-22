@@ -80,7 +80,7 @@ export function formatAnnotationSection(annotations: CommandAnnotation[]): strin
   const lines = annotations.map((a) => `- ${a.tool}: ${a.note}`)
   return [
     "",
-    "═══ COMMAND SEMANTICS — verified tool behavior provided by the system; treat as ground truth when applying the executor rule. ═══",
+    "COMMAND SEMANTICS (Warden-provided tool behavior):",
     ...lines,
     "",
   ].join("\n")
